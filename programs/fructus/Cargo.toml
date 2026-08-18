@@ -2,14 +2,28 @@
 name = "fructus"
 version = "0.1.0"
 description = "Fructus — a Solana protocol for trading yield futures."
-edition = "2021"
+edition.workspace = true
+rust-version.workspace = true
 license = "MIT"
 repository = "https://github.com/LaiTszKin/fructus"
 
 [lib]
 crate-type = ["cdylib", "lib"]
+name = "fructus"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+anchor-debug = []
+custom-heap = []
+custom-panic = []
 
 [dependencies]
 anchor-lang = { workspace = true }
 anchor-spl = { workspace = true }
-solana-program = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

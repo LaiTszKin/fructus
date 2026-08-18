@@ -9,8 +9,9 @@
 
 use anchor_lang::prelude::*;
 
-// TODO: Replace with the program keypair generated for this program.
-declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
+// Program keypair is generated locally at `target/deploy/fructus-keypair.json`
+// (gitignored). Keep it safe — it is required to upgrade the deployed program.
+declare_id!("8ZLiJ12eBiam4UP2HRp3M75CQAcc8GuUBz44zeHt6mjH");
 
 /// The Fructus on-chain program.
 ///

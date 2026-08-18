@@ -88,8 +88,9 @@ anchor test
 anchor localnet
 ```
 
-> **Note:** the on-chain program ID in `lib.rs` is a placeholder. Replace it
-> with your own keypair before deploying.
+> **Note:** the program keypair is generated locally at
+> `target/deploy/fructus-keypair.json` (gitignored). Keep it safe — it is
+> required to deploy and upgrade the program.
 
 ## Status
 
