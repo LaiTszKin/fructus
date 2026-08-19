@@ -13,6 +13,12 @@ The protocol ships in stages:
 2. **jitoSOL dated futures** (fixed-expiry contracts)
 3. **Expansion to other yield-bearing assets**
 
+## Documentation
+
+Full project documentation lives under [`docs/`](docs/README.md) — architecture,
+modules, instruction reference, data models, setup, testing, and workflows.
+Agent orientation is in [`AGENTS.md`](AGENTS.md).
+
 ## Why Fructus?
 
 Liquid staking (for example, jitoSOL) pays a variable yield. Today, separating
@@ -53,10 +59,11 @@ structured products.
 
 ## Technology
 
-- **Language:** Rust
+- **Language:** Rust (on-chain) + TypeScript (off-chain keeper)
 - **Chain:** Solana
-- **Framework:** Anchor
-- **Key dependencies:** `anchor-lang`, `anchor-spl`, `solana-program`
+- **Framework:** Anchor 1.1
+- **Key dependencies:** `anchor-lang`, `anchor-spl`, `solana-sdk-ids`, `@solana/web3.js`
+- **Fuzzing:** Trident
 
 ## Repository layout
 
@@ -64,28 +71,34 @@ structured products.
 .
 ├── Anchor.toml                 # Anchor workspace configuration
 ├── Cargo.toml                  # Rust workspace manifest
+├── AGENTS.md                   # Agent orientation (build/test/conventions)
+├── docs/                       # Project documentation (docs/README.md hub)
 ├── programs/
-│   └── fructus/                # On-chain program (smart contract)
-│       ├── Cargo.toml
-│       └── src/lib.rs
+│   └── fructus/                # On-chain program (oracle, settlement, ed25519)
+│       └── src/
+├── publisher/                  # Off-chain TypeScript keeper
+├── trident-tests/              # On-chain fuzz harness
 ├── CHANGELOG.md
 └── LICENSE
 ```
 
 ## Getting started
 
-> **Prerequisites:** Rust toolchain, Solana CLI, and Anchor CLI. See
+> **Prerequisites:** Rust toolchain, Anchor CLI, and `cargo-build-sbf`. See
 > [Anchor installation](https://www.anchor-lang.com/docs/installation).
 
 ```bash
-# Build the workspace
+# Build the on-chain program
 anchor build
 
-# Run unit tests
-anchor test
+# Run the on-chain test suite
+cargo test --workspace
 
-# Deploy to a local validator
-anchor localnet
+# Run the off-chain publisher tests
+cd publisher && npm test
+
+# Run the on-chain fuzz smoke test
+cd trident-tests && cargo run --bin fuzz_0
 ```
 
 > **Note:** the program keypair is generated locally at
@@ -95,8 +108,10 @@ anchor localnet
 ## Status
 
 Fructus is in **early development** and is currently a **private** repository.
-The protocol has not been audited and is not deployed to mainnet. Do not use it
-with real funds.
+The **data module** (mark-price APY oracle, trustless settlement reference,
+off-chain keeper, fuzz harness) is implemented and tested; the yield-futures
+trading logic is next. The protocol has not been audited and is not deployed to
+mainnet. Do not use it with real funds.
 
 ## License
 
