@@ -1,0 +1,8 @@
+[fuzz.metrics]
+enabled = true
+
+
+[[fuzz.programs]]
+address = "8ZLiJ12eBiam4UP2HRp3M75CQAcc8GuUBz44zeHt6mjH"
+program = "../target/deploy/fructus.so"
+ 
