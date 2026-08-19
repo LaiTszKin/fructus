@@ -1,5 +1,5 @@
 # Rust
-/target
+target/
 **/*.rs.bk
 
 # Anchor / Solana
@@ -9,9 +9,16 @@ test-ledger
 *.keypair.json
 .idl/
 
+# TypeScript build output
+dist/
+
+# Review / agent artifacts
+.review/
+
 # Environment & secrets
 .env
 .env.*
+!.env.example
 *.local
 credentials.json
 
