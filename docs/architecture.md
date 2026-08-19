@@ -1,8 +1,9 @@
 # Architecture
 
 Fructus is a Solana yield-futures protocol. The current codebase implements the
-**data module**: a mark-price APY oracle and a trustless settlement reference for
-jitoSOL yield.
+**data module** (a mark-price APY oracle and a trustless settlement reference for
+jitoSOL yield) plus the **perpetual-market account** that binds them into a
+tradeable instrument configuration.
 
 ## System Context (C4 Level 1)
 
@@ -21,9 +22,10 @@ graph TD
 graph TD
     subgraph OnChain[On-chain: programs/fructus]
         ORC[YieldOracle account]
+        MKT[PerpMarket account]
         EXC[exchange.rs — ExchangeRate]
         ED[ed25519.rs — verify_publisher_signature]
-        IX[Instruction handlers: initialize / update_apy / read_exchange_rate / admin]
+        IX[Instruction handlers: initialize / update_apy / initialize_market / read_exchange_rate / admin]
     end
     subgraph OffChain[Off-chain: publisher/]
         FETCH[jito.ts — fetchLatestApy]
@@ -36,6 +38,8 @@ graph TD
     P[Publisher] --> FETCH --> MSG --> SUB -->|ed25519 verify + update_apy| IX
     IX --> ED --> ORC
     IX --> EXC
+    IX --> MKT
+    MKT -->|index_source| SP
     EXC -->|reads| SP[jitoSOL Stake Pool]
 ```
 
@@ -65,4 +69,6 @@ graph TD
 | ed25519 signature via instruction introspection, byte-level comparison | Anchor 1.x "Address" migration makes `Pubkey`/`Address` types version-fragile; bytes are stable | Active |
 | Trustless settlement reads the SPL Stake Pool account directly | Exchange rate is on-chain state → cannot stale or be manipulated | Active |
 | `u128` intermediates in yield math | Avoid overflow on `u64` numerator/denominator products | Active |
+| Singleton `PerpMarket` PDA for Stage 1 | One jitoSOL perp ships first; multi-market (Stage 3) parameterizes the seed | Active |
+| Market config validated at init (fixed-point funding + bps margins) | Reject invalid config atomically; vault custody is a later issue | Active |
 | Cross-language message vector test | Locks publisher ↔ program signature consistency | Active |

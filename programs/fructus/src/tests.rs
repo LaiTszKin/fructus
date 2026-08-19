@@ -12,7 +12,10 @@ use crate::exchange::{
     annualize, ExchangeRate, ACCOUNT_TYPE_OFFSET, ACCOUNT_TYPE_STAKE_POOL,
     POOL_TOKEN_SUPPLY_OFFSET, TOTAL_LAMPORTS_OFFSET,
 };
-use crate::state::{apy_in_bounds, is_stale, update_message, validate_version};
+use crate::state::{
+    apy_in_bounds, funding_k_in_bounds, initial_margin_in_bounds, is_stale,
+    maintenance_margin_in_bounds, max_funding_in_bounds, update_message, validate_version,
+};
 use solana_instruction::BorrowedInstruction;
 use solana_instructions_sysvar::construct_instructions_data;
 use solana_sdk_ids::{ed25519_program, sysvar};
@@ -365,4 +368,68 @@ fn build_ed25519_instruction_data(pk: &Pubkey, msg: &[u8]) -> Vec<u8> {
     data[public_key_offset..public_key_offset + ED25519_PUBKEY_LEN].copy_from_slice(pk.as_ref());
     data[message_offset..message_offset + msg.len()].copy_from_slice(msg);
     data
+}
+
+// --- PerpMarket init validation bounds (issue #2) ---
+//
+// The four pure validators below encode the exact `initialize_market` numeric
+// ranges. Each proptest asserts the validator is EXACTLY the interval predicate,
+// so the test doubles as the spec.
+
+proptest! {
+    #[test]
+    fn funding_k_bounds_match_interval(k in 0u64..) {
+        prop_assert_eq!(funding_k_in_bounds(k), (1..=1_000_000u64).contains(&k));
+    }
+
+    #[test]
+    fn max_funding_bounds_match_interval(m in 0u64..) {
+        prop_assert_eq!(max_funding_in_bounds(m), m <= 1_000_000);
+    }
+
+    #[test]
+    fn initial_margin_bounds_match_interval(im in 0u16..) {
+        prop_assert_eq!(initial_margin_in_bounds(im), im > 0 && im <= 10_000);
+    }
+
+    #[test]
+    fn maintenance_margin_bounds_match_interval(im in 0u16.., mm in 0u16..) {
+        prop_assert_eq!(maintenance_margin_in_bounds(im, mm), mm > 0 && mm <= im);
+    }
+}
+
+#[test]
+fn funding_k_boundary_edges() {
+    assert!(funding_k_in_bounds(1));
+    assert!(funding_k_in_bounds(1_000_000));
+    assert!(!funding_k_in_bounds(0));
+    assert!(!funding_k_in_bounds(1_000_001));
+}
+
+#[test]
+fn max_funding_boundary_edges() {
+    assert!(max_funding_in_bounds(0));
+    assert!(max_funding_in_bounds(1_000_000));
+    assert!(!max_funding_in_bounds(1_000_001));
+}
+
+#[test]
+fn initial_margin_boundary_edges() {
+    assert!(initial_margin_in_bounds(1));
+    assert!(initial_margin_in_bounds(10_000));
+    assert!(!initial_margin_in_bounds(0));
+    assert!(!initial_margin_in_bounds(10_001));
+}
+
+#[test]
+fn maintenance_margin_boundary_edges() {
+    // initial = 1: maintenance must be in (0, 1] => only 1 is valid.
+    assert!(maintenance_margin_in_bounds(1, 1));
+    assert!(!maintenance_margin_in_bounds(1, 0));
+    assert!(!maintenance_margin_in_bounds(1, 2));
+
+    // initial = 10_000: maintenance must be in (0, 10_000].
+    assert!(maintenance_margin_in_bounds(10_000, 10_000));
+    assert!(!maintenance_margin_in_bounds(10_000, 0));
+    assert!(!maintenance_margin_in_bounds(10_000, 10_001));
 }

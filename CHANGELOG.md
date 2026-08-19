@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Perpetual market account (`PerpMarket`) + `initialize_market` instruction:
+  - Singleton `PerpMarket` PDA (seed `"perp_market"`) binding the jitoSOL
+    stake-pool `index_source`, USDC `collateral_mint`, funding params
+    (`funding_k`, `max_funding`, `funding_epoch_slots`), margin params
+    (`initial_margin_bps`, `maintenance_margin_bps`), `authority`, and the
+    collateral `vault` PDA.
+  - `initialize_market` validates `index_source` (SPL Stake Pool owner +
+    discriminator), enforces fixed-point funding bounds and basis-point margin
+    bounds, derives the vault PDA, and stores all fields atomically.
+  - Property-based tests for the four validation bounds (proptest + boundary).
 - Yield oracle data module (mark-price APY):
   - `YieldOracle` singleton PDA state (`apy`, `version`, `last_update_slot`,
     `publisher`, `authority`, `stale_after_slots`).

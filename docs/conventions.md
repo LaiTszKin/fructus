@@ -14,6 +14,8 @@ reliably infer from config files alone.
 ## Fixed-point math
 
 - APY and yield are `u64` scaled by `1_000_000` (`APY_SCALE`): `1.0 == 1_000_000`.
+- Funding parameters (`funding_k`, `max_funding`) use the same `APY_SCALE`;
+  margin fields are `u16` basis points (`≤ 10_000`, maintenance ≤ initial).
 - Yield math uses `u128` intermediates + `checked_*`; staleness uses
   `saturating_sub` — no panicking arithmetic.
 
