@@ -1,0 +1,20 @@
+{
+  "name": "fructus-publisher",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Off-chain keeper that feeds the Fructus yield oracle: fetch jitoSOL APY, sign, submit.",
+  "scripts": {
+    "test": "tsx --test test/*.test.ts",
+    "publish": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.15.0",
+    "typescript": "^5.5.0"
+  }
+}
