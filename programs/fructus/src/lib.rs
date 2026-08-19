@@ -1,36 +1,147 @@
 //! Fructus — a Solana protocol for trading yield futures.
 //!
-//! The protocol starts with jitoSOL yield perpetual futures (MVP), then adds
-//! jitoSOL dated futures, and eventually expands to other yield-bearing assets.
-//!
-//! This is an initial scaffold: the program ID below is a placeholder and the
-//! instruction surface is intentionally minimal. Replace the program ID with
-//! your own keypair before deploying.
+//! This milestone implements the **data module**: an on-chain mark-price APY
+//! oracle that is updated via publisher-signed (ed25519) data, with a
+//! staleness predicate consumers can use as a circuit breaker.
 
 use anchor_lang::prelude::*;
 
-// Program keypair is generated locally at `target/deploy/fructus-keypair.json`
-// (gitignored). Keep it safe — it is required to upgrade the deployed program.
+pub mod constants;
+pub mod ed25519;
+pub mod error;
+pub mod exchange;
+pub mod state;
+
+use constants::ORACLE_SEED;
+use error::FructusError;
+use exchange::{ExchangeRate, STAKE_POOL_PROGRAM_ID};
+use state::{apy_in_bounds, update_message, validate_version, YieldOracle};
+
 declare_id!("8ZLiJ12eBiam4UP2HRp3M75CQAcc8GuUBz44zeHt6mjH");
 
-/// The Fructus on-chain program.
-///
-/// Instructions for yield perpetual and dated futures will be added here as
-/// the protocol is implemented.
 #[program]
 pub mod fructus {
     use super::*;
 
-    /// Placeholder initialization instruction.
+    /// Create the singleton yield oracle.
+    pub fn initialize(
+        ctx: Context<Initialize>,
+        publisher: Pubkey,
+        stale_after_slots: u64,
+        initial_apy: u64,
+    ) -> Result<()> {
+        require!(apy_in_bounds(initial_apy), FructusError::ApyTooHigh);
+        let oracle = &mut ctx.accounts.oracle;
+        oracle.apy = initial_apy;
+        oracle.version = 0;
+        oracle.last_update_slot = Clock::get()?.slot;
+        oracle.publisher = publisher;
+        oracle.authority = ctx.accounts.authority.key();
+        oracle.stale_after_slots = stale_after_slots;
+        oracle.bump = ctx.bumps.oracle;
+        Ok(())
+    }
+
+    /// Update the APY reference using a publisher-signed value.
     ///
-    /// Establishes a program-owned state account; real market/position
-    /// accounts will replace it in subsequent milestones.
-    pub fn initialize(_ctx: Context<Initialize>) -> Result<()> {
-        msg!("Fructus initialized");
+    /// The transaction must carry an `ed25519` verify instruction whose public
+    /// key is `oracle.publisher` and whose message is
+    /// `update_message(oracle, apy, version)`.
+    pub fn update_apy(ctx: Context<UpdateApy>, apy: u64, version: u64) -> Result<()> {
+        require!(apy_in_bounds(apy), FructusError::ApyTooHigh);
+
+        {
+            let oracle = &ctx.accounts.oracle;
+            let publisher = oracle.publisher;
+            let oracle_key = oracle.key();
+            let message = update_message(&oracle_key, apy, version);
+            let ix_sysvar = ctx.accounts.instruction_sysvar.to_account_info();
+            ed25519::verify_publisher_signature(&ix_sysvar, &publisher, &message)?;
+        }
+
+        {
+            let oracle = &mut ctx.accounts.oracle;
+            validate_version(oracle.version, version)?;
+            oracle.apy = apy;
+            oracle.version = version;
+            oracle.last_update_slot = Clock::get()?.slot;
+        }
+        Ok(())
+    }
+
+    /// Change the staleness window (authority only).
+    pub fn set_stale_window(ctx: Context<Admin>, new_stale_after_slots: u64) -> Result<()> {
+        ctx.accounts.oracle.stale_after_slots = new_stale_after_slots;
+        Ok(())
+    }
+
+    /// Rotate the publisher key (authority only).
+    pub fn set_publisher(ctx: Context<Admin>, new_publisher: Pubkey) -> Result<()> {
+        ctx.accounts.oracle.publisher = new_publisher;
+        Ok(())
+    }
+
+    /// Derive the current exchange rate (SOL per pool token) from a stake pool
+    /// account, on-chain and trustless.
+    ///
+    /// The rate is `total_lamports / pool_token_supply`, read directly from the
+    /// pool account after validating that the account is owned by the SPL Stake
+    /// Pool program and carries the `StakePool` discriminator. No external
+    /// oracle or signed input is trusted.
+    pub fn read_exchange_rate(ctx: Context<ReadExchangeRate>) -> Result<()> {
+        let pool = &ctx.accounts.stake_pool;
+        require!(
+            pool.owner == &STAKE_POOL_PROGRAM_ID,
+            FructusError::InvalidStakePool
+        );
+        let rate = ExchangeRate::read(&pool.data.borrow())
+            .ok_or(FructusError::InvalidStakePool)?;
+        msg!(
+            "fructus exchange_rate total_lamports={} pool_token_supply={}",
+            rate.total_lamports,
+            rate.pool_token_supply
+        );
         Ok(())
     }
 }
 
-/// Accounts required by [`initialize`](fructus::initialize).
 #[derive(Accounts)]
-pub struct Initialize {}
+pub struct Initialize<'info> {
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + YieldOracle::LEN,
+        seeds = [ORACLE_SEED],
+        bump
+    )]
+    pub oracle: Account<'info, YieldOracle>,
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateApy<'info> {
+    #[account(mut, seeds = [ORACLE_SEED], bump = oracle.bump)]
+    pub oracle: Account<'info, YieldOracle>,
+    /// CHECK: the instruction sysvar, used to introspect the ed25519 verify
+    /// instruction. `load_instruction_at_checked` rejects a non-sysvar account.
+    pub instruction_sysvar: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct Admin<'info> {
+    #[account(mut, seeds = [ORACLE_SEED], bump = oracle.bump, has_one = authority)]
+    pub oracle: Account<'info, YieldOracle>,
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ReadExchangeRate<'info> {
+    /// CHECK: the handler validates the owner (SPL Stake Pool program) and the
+    /// `account_type == StakePool` discriminator before reading the fields.
+    pub stake_pool: UncheckedAccount<'info>,
+}
+
+#[cfg(test)]
+mod tests;
