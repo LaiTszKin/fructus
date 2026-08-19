@@ -129,7 +129,7 @@ that provide liquidity and raise the cost of a hostile capital attack.
 ├── AGENTS.md                   # Agent orientation (build/test/conventions)
 ├── docs/                       # Project documentation (docs/README.md hub)
 ├── programs/
-│   └── fructus/                # On-chain program (oracle, settlement, ed25519)
+│   └── fructus/                # On-chain program (oracle, market, settlement, ed25519)
 │       └── src/
 ├── publisher/                  # Off-chain TypeScript keeper
 ├── trident-tests/              # On-chain fuzz harness
@@ -164,9 +164,10 @@ cd trident-tests && cargo run --bin fuzz_0
 
 Fructus is in **early development** and is currently a **private** repository.
 The **data module** (mark-price APY oracle, trustless settlement reference,
-off-chain keeper, fuzz harness) is implemented and tested; the yield-futures
-trading logic is next. The protocol has not been audited and is not deployed to
-mainnet. Do not use it with real funds.
+off-chain keeper, fuzz harness) and the **perpetual market** account
+(`PerpMarket` + `initialize_market`) are implemented and tested; position,
+vault, and trading logic is next. The protocol has not been audited and is not
+deployed to mainnet. Do not use it with real funds.
 
 ## License
 

@@ -12,7 +12,7 @@
 ## Commands
 
 ```bash
-cargo test --workspace                    # full Rust suite (23 tests)
+cargo test --workspace                    # full Rust suite (31 tests)
 cargo test --workspace <test_name>        # single test
 cd publisher && npm test                  # TS suite (8 tests)
 cd trident-tests && cargo run --bin fuzz_0   # fuzz (1000 iters × 100 flows)
@@ -27,6 +27,9 @@ cd trident-tests && cargo run --bin fuzz_0   # fuzz (1000 iters × 100 flows)
 - `ExchangeRate::read` round-trips; rejects zero supply / wrong discriminator.
 - `realized_yield` self-yield == 0; monotonic in settle numerator.
 - `annualize` identity when period == year; rejects zero period.
+- `PerpMarket` init bounds: `funding_k` ∈ [1, 1_000_000]; `max_funding` ≤ 1_000_000;
+  `initial_margin_bps` ∈ (0, 10_000]; `maintenance_margin_bps` ∈ (0, initial] —
+  asserted as exact interval equivalence plus boundary edges.
 
 ## Signature verification (mock sysvar)
 

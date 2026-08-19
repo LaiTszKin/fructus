@@ -2,7 +2,7 @@
 
 | Directory | Responsibility | Key Files |
 | --- | --- | --- |
-| `programs/fructus/src/` | On-chain Anchor program (yield oracle + settlement data) | `lib.rs`, `state.rs`, `exchange.rs`, `ed25519.rs` |
+| `programs/fructus/src/` | On-chain Anchor program (yield oracle + market + settlement data) | `lib.rs`, `state.rs`, `exchange.rs`, `ed25519.rs` |
 | `publisher/` | Off-chain TypeScript keeper (fetch → sign → submit) | `src/index.ts`, `src/update.ts`, `src/message.ts` |
 | `trident-tests/` | On-chain stateful fuzz harness (separate workspace) | `fuzz_0/test_fuzz.rs` |
 | `docs/` | Documentation | `README.md` (hub) |
@@ -14,8 +14,8 @@
 | File | Responsibility |
 | --- | --- |
 | `lib.rs` | Instruction entrypoints + account contexts |
-| `constants.rs` | APY scale, domain separator, PDA seed |
-| `state.rs` | `YieldOracle` account + pure logic (`is_stale`, `update_message`, …) |
+| `constants.rs` | APY/funding scale, domain separators, PDA seeds, validation bounds |
+| `state.rs` | `YieldOracle` + `PerpMarket` accounts + pure logic (`is_stale`, `update_message`, validators, …) |
 | `exchange.rs` | Trustless settlement: stake-pool exchange rate + realized yield |
 | `ed25519.rs` | Publisher signature verification via instruction introspection |
 | `error.rs` | `FructusError` error codes |

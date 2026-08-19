@@ -2,8 +2,9 @@
 
 Fructus is a Solana protocol for trading yield futures — turning the variable
 yield of liquid-staking assets (starting with jitoSOL) into a tradeable
-instrument. This tree documents the **data module**: the mark-price APY oracle,
-trustless settlement reference, off-chain keeper, and fuzz harness.
+instrument. This tree documents the **data module** (the mark-price APY oracle,
+trustless settlement reference, off-chain keeper, and fuzz harness) and the
+**perpetual-market** account.
 
 ## Quick Links
 
@@ -20,6 +21,7 @@ trustless settlement reference, off-chain keeper, and fuzz harness.
 | See account/field layouts | [data-models.md](data-models.md) |
 | Understand the mark-price oracle | [modules/oracle.md](modules/oracle.md) |
 | Understand trustless settlement | [modules/settlement.md](modules/settlement.md) |
+| Understand the perpetual market | [modules/market.md](modules/market.md) |
 | Understand the off-chain keeper | [modules/publisher.md](modules/publisher.md) |
 | Run tests / fuzz | [testing.md](testing.md) |
 | Learn code conventions | [conventions.md](conventions.md) |
@@ -33,6 +35,7 @@ trustless settlement reference, off-chain keeper, and fuzz harness.
 - [conventions.md](conventions.md) — code rules that differ from defaults
 - [modules/oracle.md](modules/oracle.md) — mark-price APY oracle
 - [modules/settlement.md](modules/settlement.md) — trustless exchange rate / yield
+- [modules/market.md](modules/market.md) — perpetual market + `initialize_market`
 - [modules/publisher.md](modules/publisher.md) — off-chain keeper
 - [api-reference.md](api-reference.md) — instruction reference + signature scheme
 - [data-models.md](data-models.md) — account + derived-rate layouts
