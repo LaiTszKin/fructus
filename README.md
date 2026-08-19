@@ -7,11 +7,11 @@ variable yield of liquid-staking assets into a standalone, tradeable instrument,
 so anyone can hedge or speculate on future yield **without understanding
 interest-rate swaps**.
 
-The protocol ships in stages:
+The protocol ships in stages (full detail in [Roadmap](#roadmap)):
 
 1. **jitoSOL yield perpetual futures** (MVP)
 2. **jitoSOL dated futures** (fixed-expiry contracts)
-3. **Expansion to other yield-bearing assets**
+3. **Protocol engine** — anyone deploys configurable markets via the SDK
 
 ## Documentation
 
@@ -46,6 +46,61 @@ Fixed-expiry contracts that settle against the realized yield of a staking
 asset over a defined period (for example, the annualized jitoSOL APY between
 two dates). These are the building blocks for terms, calendar spreads, and
 structured products.
+
+## Roadmap
+
+### Stage 1 — jitoSOL yield perpetual futures (MVP)
+
+Launch the perp: a perpetual contract on jitoSOL's yield rate, anchored to
+realized staking yield by funding. This validates the oracle and settlement
+machinery in production with a single, closely-watched instrument.
+
+### Stage 2 — jitoSOL dated futures
+
+Launch fixed-expiry contracts settling against realized jitoSOL APY over a
+defined period — the building blocks for terms, calendar spreads, and
+structured products.
+
+### Stage 3 — Protocol engine
+
+With both futures forms complete, the protocol stops hand-shipping markets
+and becomes an **engine**: fees, data sources, and every other configurable
+dimension of a market are declared by its creator via the SDK and deployed
+on-chain. Deploying a market costs a **deployment fee** paid to the protocol.
+
+The engine removes the protocol's dependence on the development team for
+centralized audit and long-term maintenance, and shifts the revenue model
+from per-trade fees to deployment fees:
+
+- **Creator flywheel** — early instruments are deployed by the protocol
+  itself; as users grow, more market creators are willing to take on the risk
+  of building a futures contract that solves a real pain point. Expansion to
+  new assets no longer waits for the core team.
+- **Self-sustaining protocol** — deployment fees keep the protocol running
+  without taxing every trade.
+
+**Deployment gates.** Market creation is gated by design:
+
+- Deployers must use a wallet that has passed real-world KYC (SAS), keeping
+  every market attributable.
+- The deployment fee has a floor — it cannot be set too low — acting as a
+  capital threshold on top of traceability.
+
+**Dual-track listing.** New markets can launch through either track:
+
+- **Self-funded track** — creators complete their own KYC and pay the
+  deployment fee to list a market directly.
+- **Idea track** — creators who cannot afford the fee but are convinced of a
+  market's value pitch the protocol. The protocol admin reviews the futures
+  design and negotiates a fee-share with the proposer; the protocol deploys
+  the market, and trading fees are split 50/50 between the protocol and the
+  proposer by default, with the split adjustable based on the market's
+  expected value.
+
+**Anti-manipulation.** The protocol ships defenses against market abuse:
+protocol-level state rollback tooling, an emergency freeze letting the
+protocol administrator halt malicious trading, and market-maker incentives
+that provide liquidity and raise the cost of a hostile capital attack.
 
 ## Use cases
 
