@@ -12,10 +12,23 @@ pub mod error;
 pub mod exchange;
 pub mod state;
 
-use constants::ORACLE_SEED;
+use constants::{ORACLE_SEED, PERP_MARKET_SEED, VAULT_SEED};
 use error::FructusError;
 use exchange::{ExchangeRate, STAKE_POOL_PROGRAM_ID};
-use state::{apy_in_bounds, update_message, validate_version, YieldOracle};
+use state::{
+    apy_in_bounds, funding_k_in_bounds, initial_margin_in_bounds, maintenance_margin_in_bounds,
+    max_funding_in_bounds, update_message, validate_version, PerpMarket, YieldOracle,
+};
+
+/// Validate that `account` is owned by the SPL Stake Pool program and carries
+/// the `StakePool` discriminator, returning the parsed [`ExchangeRate`].
+fn read_stake_pool(account: &AccountInfo) -> Result<ExchangeRate> {
+    require!(
+        account.owner == &STAKE_POOL_PROGRAM_ID,
+        FructusError::InvalidStakePool
+    );
+    ExchangeRate::read(&account.data.borrow()).ok_or(FructusError::InvalidStakePool.into())
+}
 
 declare_id!("8ZLiJ12eBiam4UP2HRp3M75CQAcc8GuUBz44zeHt6mjH");
 
@@ -39,6 +52,55 @@ pub mod fructus {
         oracle.authority = ctx.accounts.authority.key();
         oracle.stale_after_slots = stale_after_slots;
         oracle.bump = ctx.bumps.oracle;
+        Ok(())
+    }
+
+    /// Create the singleton perpetual market and bind it to a trustless index
+    /// source (jitoSOL stake pool), a collateral mint, and funding/margin
+    /// parameters. The collateral-vault PDA is derived and stored here but its
+    /// token account is not created (deferred to a later issue).
+    pub fn initialize_market(
+        ctx: Context<InitializeMarket>,
+        collateral_mint: Pubkey,
+        funding_k: u64,
+        max_funding: u64,
+        funding_epoch_slots: u64,
+        initial_margin_bps: u16,
+        maintenance_margin_bps: u16,
+    ) -> Result<()> {
+        require!(
+            funding_k_in_bounds(funding_k),
+            FructusError::InvalidFundingK
+        );
+        require!(
+            max_funding_in_bounds(max_funding),
+            FructusError::InvalidMaxFunding
+        );
+        require!(
+            initial_margin_in_bounds(initial_margin_bps),
+            FructusError::InvalidInitialMargin
+        );
+        require!(
+            maintenance_margin_in_bounds(initial_margin_bps, maintenance_margin_bps),
+            FructusError::InvalidMaintenanceMargin
+        );
+
+        let index_source = &ctx.accounts.index_source;
+        read_stake_pool(index_source)?;
+
+        let vault = Pubkey::find_program_address(&[VAULT_SEED], &crate::ID).0;
+
+        let market = &mut ctx.accounts.market;
+        market.index_source = index_source.key();
+        market.collateral_mint = collateral_mint;
+        market.funding_k = funding_k;
+        market.max_funding = max_funding;
+        market.funding_epoch_slots = funding_epoch_slots;
+        market.initial_margin_bps = initial_margin_bps;
+        market.maintenance_margin_bps = maintenance_margin_bps;
+        market.authority = ctx.accounts.authority.key();
+        market.vault = vault;
+        market.bump = ctx.bumps.market;
         Ok(())
     }
 
@@ -89,13 +151,7 @@ pub mod fructus {
     /// Pool program and carries the `StakePool` discriminator. No external
     /// oracle or signed input is trusted.
     pub fn read_exchange_rate(ctx: Context<ReadExchangeRate>) -> Result<()> {
-        let pool = &ctx.accounts.stake_pool;
-        require!(
-            pool.owner == &STAKE_POOL_PROGRAM_ID,
-            FructusError::InvalidStakePool
-        );
-        let rate = ExchangeRate::read(&pool.data.borrow())
-            .ok_or(FructusError::InvalidStakePool)?;
+        let rate = read_stake_pool(&ctx.accounts.stake_pool)?;
         msg!(
             "fructus exchange_rate total_lamports={} pool_token_supply={}",
             rate.total_lamports,
@@ -117,6 +173,25 @@ pub struct Initialize<'info> {
     pub oracle: Account<'info, YieldOracle>,
     #[account(mut)]
     pub authority: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeMarket<'info> {
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + PerpMarket::LEN,
+        seeds = [PERP_MARKET_SEED],
+        bump
+    )]
+    pub market: Account<'info, PerpMarket>,
+    /// CHECK: the handler validates owner == SPL Stake Pool program and
+    /// account_type == StakePool before using it as the index source.
+    pub index_source: UncheckedAccount<'info>,
+    pub authority: Signer<'info>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
     pub system_program: Program<'info, System>,
 }
 
