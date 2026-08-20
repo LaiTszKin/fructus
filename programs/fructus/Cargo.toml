@@ -24,13 +24,29 @@ custom-panic = []
 [dependencies]
 anchor-lang = { workspace = true }
 anchor-spl = { workspace = true }
+bytemuck = { version = "1.17", features = ["derive", "min_const_generics"] }
 solana-sdk-ids = "3.1.0"
 solana-instructions-sysvar = "3.0.0"
 sha2 = "0.11"
 
 [dev-dependencies]
+anchor-lang = { workspace = true }
 proptest = "1"
-solana-instruction = "3.0.0"
+solana-account = "=3.4.0"
+solana-instruction = "=3.4.0"
+solana-keypair = "=3.1.2"
+solana-program-pack = "=3.1.0"
+solana-program-test = { version = "3.1", features = ["agave-unstable-api"] }
+solana-pubkey = "=3.0.0"
+solana-rent = "=3.1.0"
+solana-sdk-ids = "=3.1.0"
+solana-signature = "=3.4.0"
+solana-signer = "=3.0.0"
+solana-transaction = "=3.1.0"
+solana-transaction-error = "=3.4.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+spl-token = "9.0"
+spl-associated-token-account = "8.0"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
