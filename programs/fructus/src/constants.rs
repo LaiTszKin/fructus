@@ -29,3 +29,49 @@ pub const MAX_FUNDING_MAX: u64 = APY_SCALE;
 
 /// Upper bound (inclusive) for margin ratios, expressed in basis points.
 pub const MAX_MARGIN_BPS: u16 = 10_000;
+
+// --- Order book + collateral vault (issues #3 & #4) ---
+
+/// PDA seed for the order-book account (one per market, bound by the market key).
+pub const ORDER_BOOK_SEED: &[u8] = b"order_book";
+
+/// PDA seed for the per-`(market, user)` collateral-ledger account.
+pub const USER_COLLATERAL_SEED: &[u8] = b"user_collateral";
+
+/// Maximum number of resting orders per side of the order book.
+///
+/// Drives the inline `[Order; MAX_ORDERS_PER_SIDE]` arrays in `OrderBook`, so it
+/// is a `usize` (used directly as an array length and compared with `Vec::len`).
+pub const MAX_ORDERS_PER_SIDE: usize = 64;
+
+/// Maximum number of distinct price levels per side (FR-2(a) / REQ-4).
+///
+/// This iteration collapses price-level capacity into per-order capacity: every
+/// resting order may occupy its own level, so the level bound equals the order
+/// bound. It is kept as a named constant so the FR-2(a) capacity contract is
+/// explicit rather than dropped (see docs/modules/order-book.md).
+pub const MAX_PRICE_LEVELS_PER_SIDE: usize = MAX_ORDERS_PER_SIDE;
+
+/// Length of the bounded on-chain event-queue ring (fills/cancels/residuals).
+pub const EVENT_QUEUE_LEN: usize = 128;
+
+/// Number of entries in the TWAP observation ring.
+///
+/// Each entry is 32 bytes (an 8-byte slot, an 8-byte mid, and a 16-byte `u128`
+/// accumulator), so
+/// raising this is cheap; issue #8 fixes the actual liquidation window and may
+/// widen the ring then (design OQ-4).
+pub const TWAP_OBSERVATIONS: usize = 16;
+
+/// Bounded per-transaction matching budget (the compute "batch").
+///
+/// `match_order` stops after this many fills and defers any still-crossable
+/// remainder as a `Residual` event for the permissionless `crank` to resume
+/// (design D6/D7). Chosen `8`: each step rewrites one array slot plus
+/// `best_bid`/`best_ask` and appends an event + a TWAP observation, so 8 fills
+/// stay comfortably inside the default 200k CU budget while a worst-case full
+/// book (64 makers) is drained in at most 8 cranks.
+pub const MAX_MATCH_STEPS: u64 = 8;
+
+/// Decimals of the USDC collateral mint (validated at vault initialization).
+pub const USDC_DECIMALS: u8 = 6;

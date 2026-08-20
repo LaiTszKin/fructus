@@ -80,7 +80,10 @@ pub fn parse_ed25519_instruction(data: &[u8]) -> Option<Ed25519Verification> {
     public_key.copy_from_slice(pk_bytes);
     let message = data.get(message_offset..msg_end)?.to_vec();
 
-    Some(Ed25519Verification { public_key, message })
+    Some(Ed25519Verification {
+        public_key,
+        message,
+    })
 }
 
 /// Find the `ed25519` verify instruction in the transaction and confirm it

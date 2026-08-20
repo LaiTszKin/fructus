@@ -22,4 +22,30 @@ pub enum FructusError {
     InvalidInitialMargin,
     #[msg("Maintenance margin (basis points) must be positive and no greater than initial margin")]
     InvalidMaintenanceMargin,
+    #[msg("Order book is at capacity")]
+    BookFull,
+    #[msg("Order book is already initialized")]
+    BookAlreadyInitialized,
+    #[msg("Order book is not initialized")]
+    BookNotInitialized,
+    #[msg("Order price is invalid")]
+    InvalidPrice,
+    #[msg("Order size is invalid")]
+    InvalidSize,
+    #[msg("Order not found")]
+    OrderNotFound,
+    #[msg("Order owner mismatch")]
+    OrderOwnerMismatch,
+    #[msg("Self-trade is not allowed")]
+    SelfTrade,
+    #[msg("Collateral mint is invalid")]
+    InvalidMint,
+    #[msg("Insufficient free collateral")]
+    InsufficientFreeCollateral,
+    #[msg("Collateral vault is already initialized")]
+    VaultAlreadyInitialized,
+    #[msg("Collateral vault is not initialized")]
+    VaultNotInitialized,
+    #[msg("Arithmetic overflow")]
+    ArithmeticOverflow,
 }
