@@ -22,6 +22,8 @@ trustless settlement reference, off-chain keeper, and fuzz harness) and the
 | Understand the mark-price oracle | [modules/oracle.md](modules/oracle.md) |
 | Understand trustless settlement | [modules/settlement.md](modules/settlement.md) |
 | Understand the perpetual market | [modules/market.md](modules/market.md) |
+| Understand the on-chain order book | [modules/order-book.md](modules/order-book.md) |
+| Understand the collateral vault | [modules/collateral.md](modules/collateral.md) |
 | Understand the off-chain keeper | [modules/publisher.md](modules/publisher.md) |
 | Run tests / fuzz | [testing.md](testing.md) |
 | Learn code conventions | [conventions.md](conventions.md) |
@@ -36,6 +38,8 @@ trustless settlement reference, off-chain keeper, and fuzz harness) and the
 - [modules/oracle.md](modules/oracle.md) — mark-price APY oracle
 - [modules/settlement.md](modules/settlement.md) — trustless exchange rate / yield
 - [modules/market.md](modules/market.md) — perpetual market + `initialize_market`
+- [modules/order-book.md](modules/order-book.md) — order book + matching engine + mark/twap
+- [modules/collateral.md](modules/collateral.md) — collateral vault + deposit/withdraw
 - [modules/publisher.md](modules/publisher.md) — off-chain keeper
 - [api-reference.md](api-reference.md) — instruction reference + signature scheme
 - [data-models.md](data-models.md) — account + derived-rate layouts

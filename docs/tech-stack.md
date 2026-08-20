@@ -9,6 +9,7 @@
 | **Solana / Anchor** | | | |
 | anchor-lang | 1.1.2 | Program framework | workspace dep |
 | anchor-spl | 1.1.2 | SPL helpers | workspace dep |
+| bytemuck | 1.17 | zero-copy account layouts | `derive` + `min_const_generics` |
 | solana-sdk-ids | 3.1.0 | Well-known program IDs | `ed25519_program`, sysvars |
 | solana-instructions-sysvar | 3.0.0 | Instruction introspection | for ed25519 verify |
 | sha2 | 0.11 | SHA-256 canonical message | mirrors off-chain signing |
@@ -19,6 +20,7 @@
 | **Testing / Fuzzing** | | | |
 | proptest | 1 | Property-based tests (Rust) | dev-dep |
 | solana-instruction | 3.0.0 | Mock instruction sysvar in tests | dev-dep |
+| solana-program-test | 3.1 | Bank-style CPI integration tests | dev-dep (loads the SBF `.so`) |
 | Trident (trident-cli / trident-fuzz) | 0.12.0 | On-chain stateful fuzzing | `trident-tests/` |
 | borsh | 1.5.3 | IDL/account (de)serialization in fuzz harness | |
 | node:test | built-in | Publisher unit tests | |

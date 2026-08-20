@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- On-chain order book (CLOB) + mark discovery (#3):
+  - `OrderBook` zero-copy account (`#[account(zero_copy)]`, ~21 KB) holding the
+    full bid/ask book, a bounded 128-entry event queue, and a 16-sample TWAP
+    ring inline (no per-order PDAs).
+  - Pure matching engine (`orderbook.rs`): price-time priority, partial fills,
+    no self-trade, no over-fill, bounded by `MAX_MATCH_STEPS`, with a
+    permissionless `crank` to drain the event queue and resume budget-interrupted
+    takers.
+  - Instructions: `initialize_order_book`, `place_limit_order`,
+    `place_market_order`, `cancel_order`, `crank`.
+  - `mark()` = book mid (`(best_bid + best_ask) / 2`) and `twap()` (time-weighted
+    mid) derived on-chain; property tests for the matching/mark/twap invariants.
+- Collateral vault + deposit/withdraw (#4):
+  - USDC collateral-vault token account at the `PerpMarket.vault` PDA (self-
+    authorized), created via `anchor-spl` CPI.
+  - `UserCollateral` per-`(market, user)` ledger (`deposited` + `reserved`,
+    `reserved` stubbed `0`) with a `free_collateral` seam for #5.
+  - Instructions: `initialize_collateral_vault`, `deposit_collateral`,
+    `withdraw_collateral`; bank-style CPI tests (solana-program-test) exercise
+    real token-account movement.
 - Perpetual market account (`PerpMarket`) + `initialize_market` instruction:
   - Singleton `PerpMarket` PDA (seed `"perp_market"`) binding the jitoSOL
     stake-pool `index_source`, USDC `collateral_mint`, funding params

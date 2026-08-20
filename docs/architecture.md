@@ -2,8 +2,9 @@
 
 Fructus is a Solana yield-futures protocol. The current codebase implements the
 **data module** (a mark-price APY oracle and a trustless settlement reference for
-jitoSOL yield) plus the **perpetual-market account** that binds them into a
-tradeable instrument configuration.
+jitoSOL yield), the **perpetual-market account** that binds them into a tradeable
+instrument, a fully **on-chain order book (CLOB)** whose mid is the
+market-discovered mark, and a **USDC collateral vault** for deposit/withdraw.
 
 ## System Context (C4 Level 1)
 
@@ -23,9 +24,14 @@ graph TD
     subgraph OnChain[On-chain: programs/fructus]
         ORC[YieldOracle account]
         MKT[PerpMarket account]
+        OB[OrderBook account — zero-copy CLOB]
+        UC[UserCollateral account]
+        VLT[vault token account — USDC]
         EXC[exchange.rs — ExchangeRate]
         ED[ed25519.rs — verify_publisher_signature]
-        IX[Instruction handlers: initialize / update_apy / initialize_market / read_exchange_rate / admin]
+        ENG[orderbook.rs — matching engine + mark/twap]
+        COL[collateral.rs — free-collateral accounting]
+        IX[Instruction handlers: oracle / market / order book / vault]
     end
     subgraph OffChain[Off-chain: publisher/]
         FETCH[jito.ts — fetchLatestApy]
@@ -39,7 +45,11 @@ graph TD
     IX --> ED --> ORC
     IX --> EXC
     IX --> MKT
+    IX --> ENG --> OB
+    IX --> COL --> UC
+    IX --> VLT
     MKT -->|index_source| SP
+    MKT -->|collateral_mint| VLT
     EXC -->|reads| SP[jitoSOL Stake Pool]
 ```
 
@@ -72,3 +82,8 @@ graph TD
 | Singleton `PerpMarket` PDA for Stage 1 | One jitoSOL perp ships first; multi-market (Stage 3) parameterizes the seed | Active |
 | Market config validated at init (fixed-point funding + bps margins) | Reject invalid config atomically; vault custody is a later issue | Active |
 | Cross-language message vector test | Locks publisher ↔ program signature consistency | Active |
+| On-chain order book (CLOB), not an AMM | Mark must be market-discovered; matching stays on-chain, crank only drains the event queue | Active |
+| `mark` = order-book mid | The instant price funding anchors to; derived from on-chain book state, never an oracle | Active |
+| `OrderBook` is zero-copy (`#[account(zero_copy)]`) | ~21 KB account exceeds the SBF 4 KiB stack limit for borsh deserialization | Active |
+| Custom minimal CLOB (no OpenBook) | Matching is simple enough to build in-repo; aligns with the granular-crate ethos | Active |
+| USDC collateral vault PDA (self-authorized) | Only the program can move vault funds; per-user ledger separates free vs reserved collateral | Active |

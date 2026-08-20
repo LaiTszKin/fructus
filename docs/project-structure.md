@@ -13,13 +13,16 @@
 
 | File | Responsibility |
 | --- | --- |
-| `lib.rs` | Instruction entrypoints + account contexts |
-| `constants.rs` | APY/funding scale, domain separators, PDA seeds, validation bounds |
-| `state.rs` | `YieldOracle` + `PerpMarket` accounts + pure logic (`is_stale`, `update_message`, validators, …) |
+| `lib.rs` | Instruction entrypoints + account contexts (oracle / market / order book / vault) |
+| `constants.rs` | APY/funding scale, domain separators, PDA seeds, capacities, validation bounds |
+| `state.rs` | `YieldOracle`, `PerpMarket`, `OrderBook` (zero-copy), `UserCollateral` + pure helpers |
+| `orderbook.rs` | Pure CLOB matching engine + `mark()`/`twap()` (no Anchor accounts) |
+| `collateral.rs` | Pure `free_collateral` + deposit/withdraw accounting |
 | `exchange.rs` | Trustless settlement: stake-pool exchange rate + realized yield |
 | `ed25519.rs` | Publisher signature verification via instruction introspection |
 | `error.rs` | `FructusError` error codes |
 | `tests.rs` | Property-based + mock-sysvar integration tests |
+| `tests/` | `collateral_cpi.rs` bank-style CPI tests (solana-program-test) |
 
 ## Publisher (`publisher/`)
 

@@ -19,6 +19,25 @@ reliably infer from config files alone.
 - Yield math uses `u128` intermediates + `checked_*`; staleness uses
   `saturating_sub` — no panicking arithmetic.
 
+## Zero-copy accounts
+
+Large accounts (the `OrderBook` is ~21 KB) **must** use `#[account(zero_copy)]`:
+borsh deserialization copies the whole struct onto the SBF 4 KiB stack and fails
+to build for accounts above it.
+
+- Access via `AccountLoader::load()` / `load_mut()` / `load_init()` — never
+  `Account::try_from` + `.exit()` (zero-copy writes in place; Anchor's
+  `AccountsExit` writes the 8-byte discriminator after the handler returns).
+- Sub-structs use `#[zero_copy]` (adds `#[repr(C)]` + `Copy/Clone/Pod/Zeroable`).
+  `bytemuck::Pod` forbids implicit padding, so **reorder fields and add explicit
+  `_pad: [u8; N]`** to make the layout packing-free.
+- `bool` is not `Pod` (invalid bit patterns) → use `u8` (`0`/`1`).
+- `u128` is avoided in zero-copy layouts (cross-target alignment) → store
+  `[u8; 16]` and convert with `u128::from_le_bytes` / `to_le_bytes`.
+- The `init` constraint needs `space = 8 + T::LEN` where `T::LEN = size_of::<T>()`
+  (discriminator + payload); `#[derive(Default)]` is unreliable over `#[zero_copy]`,
+  so implement `Default` manually.
+
 ## Canonical signature message
 
 - Publisher signs `sha256("fructus::update_apy" ‖ oracle_addr ‖ apy_le(8) ‖ version_le(8))`.

@@ -117,7 +117,7 @@ that provide liquidity and raise the cost of a hostile capital attack.
 - **Language:** Rust (on-chain) + TypeScript (off-chain keeper)
 - **Chain:** Solana
 - **Framework:** Anchor 1.1
-- **Key dependencies:** `anchor-lang`, `anchor-spl`, `solana-sdk-ids`, `@solana/web3.js`
+- **Key dependencies:** `anchor-lang`, `anchor-spl`, `bytemuck`, `solana-sdk-ids`, `@solana/web3.js`
 - **Fuzzing:** Trident
 
 ## Repository layout
@@ -129,8 +129,9 @@ that provide liquidity and raise the cost of a hostile capital attack.
 ├── AGENTS.md                   # Agent orientation (build/test/conventions)
 ├── docs/                       # Project documentation (docs/README.md hub)
 ├── programs/
-│   └── fructus/                # On-chain program (oracle, market, settlement, ed25519)
-│       └── src/
+│   └── fructus/                # On-chain program (oracle, market, CLOB, vault, settlement, ed25519)
+│       ├── src/
+│       └── tests/              # Bank-style CPI integration tests
 ├── publisher/                  # Off-chain TypeScript keeper
 ├── trident-tests/              # On-chain fuzz harness
 ├── CHANGELOG.md
@@ -164,10 +165,11 @@ cd trident-tests && cargo run --bin fuzz_0
 
 Fructus is in **early development** and is currently a **private** repository.
 The **data module** (mark-price APY oracle, trustless settlement reference,
-off-chain keeper, fuzz harness) and the **perpetual market** account
-(`PerpMarket` + `initialize_market`) are implemented and tested; position,
-vault, and trading logic is next. The protocol has not been audited and is not
-deployed to mainnet. Do not use it with real funds.
+off-chain keeper, fuzz harness), the **perpetual market** account
+(`PerpMarket` + `initialize_market`), the **on-chain order book** (CLOB + mark/
+twap), and the **collateral vault** (USDC deposit/withdraw) are implemented and
+tested; position lifecycle, funding, and liquidation are next. The protocol has
+not been audited and is not deployed to mainnet. Do not use it with real funds.
 
 ## License
 
