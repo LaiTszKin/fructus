@@ -328,12 +328,13 @@ proptest! {
         position_collateral in any::<u64>(),
         notional in 1u64..NOTIONAL_MAX,
         amount in 1u64..NOTIONAL_MAX,
+        initial_margin_bps in 1u16..=10_000,
         maintenance_bps in 1u16..=10_000,
         penalty_bps in 0u16..=10_000,
     ) {
         let amount = if amount > notional { notional } else { amount };
         let (remaining, reward) =
-            apply_liquidation(position_collateral, notional, amount, maintenance_bps, penalty_bps).unwrap();
+            apply_liquidation(position_collateral, notional, amount, initial_margin_bps, maintenance_bps, penalty_bps).unwrap();
         prop_assert!(remaining >= 0, "remaining collateral never negative");
         prop_assert!(reward >= 0, "reward never negative");
         prop_assert!(remaining <= position_collateral, "remaining <= position collateral");
@@ -346,40 +347,50 @@ proptest! {
     fn apply_liquidation_invalid_amount_rejected(
         position_collateral in any::<u64>(),
         notional in any::<u64>(),
+        initial_margin_bps in any::<u16>(),
         maintenance_bps in any::<u16>(),
         penalty_bps in any::<u16>(),
     ) {
         // amount == 0 => InvalidAmount regardless of everything else.
         prop_assert_eq!(
-            apply_liquidation(position_collateral, notional, 0, maintenance_bps, penalty_bps),
+            apply_liquidation(position_collateral, notional, 0, initial_margin_bps, maintenance_bps, penalty_bps),
             Err(LiquidateError::InvalidAmount)
         );
         // amount > notional => InvalidAmount.
         let too_big = notional.saturating_add(1).max(1);
         prop_assert_eq!(
-            apply_liquidation(position_collateral, notional, too_big, maintenance_bps, penalty_bps),
+            apply_liquidation(position_collateral, notional, too_big, initial_margin_bps, maintenance_bps, penalty_bps),
             Err(LiquidateError::InvalidAmount)
         );
     }
 
     #[test]
-    fn apply_liquidation_full_releases_maintenance_backing(
+    fn apply_liquidation_full_releases_all_collateral(
         notional in 1u64..NOTIONAL_MAX,
+        initial_margin_bps in 1u16..=10_000,
         maintenance_bps in 1u16..=10_000,
         penalty_bps in 0u16..=10_000,
     ) {
-        // A position backed exactly at its maintenance requirement (bottom of
-        // band — the most under-collateralized state that is still 'health-safe'
-        // at the boundary). Full liquidation must consume at most the backing +
-        // the penalty, never leave negative.
-        let position_collateral = maintenance_margin(notional, maintenance_bps).unwrap();
-        let (remaining, reward) =
-            apply_liquidation(position_collateral, notional, notional, maintenance_bps, penalty_bps).unwrap();
-        let release = maintenance_margin(notional, maintenance_bps).unwrap();
-        let available = position_collateral.saturating_sub(release);
-        prop_assert_eq!(reward, liquidation_penalty(release, penalty_bps).unwrap().min(available));
-        prop_assert_eq!(remaining, available.saturating_sub(reward));
-        prop_assert!(remaining >= 0, "full liquidation never leaves negative remaining");
+        // A real position is backed at the INITIAL margin ratio (state.rs
+        // invariant). A FULL liquidation (`amount == notional`) closes the
+        // position (notional -> 0), so its surviving collateral must be
+        // margin_required(0, _) == 0 — all collateral released, never leaving a
+        // negative remaining.
+        prop_assume!(maintenance_bps < initial_margin_bps);
+        let position_collateral = margin_required(notional, initial_margin_bps).unwrap();
+        let (remaining, reward) = apply_liquidation(
+            position_collateral,
+            notional,
+            notional,
+            initial_margin_bps,
+            maintenance_bps,
+            penalty_bps,
+        )
+        .unwrap();
+        prop_assert_eq!(remaining, margin_required(0, initial_margin_bps).unwrap());
+        prop_assert_eq!(remaining, 0, "full liquidation never leaves negative remaining");
+        prop_assert!(reward >= 0, "reward never negative");
+        prop_assert!(remaining + reward <= position_collateral, "no value created");
     }
 }
 
