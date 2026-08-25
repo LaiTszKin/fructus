@@ -1,7 +1,9 @@
 # Module: Perp Market (PerpMarket + initialize_market)
 
 **Purpose:** Singleton perpetual-market configuration that binds a trustless
-index source to a collateral token and records funding + margin parameters.
+index source to a collateral token and records funding + margin parameters,
+including the funding-accrual state written by `settle_funding` (see
+[funding.md](funding.md)).
 
 ## Public API
 
@@ -31,13 +33,18 @@ index source to a collateral token and records funding + margin parameters.
 | `maintenance_margin_bps` | u16 | maintenance margin, basis points |
 | `authority` | Pubkey | admin |
 | `vault` | Pubkey | collateral-custody PDA (derived, not created at init) |
+| `funding_epoch` | u64 | last settled funding epoch index; `0` before the first `settle_funding` (R-F4) |
+| `index_n` | u64 | stake-pool rate snapshot **numerator** at the last `settle_funding` (the epoch baseline; R-F4) |
+| `index_d` | u64 | stake-pool rate snapshot **denominator** at the last `settle_funding`; `index_n/index_d == 0` marks an un-set baseline |
+| `funding_accumulator` | i128 | cumulative signed funding realized on the market (net-additive; long flows negative, short positive) |
 | `bump` | u8 | market PDA bump |
 
 ## Dependencies
 
 - Inbound: `lib.rs::initialize_market`.
 - Outbound: `constants` (seeds, bounds), `error`, `state` (validators),
-  `exchange` (`STAKE_POOL_PROGRAM_ID`, `ExchangeRate::read`).
+  `exchange` (`STAKE_POOL_PROGRAM_ID`, `ExchangeRate::read`), `funding`
+  (`settle_funding` writes the funding state).
 
 ## Patterns & Gotchas
 
@@ -53,3 +60,7 @@ index source to a collateral token and records funding + margin parameters.
   (seed `"vault"`) but does not create the token account (a later issue).
 - `funding_epoch_slots` has no bound and `collateral_mint` is not validated in
   this iteration (documented out of scope).
+- **Deployment** — `initialize_market` is the first step of the devnet
+  end-to-end lifecycle (`scripts/e2e`: deploy → init market → deposit → open →
+  funding → close → settle), driven via the `sdk/`/`cli/` packages (see
+  [docs README, SDK, CLI & deployment](../README.md#sdk-cli--deployment)).

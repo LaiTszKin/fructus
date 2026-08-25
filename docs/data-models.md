@@ -34,13 +34,21 @@ Singleton PDA, seed `"perp_market"`. Borsh layout (after the 8-byte discriminato
 | `maintenance_margin_bps` | u16 | 90 | maintenance margin, basis points |
 | `authority` | Pubkey | 92 | admin |
 | `vault` | Pubkey | 124 | collateral-custody PDA (derived, not created at init) |
-| `bump` | u8 | 156 | PDA bump |
+| `funding_epoch` | u64 | 156 | last settled funding epoch index; `0` before the first `settle_funding` (R-F4) |
+| `index_n` | u64 | 164 | stake-pool rate snapshot **numerator** at the last `settle_funding` (the epoch baseline; R-F4) |
+| `index_d` | u64 | 172 | stake-pool rate snapshot **denominator**; `index_n/index_d == 0` marks an un-set baseline |
+| `funding_accumulator` | i128 | 180 | cumulative signed funding realized on the market (net-additive; long flows negative, short positive) |
+| `bump` | u8 | 196 | PDA bump |
 
-- `LEN = 157` (packed borsh payload, excluding the 8-byte discriminator).
+- `LEN = 197` (packed borsh payload, excluding the 8-byte discriminator).
 - Singleton seed `"perp_market"`; `index_source` and `collateral_mint` are plain
   fields, not seed components.
 - `funding_k` / `max_funding` use the fixed-point scale `1_000_000`
   (`1.0 == 1_000_000`); the two margin fields use basis points (≤ `10_000`).
+- The funding state (`funding_epoch` / `index_n` / `index_d` /
+  `funding_accumulator`) is zero-initialized at init and written by
+  `settle_funding` (see [modules/funding.md](modules/funding.md)); `i128`
+  borsh-serializes to 16 LE bytes.
 
 ## `OrderBook` (zero-copy account)
 
@@ -146,11 +154,12 @@ One PDA per `(market, user, side)`, seed
 | `entry_n_sum` | u128 | 73 | `Σ(total_lamports × fill_size)` — notional-weighted entry-index running sum |
 | `entry_d_sum` | u128 | 89 | `Σ(pool_token_supply × fill_size)` — notional-weighted entry-index running sum |
 | `collateral` | u64 | 105 | reserved margin = `margin_required(notional, initial_margin_bps)` (ceiling division) |
-| `last_funding_epoch` | u64 | 113 | stored; `0` this iteration (#6 writes it) |
-| `open_slot` | u64 | 121 | (re)creation slot: fill slot (inline taker opens) or settlement slot (maker re-opens via `settle_fill`) |
-| `bump` | u8 | 129 | PDA bump |
+| `last_funding_epoch` | u64 | 113 | last funding epoch this position was settled for (written by `settle_funding`) |
+| `closed_notional` | u64 | 121 | notional closed but not yet realized (written by `close_position`; reset by `settle_close` — R-S1) |
+| `open_slot` | u64 | 129 | (re)creation slot: fill slot (inline taker opens) or settlement slot (maker re-opens via `settle_fill`) |
+| `bump` | u8 | 137 | PDA bump |
 
-- `LEN = 130`.
+- `LEN = 138`.
 - Lazily created on first fill/settlement (payer = user/cranker) and **retained**
   after a full close; `notional == 0` means closed. A re-open resets
   `entry_n_sum` / `entry_d_sum` / `open_slot`.
@@ -163,6 +172,11 @@ One PDA per `(market, user, side)`, seed
   `u128` fields — no per-access byte conversion.
 - Margin is ledger-only: `collateral` mirrors the reserved-margin bookkeeping in
   `UserCollateral.reserved`; no token movement on open or close.
+- `closed_notional` is the settlement seam (issue #7): a lifecycle-only
+  `close_position` records closed fills here, and the permissionless
+  `settle_close` realizes their signed PnL into `UserCollateral.deposited`
+  (clamped so the vault is never insolvent) before resetting it to `0`. See
+  [modules/settlement.md](modules/settlement.md).
 
 ## `ExchangeRate` (derived, not stored)
 
@@ -205,6 +219,10 @@ erDiagram
         u16 maintenance_margin_bps
         Pubkey authority
         Pubkey vault
+        u64 funding_epoch
+        u64 index_n
+        u64 index_d
+        i128 funding_accumulator
     }
     OrderBook {
         Pubkey market
@@ -228,6 +246,7 @@ erDiagram
         u128 entry_d_sum
         u64 collateral
         u64 last_funding_epoch
+        u64 closed_notional
         u64 open_slot
     }
     ExchangeRate {

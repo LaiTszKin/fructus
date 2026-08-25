@@ -6,7 +6,7 @@ accumulator **inline** — no per-order PDA accounts, no off-chain book, no
 oracle. The matching engine is a pure, dependency-free Rust module
 (`crate::orderbook`) so its invariants are locked by `proptest` before any
 instruction runs. `mid()` is the book-derived mark; `twap()` is the windowed
-time-weighted mid primitive that liquidation (#8) will consume. Every `Fill`
+time-weighted mid primitive that liquidation (#8) consumes. Every `Fill`
 event carries the **fill-time index snapshot** (`entry_total_lamports` /
 `entry_pool_token_supply`) plus a `settled` flag so the position lifecycle (#5)
 can book resting makers at the rate in effect when they filled.
@@ -155,7 +155,8 @@ holds no privileged state, and cannot mint or move value.
   toward zero** (integer floor on unsigned values). The result is always within
   `[best_bid, best_ask]` inclusive. It returns **`None` when the book is
   one-sided or empty** (`best_bid == 0 || best_ask == 0`); the index-source
-  fallback for funding is issue #6's boundary, not this module's.
+  fallback for funding is `settle_funding`'s boundary (see
+  [funding.md](funding.md)), not this module's.
 - **`record_observation`** — on every book mutation, appends
   `cumulative_mid += previous_mid × Δslot` (`u128`, saturating): the elapsed
   interval saw the **pre-mutation** mid, so that is what is charged, never the

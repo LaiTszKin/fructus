@@ -60,6 +60,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejected).
 - Trident fuzz harness (`trident-tests/`): stateful fuzzing of `initialize` +
   publisher-signed `update_apy`, asserting APY bounds and version monotonicity.
+- Position lifecycle (open/close long & short) + maker settlement (#5):
+  - Per-`(market, user, side)` `Position` ledger with notional-weighted entry
+    running sums (`entry_n_sum`/`entry_d_sum`), ledger-only margin
+    (`Position.collateral` ↔ `UserCollateral.reserved`), and reuse of the CLOB.
+  - Instructions: `open_position` (taker-fulfill inline), `close_position`
+    (lifecycle-only), `settle_fill` (idempotent maker settlement), `reset_position`.
+  - Pure `positions.rs` module: `margin_required` (ceiling), entry accumulation,
+    signed PnL (`signed_yield_change` + `pnl`), `apply_pnl` (credit/clamp);
+    `proptest` invariants for margin bounds, leverage cap, and PnL sign.
+- Funding engine (#6) — anchor on-chain `mark` to the trustless `index`:
+  - Sign convention `premium > 0 ⇒ longs pay shorts` (exact opposites); signed
+    `i128` `premium`/`funding_rate` (clamped `±max_funding`) /`funding_payment`;
+    epoch = `slot / funding_epoch_slots`, idempotent per-epoch accrual.
+  - `PerpMarket` gains `funding_epoch`/`index_n`/`index_d`/`funding_accumulator`;
+    permissionless `settle_funding` (per-position), mark falls back to `index`
+    on a one-sided/empty book.
+- Trustless realized-yield settlement (#7):
+  - `Position.closed_notional`; permissionless `settle_close` realizes the
+    **signed** index-based `positions::pnl` into `UserCollateral.deposited`
+    (negative clamped so the vault never goes negative); depends only on
+    `exchange.rs` data, never the mark oracle.
+- Liquidation engine (#8) — solvency backstop at the order-book TWAP:
+  - `liquidation.rs`: `equity`, `maintenance_margin`, `liquidatable` (strict `<`,
+    equality healthy, zero-notional never liquidatable), `liquidation_penalty`
+    (bounded by collateral), `apply_liquidation` (partial/full, rewards the
+    liquidator, never yields negative collateral).
+  - Permissionless `liquidate` instruction (partial + full, penalty to the
+    liquidator; i128 health math, no panicking arithmetic).
+- Trader TypeScript SDK (#10):
+  - `sdk/` — instruction builders for the full program surface, typed account
+    decoders (`PerpMarket`/`Position`/`UserCollateral`/`OrderBook`/`YieldOracle`),
+    funding/PnL/mark/index helpers, cross-language vector tests (byte-identical
+    to the Rust `funding.rs`/`positions.rs`/`orderbook.rs`).
+- Trader CLI (#11):
+  - `cli/` — `open`/`close`/`deposit`/`withdraw`/`position`/`funding`/`mark`/
+    `index` over the SDK: dry-run by default, `--network`/`--submit` live.
+- Devnet deployment + end-to-end lifecycle (#9):
+  - `scripts/` — `deploy.sh` (build + deploy + record program id / PerpMarket PDA),
+    `e2e.mts` (deploy → init → deposit → open long/short → funding → close →
+    settle, asserting the funding sign convention), `Anchor.toml` devnet profile.
+- Adversarial review invariants (`review_tests.rs`, `sdk/test/review-invariants.test.ts`):
+  property-based proof over the funding/liquidation/settlement logic; one
+  confirmed CLI mark-fallback bug found and fixed (`cli/src/commands/funding.ts`).
 
 ## [0.1.0] - 2026-08-19
 

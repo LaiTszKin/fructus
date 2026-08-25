@@ -7,18 +7,22 @@ makers' fills from the event queue. The lifecycle is **order-driven**: orders
 are the only way positions change, and positions result from matched fills.
 Margin is **ledger-only** — `Position.collateral` is reserved inside
 `UserCollateral.reserved`, so the #4 `free_collateral` seam gates every open
-and every withdrawal — and PnL is a pure signed function (realizing it into
-collateral is issue #7). All arithmetic is `u64`/`u128`/`i128` +
-`checked_*`/`saturating_*`; the property-testable logic lives in the pure
-`crate::positions` module (mirroring `orderbook.rs` / `collateral.rs`).
+and every withdrawal — and PnL is a pure signed function realized into
+collateral by the permissionless `settle_close` (see
+[settlement.md](settlement.md)). `close_position` stays **lifecycle-only** (D4):
+it records the closed notional for `settle_close` but never realizes PnL itself.
+All arithmetic is `u64`/`u128`/`i128` + `checked_*`/`saturating_*`; the
+property-testable logic lives in the pure `crate::positions` module (mirroring
+`orderbook.rs` / `collateral.rs`).
 
 ## Public API
 
 | Instruction | Signature | Description |
 | --- | --- | --- |
 | `open_position` | `(side: u8, size: u64, price: u64)` | Open (or add to) a position: place a limit order (`price != 0`, rests if non-crossing) or market-IOC order (`price == 0`); taker fills settle inline |
-| `close_position` | `(side: u8, size: u64)` | Reduce/close the named side with a market-IOC order on the **opposite** side; lifecycle-only (no PnL settlement) |
+| `close_position` | `(side: u8, size: u64)` | Reduce/close the named side with a market-IOC order on the **opposite** side; lifecycle-only — records `closed_notional` but does **not** settle PnL |
 | `settle_fill` | `(seq: u64)` | Permissionless: book one resting maker's `Fill` from the event queue (open-intent, idempotent) |
+| `settle_close` | `()` | Permissionless: realize the signed PnL of `closed_notional` into collateral (see [settlement.md](settlement.md)) |
 
 | Pure function | Signature | Description |
 | --- | --- | --- |
@@ -27,6 +31,7 @@ collateral is issue #7). All arithmetic is `u64`/`u128`/`i128` +
 | `normalize_sums` | `(entry_n_sum: u128, entry_d_sum: u128) -> (u64, u64)` | Shared power-of-two shift (`k = max(0, bitlen(max) − 45)`); the larger sum lands in `[2^44, 2^45)` |
 | `signed_yield_change` | `(entry_n_sum: u128, entry_d_sum: u128, cur_n: u64, cur_d: u64) -> Option<i128>` | `(rate_cur / rate_entry − 1) × APY_SCALE` **with sign**, cross-multiplied; `None` on degenerate inputs |
 | `pnl` | `(entry_n_sum, entry_d_sum, cur_n, cur_d, notional: u64, side) -> Option<i128>` | `notional × signed_yield_change / APY_SCALE × (+1 Long, −1 Short)`, signed USDC microunits, truncating toward zero |
+| `apply_pnl` | `(deposited: u64, pnl: i128) -> Option<u64>` | Add signed PnL to `deposited`: a profit credits (`None` only on a positive overflow); a loss debits **clamped at `0`** so `deposited` never goes negative (the vault is never insolvent — R-S3). This is the pure ledger transition for `settle_close` / `settle_funding` |
 | `validate_open_args` | `(side: u8, size: u64) -> Result<()>` | `side` must be `0`/`1` (`ProgramError::InvalidInstructionData` otherwise — the existing `side_from_u8` behavior, no `InvalidSide` variant), `size > 0` (`InvalidSize`) |
 
 ## The `Position` account
@@ -38,8 +43,8 @@ One PDA per `(market, user, side)`, seed
 simultaneously and `close_position(side)` names its target. Payload (borsh,
 after the 8-byte discriminator): `market` (32) · `owner` (32) · `side` (1) ·
 `notional` (8) · `entry_n_sum` (16) · `entry_d_sum` (16) · `collateral` (8) ·
-`last_funding_epoch` (8) · `open_slot` (8) · `bump` (1), `LEN = 130`. Full
-field-level offsets in [data-models.md](../data-models.md).
+`last_funding_epoch` (8) · `closed_notional` (8) · `open_slot` (8) · `bump` (1),
+`LEN = 138`. Full field-level offsets in [data-models.md](../data-models.md).
 
 - Lazily created on first fill/settlement (payer = the user for inline taker
   fills, the settler for `settle_fill`) and **retained** after a full close;
@@ -74,7 +79,9 @@ stateDiagram-v2
    (`InvalidSize`), `notional > 0` (`PositionNotFound`), and `size <= notional`
    (`InvalidCloseSize`); place a **market-IOC order on the opposite side**.
    Taker fills reduce the position (`notional -= size`, entry unchanged, margin
-   released). No PnL settlement (issue #7 owns realizing PnL).
+   released) and **add `size` to `closed_notional`** (R-S1). Still **no PnL
+   settlement** — the lifecycle is closed but the profit/loss stays unrealized
+   until a later `settle_close`.
 3. **Maker settlement** — `settle_fill(seq)`: locate `slot = seq %
    EVENT_QUEUE_LEN`; if the slot holds a `Fill` with `event.seq == seq` and
    `settled != 0`, return `Ok` (idempotent no-op); otherwise require
@@ -87,6 +94,16 @@ stateDiagram-v2
    fills; they never touch a taker's position. Residuals originate only from
    position-neutral `place_limit_order` (D10′), so the crank takes **no
    position accounts** and never settles positions.
+5. **Position settlement** — `settle_close()` (R-S2/R-S3): if
+   `closed_notional > 0`, realize the **signed** index-based PnL over that
+   notional into `UserCollateral.deposited` (via `positions::pnl` +
+   `apply_pnl`) and reset `closed_notional = 0`. See
+   [settlement.md](settlement.md) for the flow; `closed_notional == 0` is an
+   idempotent no-op.
+6. **Funding & liquidation** — `settle_funding` accrues signed funding over the
+   full elapsed epochs (see [funding.md](funding.md)); `liquidate` enforces the
+   maintenance-margin floor on an under-margin position (see
+   [liquidation.md](liquidation.md)).
 
 ### Open-intent maker settlement (D5)
 
@@ -151,9 +168,32 @@ pnl = notional × signed_yield_change / APY_SCALE × side                       
 
 Truncation toward zero gives the quantization floor: `pnl == 0` whenever
 `notional × |signed_yield_change| < APY_SCALE`. Realizing PnL into
-`UserCollateral` is issue #7 — this iteration only computes it (with sign
-tests: `pnl(Long) > 0 ⟺ rate_cur > rate_entry`, `pnl(Short)` the exact
-opposite).
+`UserCollateral` is `settle_close` (see [settlement.md](settlement.md)); this
+module only computes it (with sign tests: `pnl(Long) > 0 ⟺ rate_cur >
+rate_entry`, `pnl(Short)` the exact opposite).
+
+### `closed_notional` + `apply_pnl` (R-S1/R-S2/R-S3)
+
+`close_position` stays lifecycle-only (D4) but **records** every closed fill in
+`Position.closed_notional` (`closed_notional += size`, in `apply_close_fills`)
+and settles nothing. Since entry running sums are left unchanged on close, the
+closed notional's PnL is still determinable from the entry index + the current
+rate. `settle_close` reads `closed_notional` and, if `> 0`, applies:
+
+```
+pnl        = pnl(entry_n_sum, entry_d_sum, cur_n, cur_d, closed_notional, side)  (signed i128)
+deposited' = apply_pnl(deposited, pnl)                                           (clamped at 0)
+```
+
+`apply_pnl` is the pure ledger transition that both `settle_close` and
+`settle_funding` use:
+- `pnl == 0` ⇒ `Some(deposited)` — settled but unchanged.
+- `pnl > 0` ⇒ `deposited + pnl`, `None` only on a positive `u64` overflow.
+- `pnl < 0` ⇒ `deposited − |pnl|`, **clamped at `0`** so `deposited` never goes
+  negative (the vault is never insolvent; R-S3). A loss never returns `None`.
+
+`Position.closed_notional` is reset to `0` by `settle_close`; `Position
+.last_funding_epoch` is advanced by `settle_funding`.
 
 ## Settlement flow
 
@@ -181,6 +221,11 @@ graph LR
   emits. `settle_fill` itself is not fill-producing and takes no `index_source`.
 - **Idempotency**: `settled` flips to `1` on consumption; a second
   `settle_fill` on the same `seq` is a no-op.
+- **Separate close settlement path**: a taker's `close_position` reduces
+  `notional` and adds to `closed_notional` inline, but realizes nothing; the
+  maker's `settle_fill` is open-intent only. The realized (index-based) PnL of
+  closed notional is settled by the later permissionless `settle_close` read
+  against the live stake-pool index — never the mark oracle.
 
 ## Liveness bound (OQ-1)
 
@@ -196,8 +241,10 @@ practice: `settle_fill` promptly (or crank first to drain), and retry on
 
 ## Dependencies
 
-- Inbound: `lib.rs` (`open_position`, `close_position`, `settle_fill`;
-  `place_*`/`crank` only consume the `index_source` stamping).
+- Inbound: `lib.rs` (`open_position`, `close_position`, `settle_fill`,
+  `settle_close`; `settle_funding` / `liquidate` consume the `Position` /
+  `UserCollateral` accounts; `place_*`/`crank` only consume the `index_source`
+  stamping).
 - Outbound: `positions` (pure margin/entry/PnL logic), `constants`
   (`POSITION_SEED`, `EVENT_QUEUE_LEN`, `APY_SCALE`, `MAX_MATCH_STEPS`), `error`
   (`PositionNotFound`, `EventNotFound`, `InvalidCloseSize`, reused
@@ -213,8 +260,12 @@ practice: `settle_fill` promptly (or crank first to drain), and retry on
   `lib.rs` applies them to the on-chain `Position`/`UserCollateral` accounts.
 - **Order-driven** — positions only change through matched fills; there is no
   direct position mutation instruction.
-- **Close is lifecycle-only** — it reduces `notional` and releases margin but
-  never realizes PnL; #7 owns settlement.
+- **Close is lifecycle-only** — it reduces `notional`, releases margin, and
+  records `closed_notional`, but never realizes PnL; the permissionless
+  `settle_close` owns settlement (see [settlement.md](settlement.md)).
+- **`closed_notional` is the settlement seam** — entry sums are left unchanged on
+  close, so the closed notional's signed PnL is re-derivable from the entry
+  index + the current rate; `apply_pnl` clamps a loss at the deposited balance.
 - **Entry sums reset on re-open** — from `notional == 0`, the new fill's
   snapshot replaces the sums, and `open_slot` is reset to the settlement slot
   (maker re-opens) or the fill slot (inline taker opens).

@@ -114,10 +114,11 @@ that provide liquidity and raise the cost of a hostile capital attack.
 
 ## Technology
 
-- **Language:** Rust (on-chain) + TypeScript (off-chain keeper)
+- **Language:** Rust (on-chain) + TypeScript (off-chain keeper, SDK, CLI, scripts)
 - **Chain:** Solana
 - **Framework:** Anchor 1.1
 - **Key dependencies:** `anchor-lang`, `anchor-spl`, `bytemuck`, `solana-sdk-ids`, `@solana/web3.js`
+- **Testing/verification:** `proptest`, `solana-program-test` (CPI), Trident, `tsx --test`
 - **Fuzzing:** Trident
 
 ## Repository layout
@@ -129,10 +130,13 @@ that provide liquidity and raise the cost of a hostile capital attack.
 ├── AGENTS.md                   # Agent orientation (build/test/conventions)
 ├── docs/                       # Project documentation (docs/README.md hub)
 ├── programs/
-│   └── fructus/                # On-chain program (oracle, market, CLOB, vault, settlement, ed25519)
+│   └── fructus/                # On-chain program (oracle, market, CLOB, vault, positions, funding, liquidation, ed25519)
 │       ├── src/
 │       └── tests/              # Bank-style CPI integration tests
-├── publisher/                  # Off-chain TypeScript keeper
+├── publisher/                  # Off-chain TypeScript APY keeper
+├── sdk/                        # Trader TypeScript SDK (builders, decoders, funding/PnL mirrors)
+├── cli/                        # Trader CLI over the SDK (open/close/deposit/withdraw/position/funding/mark/index)
+├── scripts/                    # Devnet deploy + e2e lifecycle (deploy.sh, e2e.mts)
 ├── trident-tests/              # On-chain fuzz harness
 ├── CHANGELOG.md
 └── LICENSE
@@ -153,6 +157,13 @@ cargo test --workspace
 # Run the off-chain publisher tests
 cd publisher && npm test
 
+# Run the trader SDK + CLI suites
+cd sdk && npm test && npm run build
+cd .. && cd cli && npm test && npm run build
+
+# Offline devnet lifecycle dry-run (RUN_E2E=1 = live)
+cd scripts && npm run e2e
+
 # Run the on-chain fuzz smoke test
 cd trident-tests && cargo run --bin fuzz_0
 ```
@@ -163,13 +174,18 @@ cd trident-tests && cargo run --bin fuzz_0
 
 ## Status
 
-Fructus is in **early development** and is currently a **private** repository.
-The **data module** (mark-price APY oracle, trustless settlement reference,
-off-chain keeper, fuzz harness), the **perpetual market** account
-(`PerpMarket` + `initialize_market`), the **on-chain order book** (CLOB + mark/
-twap), and the **collateral vault** (USDC deposit/withdraw) are implemented and
-tested; position lifecycle, funding, and liquidation are next. The protocol has
-not been audited and is not deployed to mainnet. Do not use it with real funds.
+Fructus is in **early development** and is currently a **private** repository. The
+**data module** (mark-price APY oracle, trustless settlement reference,
+off-chain keeper, fuzz harness), the **perpetual market** account (`PerpMarket` +
+`initialize_market`), the **on-chain order book** (CLOB + mark/twap), the
+**collateral vault** (USDC deposit/withdraw), the **position lifecycle**
+(open/close long & short), the **funding engine** (anchor mark → index), the
+**trustless settlement** (`settle_close`, realized-yield PnL), and the
+**liquidation engine** (TWAP mark + penalty/liquidator incentive) are
+implemented and tested; a **trader SDK** (`sdk/`), a **trader CLI** (`cli/`),
+and a **devnet deploy + e2e lifecycle script** (`scripts/`) are provided. The
+protocol has **not been audited** and is **not deployed to mainnet**. Do not use
+it with real funds.
 
 ## License
 

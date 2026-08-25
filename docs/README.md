@@ -24,8 +24,11 @@ trustless settlement reference, off-chain keeper, and fuzz harness) and the
 | Understand the perpetual market | [modules/market.md](modules/market.md) |
 | Understand the on-chain order book | [modules/order-book.md](modules/order-book.md) |
 | Understand the position lifecycle | [modules/positions.md](modules/positions.md) |
+| Understand the funding engine | [modules/funding.md](modules/funding.md) |
+| Understand liquidation | [modules/liquidation.md](modules/liquidation.md) |
 | Understand the collateral vault | [modules/collateral.md](modules/collateral.md) |
 | Understand the off-chain keeper | [modules/publisher.md](modules/publisher.md) |
+| Use the SDK / CLI / deploy to devnet | [SDK, CLI & deployment](#sdk-cli--deployment) |
 | Run tests / fuzz | [testing.md](testing.md) |
 | Learn code conventions | [conventions.md](conventions.md) |
 | Follow a task recipe | [workflows.md](workflows.md) |
@@ -41,6 +44,8 @@ trustless settlement reference, off-chain keeper, and fuzz harness) and the
 - [modules/market.md](modules/market.md) — perpetual market + `initialize_market`
 - [modules/order-book.md](modules/order-book.md) — order book + matching engine + mark/twap
 - [modules/positions.md](modules/positions.md) — position lifecycle (open/close long & short)
+- [modules/funding.md](modules/funding.md) — funding engine (premium, funding rate, `settle_funding`)
+- [modules/liquidation.md](modules/liquidation.md) — liquidation (health, TWAP reference, `liquidate`)
 - [modules/collateral.md](modules/collateral.md) — collateral vault + deposit/withdraw
 - [modules/publisher.md](modules/publisher.md) — off-chain keeper
 - [api-reference.md](api-reference.md) — instruction reference + signature scheme
@@ -48,3 +53,30 @@ trustless settlement reference, off-chain keeper, and fuzz harness) and the
 - [setup.md](setup.md) — getting started
 - [testing.md](testing.md) — test strategy + commands
 - [workflows.md](workflows.md) — task recipes
+
+## SDK, CLI & deployment
+
+The on-chain program (issues #2–#8) ships a typed **TypeScript SDK** (`sdk/`), a
+**CLI** (`cli/`), and a devnet **end-to-end deployment** step — the offline-built
+deliverables of [issues #9–#11](../.plan/20260820/funding-settlement-liquidation-sdk/design.md)
+(the design artifact is gitignored, so it lives in the working tree, not the
+repo):
+
+- **`sdk/`** — typed TS client mirroring the program: `open`/`close` long & short,
+  `deposit`/`withdraw`; query `position`/`mark`/`index`/`funding`; compute expected
+  funding + PnL. Ships typed decoders for `PerpMarket`, `Position`,
+  `UserCollateral`, `OrderBook`, `YieldOracle` and a cross-language vector test
+  freezing the funding formula + account layouts byte-identical with the program.
+- **`cli/`** — `open`, `close`, `deposit`, `withdraw`, `position`, `funding`,
+  `mark`, `index`; keypair from env/flag (never committed), `.env` handling
+  consistent with `publisher/`.
+- **Devnet deployment** — `scripts/e2e` runs the full lifecycle
+  (deploy → init market → deposit → open → funding → close → settle) via a
+  `publisher`-style npm script, with the devnet program id + market address
+  documented in the deploy doc.
+
+`[INFERRED]`: these packages are built offline; the actual devnet deploy/verify
+is a documented runnable step per the design. The build/tests above cover the
+on-chain program; the SDK/CLI/e2e suite is exercised from `sdk/`, `cli/`, and
+`scripts/` respectively.
+
