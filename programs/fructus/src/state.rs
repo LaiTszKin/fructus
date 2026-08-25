@@ -243,22 +243,19 @@ pub struct OrderBook {
 }
 
 impl Default for OrderBook {
+    /// Build the all-zero book via `bytemuck::Zeroable::zeroed()`.
+    ///
+    /// The previous per-field literal constructed every fixed-capacity array
+    /// (`[OutEvent::default(); EVENT_QUEUE_LEN]`, `[Order::default();
+    /// MAX_ORDERS_PER_SIDE]`, …) as large stack temporaries, so the SBF-derived
+    /// `OrderBook::default` frame exceeded the 4 KiB Solana stack budget and
+    /// `anchor build`/`cargo build-sbf` warned "Stack offset … exceeded max
+    /// offset of 4096". `#[zero_copy]` marks the struct `bytemuck::Pod` +
+    /// `Zeroable`, so an all-zero value IS the canonical default and is
+    /// produced in place (no big callee stack frame). A zero-copy account's
+    /// default must be all zeroes.
     fn default() -> Self {
-        Self {
-            next_seq: 0,
-            best_bid: 0,
-            best_ask: 0,
-            event_read_cursor: 0,
-            event_write_cursor: 0,
-            twap_cursor: 0,
-            market: Pubkey::default(),
-            bump: 0,
-            _pad: [0u8; 7],
-            bids: [Order::default(); MAX_ORDERS_PER_SIDE],
-            asks: [Order::default(); MAX_ORDERS_PER_SIDE],
-            events: [OutEvent::default(); EVENT_QUEUE_LEN],
-            observations: [Observation::default(); TWAP_OBSERVATIONS],
-        }
+        bytemuck::Zeroable::zeroed()
     }
 }
 
@@ -486,5 +483,46 @@ mod tests {
             // Byte-level compare per AGENTS.md (no type-identity dependence).
             assert_eq!(pda.as_ref(), created.as_ref());
         }
+    }
+
+    /// `OrderBook::default()` must be the all-zero canonical value — identical to
+    /// a zeroed `bytemuck` buffer — because `initialize_order_book` creates the
+    /// account via `load_init` (zeroed memory) and reinterprets the bytes in
+    /// place (zero-copy), so a default must never carry stale non-zero bytes.
+    ///
+    /// This pins the `Default` impl that was changed to
+    /// `bytemuck::Zeroable::zeroed()`: the previous per-field literal built every
+    /// fixed-capacity array (`[OutEvent::default(); EVENT_QUEUE_LEN]`, …) as large
+    /// stack temporaries, so the SBF-derived `OrderBook::default` frame exceeded
+    /// the 4 KiB Solana stack budget and `cargo build-sbf` / `anchor build`
+    /// reported "Stack offset … exceeded max offset of 4096". The SBF build is the
+    /// true guard for that stack-size issue; this host test guards the value
+    /// semantics (all-zero) that the change must preserve.
+    #[test]
+    fn order_book_default_is_all_zero() {
+        let d = OrderBook::default();
+        let z: OrderBook = bytemuck::Zeroable::zeroed();
+        assert_eq!(
+            bytemuck::bytes_of(&d),
+            bytemuck::bytes_of(&z),
+            "default() must equal a zeroed OrderBook so initialize_order_book's \
+             load_init semantics stay byte-identical"
+        );
+        // Spot-check the header and a few ring slots are zero.
+        assert_eq!(d.next_seq, 0);
+        assert_eq!(d.best_bid, 0);
+        assert_eq!(d.best_ask, 0);
+        assert_eq!(d.event_read_cursor, 0);
+        assert_eq!(d.event_write_cursor, 0);
+        assert_eq!(d.twap_cursor, 0);
+        assert_eq!(d.market, Pubkey::default());
+        assert_eq!(d.bump, 0);
+        assert!(d.bids.iter().all(|o| o.active == 0));
+        assert!(d.asks.iter().all(|o| o.active == 0));
+        assert!(d
+            .events
+            .iter()
+            .all(|e| e.seq == 0 && e.kind == 0 && e.settled == 0));
+        assert!(d.observations.iter().all(|o| o.slot == 0));
     }
 }
