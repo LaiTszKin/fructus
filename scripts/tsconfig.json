@@ -12,5 +12,5 @@
     "sourceMap": true,
     "declaration": false
   },
-  "include": ["e2e.mts"]
+  "include": ["e2e.mts", "selfcontained.mts"]
 }

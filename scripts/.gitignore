@@ -1,3 +1,5 @@
 node_modules/
 dist/
 deploy-output.json
+# Per-run solana CLI config (points at the local authority keypair + devnet).
+devnet-config.yml

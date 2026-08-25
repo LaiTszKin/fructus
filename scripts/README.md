@@ -64,6 +64,60 @@ cd scripts
 npm install
 ```
 
+### Optional tool: self-owned stake-pool bootstrap
+
+The self-contained bootstrap (`npm run setup`) also creates a devnet SPL Stake
+Pool to use as `INDEX_SOURCE`. That needs the stake-pool CLI (not shipped with
+`spl-token`):
+
+```bash
+cargo install spl-stake-pool-cli
+export PATH="$HOME/.cargo/bin:$PATH"
+```
+
+---
+
+## Self-contained bootstrap (`npm run setup`)
+
+The e2e walk needs three external inputs: devnet SOL (rent + fees), an index
+source (a devnet SPL Stake Pool), and collateral (USDC). The external USDC
+faucet and the lack of a usable devnet stake pool make those flaky, so
+`scripts/selfcontained.mts` bootstraps them without either:
+
+```bash
+cd scripts
+npm run setup            # wallets -> airdrop SOL -> collateral mint -> stake pool -> validate -> env
+npm run setup -- --preflight   # tool + keypair check only; no transactions
+```
+
+What it does (idempotent — each step skips if already done):
+
+1. **wallets**   — ensure `authority`, `long`, `short` keypairs (all `*.keypair.json`
+   under `scripts/`, gitignored).
+2. **sol airdrop** — funds the three wallets with devnet SOL (target: 2 / 0.1 / 0.1).
+   Devnet airdrops are rate-limited per IP; if the faucet is saturated the script
+   just logs the current balance and you re-run later (or airdrop from another
+   connection).
+3. **collateral** — creates a self-owned **6-decimal** SPL mint and mints the
+   deposit into both traders' ATAs (no USDC faucet; see the security note below).
+4. **stake pool** — `spl-stake-pool create-pool` + `deposit-sol` to give the pool a
+   real (non-zero) exchange rate → the `INDEX_SOURCE`. Prints the pool address.
+5. **validate** — asserts the pool satisfies Fructus `read_exchange_rate` (owner
+   `SPoo1Ku8…`, `account_type` byte `1`, `total_lamports@258 > 0`,
+   `pool_token_supply@266 > 0`) and that both trader ATAs hold ≥ `DEPOSIT_AMOUNT`.
+6. **env** — prints the export block for `npm run deploy` + `npm run e2e:network`.
+
+> **Collateral-mint security note (mainnet):** the on-chain program only ever
+> checks that the collateral mint has `decimals == 6` (`lib.rs`
+> `initialize_collateral_vault`); it does **not** require the mint to be USDC.
+> So a self-minted test token is a *valid* collateral on devnet. That safety is
+> a **trust-the-operator** property: on mainnet the deploy authority must choose
+> a mint with no arbitrary mint authority (e.g. Circle USDC) — otherwise a
+> mintable collateral token lets the operator inflate/settle against a rigged
+> asset. This is a governance/parameter risk, **not** a program bug; the vault
+> authority is the vault PDA and withdrawals are per-user, so no admin can
+> directly drain the vault. See `docs/modules/liquidation.md`.
+
 ---
 
 ## Command sequence
