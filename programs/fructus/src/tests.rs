@@ -4,17 +4,21 @@
 //! monotonicity), REQ-5 (APY bounds), REQ-7/REQ-9 (staleness, overflow safety).
 
 use anchor_lang::prelude::*;
+use anchor_lang::system_program;
 use proptest::prelude::*;
 
-use crate::constants::MAX_APY;
+use crate::constants::{EVENT_QUEUE_LEN, MAX_APY, POSITION_SEED};
 use crate::ed25519::{parse_ed25519_instruction, ED25519_PUBKEY_LEN};
+use crate::error::FructusError;
 use crate::exchange::{
     annualize, ExchangeRate, ACCOUNT_TYPE_OFFSET, ACCOUNT_TYPE_STAKE_POOL,
     POOL_TOKEN_SUPPLY_OFFSET, TOTAL_LAMPORTS_OFFSET,
 };
+use crate::positions::margin_required;
 use crate::state::{
     apy_in_bounds, funding_k_in_bounds, initial_margin_in_bounds, is_stale,
     maintenance_margin_in_bounds, max_funding_in_bounds, update_message, validate_version,
+    Position, UserCollateral,
 };
 use solana_instruction::BorrowedInstruction;
 use solana_instructions_sysvar::construct_instructions_data;
@@ -770,12 +774,14 @@ fn collateral_boundary_edges() {
     assert_eq!(withdraw(10, 5, 5), Some(5), "exactly free -> Some");
 }
 
-// --- Review regression tests (red) ----------------------------------------
+// --- Review regression tests (green) ---------------------------------------
 //
-// Each test below pins a review finding and currently FAILS against the working
-// tree. T1/T2 are pure-logic; T3/T5/T6 are static-contract findings (dead error
-// variants, an umbrella dev-dependency, a missing required constant) pinned as
-// source-content assertions because they have no runtime behavior to exercise.
+// Each test below pins a review finding and is now GREEN (the finding was
+// fixed; the test is the regression guard — it turns red if the corresponding
+// contract regresses). T1/T2 are pure-logic; T3/T5/T6 are static-contract
+// findings (dead error variants, an umbrella dev-dependency, a missing required
+// constant) pinned as source-content assertions because they have no runtime
+// behavior to exercise.
 
 /// A zero-initialized on-chain `OrderBook` account, mirroring the empty account
 /// the `initialize_order_book` handler produces (all slots default).
@@ -814,7 +820,7 @@ fn event_ring_wrap_does_not_silently_drop_deferred_residual() {
     // 2 as a Residual event (8 fills + 1 residual => write_cursor == 9, and the
     // residual lands in slot 8).
     let incoming = ob_order(1, Side::Bid, 30, 10, 0);
-    crate::match_limit_taker(&mut account, &mut book, incoming).unwrap();
+    crate::match_limit_taker(&mut account, &mut book, incoming, 0, 0).unwrap();
     assert_eq!(account.events[8].kind, crate::EVENT_KIND_RESIDUAL);
 
     // Fill the ring past capacity WITHOUT draining (read_cursor stays 0): the
@@ -828,6 +834,8 @@ fn event_ring_wrap_does_not_silently_drop_deferred_residual() {
             crate::SIDE_BID,
             i as u64,
             1,
+            0,
+            0,
         );
     }
 
@@ -916,11 +924,13 @@ fn max_price_levels_per_side_constant_exists() {
     );
 }
 
-// --- Review regression tests, round 2 (red) --------------------------------
+// --- Review regression tests, round 2 (green) ------------------------------
 //
-// Each test below pins a round-2 review finding and currently FAILS against the
-// working tree. F1/F2/F3/F4 are pure-logic (record_observation /
-// match_limit_taker / append_event); F5 is a static doc/code-drift finding.
+// Each test below pins a round-2 review finding and is now GREEN (the finding
+// was fixed; the test is the regression guard — it turns red if the
+// corresponding contract regresses). F1/F2/F3/F4 are pure-logic
+// (record_observation / match_limit_taker / append_event); F5 is a static
+// doc/code-drift finding.
 
 /// F1 (TWAP mis-weighting): `record_observation` is fed the POST-mutation
 /// `mid(&book)` by every book-mutating handler (`save_book` runs first, then
@@ -987,7 +997,7 @@ fn crank_resumed_residual_is_not_rejected_with_book_full() {
     // so it tries to rest — but the bid side is full -> BookFull -> the crank
     // reverts and wedges on the offending Residual forever.
     let residual = ob_order(1, Side::Bid, 100, 10, 65);
-    let result = crate::match_limit_taker(&mut account, &mut book, residual);
+    let result = crate::match_limit_taker(&mut account, &mut book, residual, 0, 0);
 
     assert!(
         result.is_ok(),
@@ -1025,7 +1035,7 @@ fn deferred_residual_is_not_silently_dropped_on_full_ring() {
     };
     let incoming = ob_order(1, Side::Bid, 30, 10, 0);
 
-    let result = crate::match_limit_taker(&mut account, &mut book, incoming);
+    let result = crate::match_limit_taker(&mut account, &mut book, incoming, 0, 0);
 
     let residual_queued = account
         .events
@@ -1059,7 +1069,7 @@ fn match_limit_taker_preserves_non_self_fills_when_remainder_self_trades() {
     // remaining crossable maker is the self-owned ask -> currently SelfTrade.
     let incoming = ob_order(1, Side::Bid, 10, 150, 2);
 
-    let result = crate::match_limit_taker(&mut account, &mut book, incoming);
+    let result = crate::match_limit_taker(&mut account, &mut book, incoming, 0, 0);
 
     assert!(
         result.is_ok(),
@@ -1091,4 +1101,644 @@ fn api_reference_error_wiring_is_current() {
              with require! checks"
         );
     }
+}
+
+// --- Review regression tests, round 3 (position-lifecycle review) ----------
+//
+// Each test below pins a finding from the position-lifecycle review (issue #5)
+// and is now GREEN (the finding was fixed as part of the feature change; the
+// test is the regression guard — it turns red if the corresponding contract
+// regresses):
+//
+//   F1  — acceptance A-3's documented unit-test name
+//         `position_lifecycle_notional_zero_is_closed` must exist in the crate,
+//         so the documented evidence command runs ≥ 1 test.
+//   F2a — acceptance A-6's documented unit-test name
+//         `open_position_rejects_zero_size_and_invalid_side` must exist in
+//         positions.rs.
+//   F2b — the protocol must expose a recovery path for a squatted `Position`
+//         PDA (grounded by an account-level deserialization test proving the
+//         squat mechanism is real).
+//   F3a — the api-reference error table must not claim `settle_fill` returns
+//         `PositionNotFound` (guarded on the code side by a proptest over the
+//         exact settlement path, `apply_open_fills`).
+//   F3b — `margin_required_bounds` must assert the I-margin-bounds monotonicity
+//         item (guarded by a proptest over the formula itself).
+//   F4  — a crank `Residual` resume must never consume a maker without a
+//         persisted `Fill` event (all-or-nothing resume, D10/D10'/FR-6).
+//   F5  — the `Position` lazy-create gates must verify the account is still a
+//         pristine system account (owner / lamports), not just data-empty.
+//
+// F1/F2a/F3b/F5 use the source-embedding technique (include_str! on the file
+// under test, no CWD dependence) established by T3/T5/T6 and round-2 F5.
+
+// --- F1 (acceptance A-3): the documented test name must exist ---------------
+
+/// Exact unit-test name acceptance A-3 documents and
+/// `cargo test --workspace position_lifecycle_notional_zero_is_closed` filters
+/// on.
+const DOCUMENTED_LIFECYCLE_TEST: &str = "position_lifecycle_notional_zero_is_closed";
+
+fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// F1 — A-3 evidence: the documented acceptance test must exist in the crate.
+/// The name is defined by `position_lifecycle_notional_zero_is_closed` in
+/// positions.rs; renaming or deleting it turns this guard red.
+#[test]
+fn acceptance_a3_documented_test_exists() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for sub in ["src", "tests"] {
+        let dir = manifest_dir.join(sub);
+        if dir.is_dir() {
+            collect_rs_files(&dir, &mut files);
+        }
+    }
+    let self_name = std::path::Path::new(file!())
+        .file_name()
+        .map(|s| s.to_os_string());
+    let needle = format!("fn {DOCUMENTED_LIFECYCLE_TEST}");
+    let mut homes: Vec<String> = Vec::new();
+    for path in &files {
+        if path.file_name() == self_name.as_deref() {
+            continue; // this test file itself references the name in comments
+        }
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if text.contains(&needle) {
+                homes.push(path.display().to_string());
+            }
+        }
+    }
+    assert!(
+        !homes.is_empty(),
+        "A-3 acceptance artifact missing: no test function `fn {DOCUMENTED_LIFECYCLE_TEST}` \
+         exists in this crate (searched {} .rs file(s) under src/ and tests/), so \
+         the documented command `cargo test --workspace {DOCUMENTED_LIFECYCLE_TEST}` runs 0 \
+         tests.",
+        files.len(),
+    );
+}
+
+// --- F2a (acceptance A-6): the documented test name must exist --------------
+
+/// positions.rs source, embedded at compile time (no CWD dependence), so the
+/// source-content assertions below track the actual test definition.
+const POSITIONS_SRC: &str = include_str!("positions.rs");
+
+/// F2a — A-6 evidence: the acceptance-documented test name
+/// `open_position_rejects_zero_size_and_invalid_side` must exist as a test
+/// definition in positions.rs so the documented evidence lookup matches at
+/// least one test.
+#[test]
+fn acceptance_a6_documented_test_name_exists() {
+    assert!(
+        POSITIONS_SRC.contains("fn open_position_rejects_zero_size_and_invalid_side"),
+        "Acceptance A-6 documents the unit test `open_position_rejects_zero_size_and_invalid_side` \
+         driving `validate_open_args`, but positions.rs no longer defines it, so the documented \
+         evidence lookup `cargo test -p fructus --lib open_position_rejects_zero_size_and_invalid_side` \
+         matches nothing."
+    );
+}
+
+// --- F2b (squatted Position PDA): the protocol must expose a recovery path ---
+
+/// lib.rs source embedded at compile time (no CWD dependence).
+const LIB_SRC: &str = include_str!("lib.rs");
+
+/// Names a plausible recovery instruction must carry, per the finding's remedy
+/// ("no instruction to reclaim/reset the PDA").
+const RECOVERY_KEYWORDS: [&str; 7] = [
+    "reclaim", "reset", "recover", "repair", "unbrick", "sweep", "cleanup",
+];
+
+/// Every `pub fn` instruction handler exposed by the `#[program]` module.
+fn instruction_handler_names() -> Vec<String> {
+    LIB_SRC
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            let rest = trimmed.strip_prefix("pub fn ")?;
+            let name = rest.split(['(', '<']).next()?.trim().to_string();
+            Some(name)
+        })
+        .collect()
+}
+
+/// The position lazy-create/existence gate sites — every line mentioning
+/// `position.data_is_empty()`.
+fn position_gate_lines() -> Vec<usize> {
+    LIB_SRC
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains("position.data_is_empty()"))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// F2b — the protocol MUST keep a recovery path for a squatted or stuck
+/// `Position` PDA. GREEN via `reset_position`; the guard turns red if that
+/// recovery instruction is removed and no gate self-heal replaces it.
+#[test]
+fn protocol_must_expose_a_position_pda_reclaim_instruction() {
+    let handlers = instruction_handler_names();
+    assert!(
+        !handlers.is_empty(),
+        "instruction-surface scan found no handlers — the repro's own scan is broken"
+    );
+
+    // Recovery shape 1: an explicit instruction whose name indicates it
+    // reclaims/resets a position PDA account.
+    let recovery_handlers: Vec<&String> = handlers
+        .iter()
+        .filter(|name| {
+            RECOVERY_KEYWORDS.iter().any(|k| name.contains(k))
+                && (name.contains("position") || name.contains("pda") || name.contains("account"))
+        })
+        .collect();
+
+    // Recovery shape 2: the gates themselves self-heal a squat in place
+    // (reclaim/drain/reset text within the gate windows).
+    let windows_mention_recovery = {
+        let lines: Vec<&str> = LIB_SRC.lines().collect();
+        position_gate_lines().iter().any(|&i| {
+            let lo = i.saturating_sub(4);
+            let hi = (i + 5).min(lines.len());
+            let window = lines[lo..hi].join("\n").to_lowercase();
+            RECOVERY_KEYWORDS.iter().any(|k| window.contains(k))
+        })
+    };
+
+    assert!(
+        !recovery_handlers.is_empty() || windows_mention_recovery,
+        "the Position lazy-create gates (open_position / close_position / settle_fill) treat \
+         only a pristine system account (empty data && system-owned && zero lamports) as 'needs \
+         creation'. An attacker can create or 1-lamport-fund an account at the Position PDA \
+         [POSITION_SEED, market, user, side]; the gate then skips creation and \
+         `Account::<Position>::try_from_unchecked` fails the owner check \
+         (AccountOwnedByWrongProgram) — while close_position returns PositionNotFound — \
+         permanently bricking open/close/settle for that (market, user, side) and freezing \
+         the reserved margin. No instruction can reclaim/reset the PDA and a PDA has no \
+         keypair, so the failure is permanent: the protocol MUST provide a recovery path \
+         (an instruction handler whose name indicates reclaim/reset of the position PDA, or \
+         gate logic that reclaims the squat in place). Current handlers: {}.",
+        handlers.join(", "),
+    );
+}
+
+/// Minimal `AccountInfo` (non-signer, writable, non-executable) standing in
+/// for the `position` account at a PDA.
+fn account_info<'a>(
+    key: &'a Pubkey,
+    lamports: &'a mut u64,
+    data: &'a mut [u8],
+    owner: &'a Pubkey,
+) -> AccountInfo<'a> {
+    AccountInfo::new(key, false, true, lamports, data, owner, false)
+}
+
+/// Deserialize the way the handlers do after their gate skips creation,
+/// returning the anchor error (asserted to be the owner-check failure).
+fn position_deserialization_error<'a>(info: &'a AccountInfo<'a>) -> String {
+    match Account::<Position>::try_from_unchecked(info) {
+        Ok(_) => panic!("a squatted account must never deserialize as a Position"),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// F2b grounding: the mechanism the finding describes is real — a squatted
+/// account (with data, rent-funded-but-empty, or 1-lamport) is not "pristine",
+/// so the gate skips creation, and the very next step the handlers take
+/// (`Account::<Position>::try_from_unchecked`) fails with exactly the errors the
+/// finding cites. This documents WHY a recovery instruction (pinned by
+/// `protocol_must_expose_a_position_pda_reclaim_instruction` above) is needed.
+#[test]
+fn squatted_pda_skips_creation_and_fails_deserialization() {
+    let market = Pubkey::from([1u8; 32]);
+    let user = Pubkey::from([2u8; 32]);
+    let side: u8 = 0; // SIDE_BID / Long
+    let (pda, _bump) = Pubkey::find_program_address(
+        &[POSITION_SEED, market.as_ref(), user.as_ref(), &[side]],
+        &crate::ID,
+    );
+
+    // Variant 1: attacker squat WITH data (system-owned, lamports > 0).
+    let mut data1 = vec![0xABu8; 8 + Position::LEN];
+    let mut lamports1: u64 = 1;
+    let squat_with_data = account_info(&pda, &mut lamports1, &mut data1, &system_program::ID);
+    assert!(
+        !squat_with_data.data_is_empty(),
+        "with-data squat is not data-empty → gate skips creation"
+    );
+    assert_eq!(
+        squat_with_data.owner,
+        &system_program::ID,
+        "squat is system-owned"
+    );
+    let err1 = position_deserialization_error(&squat_with_data);
+    assert!(
+        err1.contains("AccountOwnedByWrongProgram"),
+        "with-data squat: expected AccountOwnedByWrongProgram, got {err1}"
+    );
+
+    // Variant 2: rent-funded-but-EMPTY squat (data empty, system-owned,
+    // lamports > 0 — the pristine check's lamports() == 0 leg fails).
+    let mut data2: Vec<u8> = Vec::new();
+    let mut lamports2: u64 = 1;
+    let rent_funded_empty = account_info(&pda, &mut lamports2, &mut data2, &system_program::ID);
+    assert!(
+        rent_funded_empty.data_is_empty() && rent_funded_empty.lamports() != 0,
+        "rent-funded-empty squat satisfies the data/owner legs but fails the lamports leg"
+    );
+    let err2 = position_deserialization_error(&rent_funded_empty);
+    assert!(
+        err2.contains("AccountOwnedByWrongProgram"),
+        "rent-funded-empty squat: expected AccountOwnedByWrongProgram, got {err2}"
+    );
+
+    // Variant 3: data squat with zero lamports — still not pristine (data
+    // leg), deserialization still fails.
+    let mut data3 = vec![0x00u8; 8 + Position::LEN];
+    let mut lamports3: u64 = 0;
+    let zero_lamport_with_data =
+        account_info(&pda, &mut lamports3, &mut data3, &system_program::ID);
+    assert!(
+        !zero_lamport_with_data.data_is_empty(),
+        "data-carrying squat is not pristine even at zero lamports"
+    );
+    let err3 = position_deserialization_error(&zero_lamport_with_data);
+    assert!(
+        err3.contains("AccountNotInitialized") || err3.contains("AccountOwnedByWrongProgram"),
+        "zero-lamport data squat must fail deserialization (AccountNotInitialized / \
+         AccountOwnedByWrongProgram), got {err3}"
+    );
+
+    // Control: a genuinely pristine account (empty data, system-owned, zero
+    // lamports) is what the gate calls "needs creation" — the program then
+    // CPI-creates it and the owner check passes.
+    let mut data4: Vec<u8> = Vec::new();
+    let mut lamports4: u64 = 0;
+    let pristine = account_info(&pda, &mut lamports4, &mut data4, &system_program::ID);
+    assert!(
+        pristine.data_is_empty()
+            && pristine.owner == &system_program::ID
+            && pristine.lamports() == 0,
+        "pristine account matches the gate's needs-creation predicate"
+    );
+}
+
+// --- F3a (error table): settle_fill never returns PositionNotFound ----------
+
+/// The api-reference error table, read from the repo docs so the assertion
+/// tracks the actually-documented surface (reintroducing the over-claim turns
+/// the test red again).
+const API_REFERENCE: &str = include_str!("../../../docs/api-reference.md");
+
+/// F3a — the error table must NOT claim `settle_fill` can raise
+/// `PositionNotFound`. The documented trigger is "`close_position`/`settle_fill`
+/// without a live position (`notional == 0` or no `Position` account)", but
+/// `settle_fill` never returns that variant (FR-5/A-9b re-opens a
+/// `notional == 0` maker position; a missing ledger is
+/// `InsufficientFreeCollateral`).
+#[test]
+fn f3_error_table_must_not_claim_settle_fill_returns_position_not_found() {
+    let row = API_REFERENCE
+        .lines()
+        .find(|line| line.contains("| `PositionNotFound` |"))
+        .expect("api-reference.md error table must document the PositionNotFound variant");
+    // Markdown table row: `| — | `PositionNotFound` | <trigger> | ...`.
+    let trigger = row.split('|').nth(3).unwrap_or_default().trim();
+    assert!(
+        !trigger.contains("settle_fill"),
+        "docs/api-reference.md overstates the error surface: the `PositionNotFound` \
+         error-table row attributes the variant to `settle_fill` (\"{trigger}\"), but \
+         settle_fill never returns PositionNotFound (FR-5/A-9b: a `notional == 0` maker \
+         position is re-opened with `entry := snapshot x size`, `open_slot := now`; a \
+         missing `UserCollateral` reports InsufficientFreeCollateral). The settle_fill \
+         instruction row is accurate — only this error-table entry is wrong."
+    );
+}
+
+// F3a code-side guard: the settle_fill settlement path (`apply_open_fills` on
+// a retained, fully-closed maker position) has no `PositionNotFound` path — a
+// `notional == 0` position is re-opened per FR-5 rather than rejected, and the
+// only realistic failure is the margin shortfall
+// (`InsufficientFreeCollateral`). If a future change ever made this path raise
+// `PositionNotFound`, this property (and the doc-consistency test above) would
+// both go red.
+proptest! {
+    #[test]
+    fn f3_settle_fill_never_returns_position_not_found(
+        lamports in 1u64..10_000_000_000_000_000_000u64,
+        supply in 1u64..10_000_000_000_000_000_000u64,
+        size in 1u64..1_000_000_000,
+        bps in 1u16..=10_000,
+        deposited in 0u64..10_000_000_000_000_000,
+        now_slot in 0u64..10_000_000,
+    ) {
+        // A retained, fully-closed maker position awaiting settlement:
+        // `notional == 0`, no entry history, no reserved margin — the exact
+        // state the docs claim would trigger `PositionNotFound`.
+        let mut position = Position {
+            market: Pubkey::default(),
+            owner: Pubkey::default(),
+            side: 1,
+            notional: 0,
+            entry_n_sum: 0,
+            entry_d_sum: 0,
+            collateral: 0,
+            last_funding_epoch: 0,
+            open_slot: 0,
+            bump: 255,
+        };
+        let mut user_collateral = UserCollateral {
+            deposited,
+            reserved: 0,
+            bump: 255,
+        };
+        let fill = [crate::orderbook::Fill {
+            maker_seq: 0,
+            maker_owner: Pubkey::default(),
+            taker_owner: Pubkey::default(),
+            size,
+            price: 1,
+        }];
+        let result = crate::apply_open_fills(
+            &mut position,
+            &mut user_collateral,
+            bps,
+            &fill,
+            lamports,
+            supply,
+            now_slot,
+        );
+        match result {
+            Err(e) => {
+                // The documented `PositionNotFound` trigger cannot occur:
+                // only the margin shortfall (`InsufficientFreeCollateral`)
+                // or arithmetic overflow can fail this path.
+                let expected: anchor_lang::error::Error =
+                    FructusError::PositionNotFound.into();
+                prop_assert_ne!(
+                    e,
+                    expected,
+                    "settle_fill must never fail with PositionNotFound on a \
+                     notional == 0 maker position"
+                );
+            }
+            Ok(()) => {
+                // Re-open semantics (FR-5/A-9b): entry := snapshot x size,
+                // open_slot := now, margin reserved against free collateral.
+                prop_assert_eq!(position.notional, size);
+                prop_assert_eq!(
+                    position.entry_n_sum,
+                    (lamports as u128) * (size as u128),
+                    "entry_n_sum := snapshot total_lamports x size"
+                );
+                prop_assert_eq!(
+                    position.entry_d_sum,
+                    (supply as u128) * (size as u128),
+                    "entry_d_sum := snapshot pool_token_supply x size"
+                );
+                prop_assert_eq!(
+                    position.open_slot, now_slot,
+                    "re-open stamps the settlement slot"
+                );
+                let expected_margin = margin_required(size, bps).unwrap();
+                prop_assert_eq!(position.collateral, expected_margin);
+                prop_assert_eq!(user_collateral.reserved, expected_margin);
+            }
+        }
+    }
+}
+
+// --- F3b (I-margin-bounds): monotonicity is asserted + holds ----------------
+
+/// The body of the `margin_required_bounds` proptest in positions.rs (the test
+/// the design's PBT plan row names for I-margin-bounds). Deterministic: the
+/// body opens at the first `{` after the fn signature and closes at the first
+/// 8-space-indented `}` (the inner `if` blocks close at 12 spaces).
+fn margin_required_bounds_body() -> &'static str {
+    let start = POSITIONS_SRC
+        .find("fn margin_required_bounds(")
+        .expect("positions.rs must define the margin_required_bounds proptest");
+    let open = start
+        + POSITIONS_SRC[start..]
+            .find('{')
+            .expect("margin_required_bounds must have a body");
+    let end = open
+        + 1
+        + POSITIONS_SRC[open + 1..]
+            .find("\n        }\n")
+            .expect("margin_required_bounds body must close at 8-space indent");
+    &POSITIONS_SRC[open + 1..end]
+}
+
+/// F3b — the `margin_required_bounds` property test must keep asserting the
+/// I-margin-bounds monotonicity item, exactly as the PBT plan row ("ceiling
+/// formula + monotonicity + bps==10_000 ⇒ == notional + collateral ≥ 1") and
+/// design.md §5 ("`margin_required` is monotonic non-decreasing in `notional`")
+/// document. Removing the monotonicity assertion turns this guard red.
+#[test]
+fn f3_margin_required_bounds_asserts_monotonicity() {
+    let body = margin_required_bounds_body();
+    let margin_evals = body.matches("margin_required(").count();
+    assert!(
+        body.contains("monotonic") && margin_evals >= 2,
+        "I-margin-bounds monotonicity item is not asserted: design.md §5 \
+         locks 'margin_required is monotonic non-decreasing in notional' \
+         and the PBT plan row (design.md §6) requires margin_required_bounds \
+         to assert 'ceiling formula + monotonicity + bps==10_000 => == \
+         notional + collateral >= 1', but the implemented test only asserts \
+         the formula/identity/floor — monotonicity in notional is never \
+         asserted (found {margin_evals} margin_required( evaluation(s) in \
+         the test body; 'monotonic' mentioned: {}). One line closes the \
+         gap, e.g. prop_assert!(margin_required(notional + 1, \
+         bps).unwrap() >= m, \"monotonic non-decreasing in notional\");",
+        body.contains("monotonic"),
+    );
+}
+
+// F3b code-side guard: the formula `ceil(notional × bps / 10_000)` is
+// monotonic non-decreasing in notional over a wide band (every value is
+// `Some` for `bps ≤ 10_000`, so the function is total here) — the invariant
+// the I-margin-bounds row documents actually holds for the implemented
+// formula.
+proptest! {
+    #[test]
+    fn f3_margin_required_is_monotonic(
+        n in 0u64..1_000_000_000_000_000_000u64,
+        bps in 1u16..=10_000,
+    ) {
+        let m = margin_required(n, bps).expect("total for bps <= 10_000");
+        let m_next = margin_required(n + 1, bps).expect("total for bps <= 10_000");
+        prop_assert!(
+            m_next >= m,
+            "I-margin-bounds: margin_required must be monotonic non-decreasing \
+             in notional (n = {n}, n+1 = {}, bps = {bps}: {m} -> {m_next})",
+            n + 1,
+        );
+    }
+}
+
+// --- F4 (crank residual resume): all-or-nothing, no dropped fills -----------
+
+/// F4 — a residual resume must never consume a maker from the book without
+/// persisting that maker's `Fill` event (D10: fills are never silently
+/// dropped; D10'/FR-6: a residual is resumed only when the ring can hold
+/// ALL its fills, otherwise it is cancelled without matching anyone).
+#[test]
+fn crank_resume_never_consumes_maker_without_persisted_fill_event() {
+    // Full ring (128 undrained events); the head is a Residual that crosses
+    // TWO asks, so it needs TWO fill events but only ONE ring slot is freed
+    // by draining the head.
+    let mut account = empty_onchain_order_book();
+    let mut residual = crate::state::OutEvent::default();
+    residual.seq = 0;
+    residual.kind = crate::EVENT_KIND_RESIDUAL;
+    residual.side = crate::SIDE_BID;
+    residual.owner = Pubkey::from([1; 32]);
+    residual.price = 30;
+    residual.size = 12;
+    account.events[0] = residual;
+    for i in 1..(EVENT_QUEUE_LEN as u64) {
+        let mut fill = crate::state::OutEvent::default();
+        fill.seq = i;
+        fill.kind = crate::EVENT_KIND_FILL;
+        fill.side = crate::SIDE_BID;
+        fill.owner = Pubkey::from([7; 32]);
+        fill.size = 1;
+        account.events[i as usize] = fill;
+    }
+    account.event_write_cursor = EVENT_QUEUE_LEN as u64;
+
+    let mut book = Book {
+        bids: vec![],
+        asks: vec![
+            ob_order(2, Side::Ask, 10, 5, 0),
+            ob_order(2, Side::Ask, 11, 5, 1),
+        ],
+        next_seq: 2,
+    };
+    let makers_before = book.asks.len();
+    let write_before = account.event_write_cursor;
+
+    let _dirty = crate::drain_events(&mut account, &mut book, 100, 200).unwrap();
+
+    let fills_persisted = (account.event_write_cursor - write_before) as usize;
+    let makers_consumed = makers_before - book.asks.len();
+    assert_eq!(
+        fills_persisted, makers_consumed,
+        "the residual resume consumed {makers_consumed} maker(s) from the book but \
+         persisted only {fills_persisted} Fill event(s): every maker whose resting \
+         order was matched must have a persisted, settle-able Fill event (D10: fills \
+         are never silently dropped; FR-6/D10': a residual is resumed only when the \
+         ring has capacity to persist its fills, otherwise it is cancelled without \
+         matching anyone)."
+    );
+}
+
+/// F4 — same invariant, but the ring has capacity for ONE of the residual's two
+/// fills — still not all of them — so the resume must be all-or-nothing.
+#[test]
+fn crank_resume_all_or_nothing_when_partial_capacity() {
+    let mut account = empty_onchain_order_book();
+    let mut residual = crate::state::OutEvent::default();
+    residual.seq = 0;
+    residual.kind = crate::EVENT_KIND_RESIDUAL;
+    residual.side = crate::SIDE_BID;
+    residual.owner = Pubkey::from([1; 32]);
+    residual.price = 30;
+    residual.size = 12;
+    account.events[0] = residual;
+    for i in 1..(EVENT_QUEUE_LEN as u64) {
+        let mut fill = crate::state::OutEvent::default();
+        fill.seq = i;
+        fill.kind = crate::EVENT_KIND_FILL;
+        fill.side = crate::SIDE_BID;
+        fill.owner = Pubkey::from([7; 32]);
+        fill.size = 1;
+        account.events[i as usize] = fill;
+    }
+    // One free slot: the ring holds 127 events, the head drains to 126 queued.
+    account.event_write_cursor = EVENT_QUEUE_LEN as u64 - 1;
+
+    let mut book = Book {
+        bids: vec![],
+        asks: vec![
+            ob_order(2, Side::Ask, 10, 5, 0),
+            ob_order(2, Side::Ask, 11, 5, 1),
+        ],
+        next_seq: 2,
+    };
+    let makers_before = book.asks.len();
+    let write_before = account.event_write_cursor;
+
+    let _dirty = crate::drain_events(&mut account, &mut book, 100, 200).unwrap();
+
+    let fills_persisted = (account.event_write_cursor - write_before) as usize;
+    let makers_consumed = makers_before - book.asks.len();
+    assert_eq!(
+        fills_persisted, makers_consumed,
+        "partial ring capacity must not consume makers without persisting their fills"
+    );
+}
+
+// --- F5 (lazy-create gates): a squat must not pass for pristine -------------
+
+/// Window (lines before/after a `position.data_is_empty()` site) in which
+/// an ownership / pristine-account check may legitimately live, so the
+/// regression stays GREEN under the natural fix shapes (owner/lamports
+/// check on the same line, on an adjacent line of a split condition, or in
+/// a `let pristine = ...` hoisted directly above the gate) while still
+/// RED if the gate ever regresses to data-empty-only.
+const GATE_WINDOW_BEFORE: usize = 2;
+const GATE_WINDOW_AFTER: usize = 6;
+
+/// F5 — every `ctx.accounts.position.data_is_empty()` lazy-create gate must, on
+/// the SAME condition, also verify the account is still a pristine system-owned
+/// account (`owner` / `lamports`); otherwise a pre-created system account at
+/// the PDA bricks the instruction permanently (AccountOwnedByWrongProgram, or
+/// the CPI create_account "already in use" failure) and freezes the victim's
+/// reserved margin (close can never succeed).
+#[test]
+fn position_lazy_create_gate_checks_account_owner() {
+    let lines: Vec<&str> = LIB_SRC.lines().collect();
+    let mut bad_gates: Vec<String> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.contains("position.data_is_empty()") {
+            let lo = i.saturating_sub(GATE_WINDOW_BEFORE);
+            let hi = (i + GATE_WINDOW_AFTER + 1).min(lines.len());
+            let window = lines[lo..hi].join("\n");
+            if !window.contains("owner") && !window.contains("lamports") {
+                bad_gates.push(format!("line {}: {}", i + 1, trimmed));
+            }
+        }
+    }
+    assert!(
+        bad_gates.is_empty(),
+        "the Position lazy-create gates in open_position/close_position/settle_fill guard on \
+         `ctx.accounts.position.data_is_empty()` alone ({} gate(s): {}). An attacker can \
+         create a system-owned account (with data, or rent-funded-but-empty) at a victim's \
+         Position PDA [POSITION_SEED, market, user, side]; the handler then skips creation \
+         and `Account::try_from_unchecked` fails the owner check (AccountOwnedByWrongProgram) \
+         — or the CPI create_account fails with 'already in use' — permanently bricking \
+         open/close/settle for that (market, user, side) and freezing the reserved margin \
+         (close can never succeed). The gate must also verify the account is still a pristine \
+         system-owned account (owner == system program, lamports == 0).",
+        bad_gates.len(),
+        bad_gates.join(" | "),
+    );
 }
