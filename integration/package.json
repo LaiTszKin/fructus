@@ -1,0 +1,22 @@
+{
+  "name": "fructus-integration",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "SDK/CLI -> protocol integration property-based tests: the trader SDK builders submit real instructions to a solana-test-validator running the deployed program, and on-chain invariants are asserted.",
+  "scripts": {
+    "test": "tsx --test --test-force-exit test/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.0",
+    "fructus-sdk": "file:../sdk",
+    "fructus-cli": "file:../cli"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.15.0",
+    "typescript": "^5.5.0"
+  }
+}
