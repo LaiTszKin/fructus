@@ -138,12 +138,21 @@ pub struct OutEvent {
     pub owner: Pubkey,
     /// The counterparty that matched this order (zero pubkey when unset).
     pub counterparty: Pubkey,
+    /// Fill-time index snapshot numerator: pool `total_lamports` when the fill
+    /// executed (design D7/D8). `0` on non-fill events (Cancel/Residual).
+    pub entry_total_lamports: u64,
+    /// Fill-time index snapshot denominator: pool token supply when the fill
+    /// executed (design D7/D8). `0` on non-fill events (Cancel/Residual).
+    pub entry_pool_token_supply: u64,
+    /// Whether a maker settlement has consumed this Fill (`0` = pending; the
+    /// `settle_fill` instruction flips it to `1`). Meaningless on other kinds.
+    pub settled: u8,
     /// Event kind: `0` = Fill, `1` = Cancel, `2` = Residual.
     pub kind: u8,
     /// Which side the order was on: `0` = Bid, `1` = Ask.
     pub side: u8,
     /// Explicit padding so the `#[repr(C)]` zero-copy layout is packing-free.
-    pub _pad: [u8; 6],
+    pub _pad: [u8; 5],
 }
 
 impl Default for OutEvent {
@@ -154,15 +163,18 @@ impl Default for OutEvent {
             size: 0,
             owner: Pubkey::default(),
             counterparty: Pubkey::default(),
+            entry_total_lamports: 0,
+            entry_pool_token_supply: 0,
+            settled: 0,
             kind: 0,
             side: 0,
-            _pad: [0u8; 6],
+            _pad: [0u8; 5],
         }
     }
 }
 
 impl OutEvent {
-    /// In-memory `#[repr(C)]` size (`96` bytes, incl. the explicit padding).
+    /// In-memory `#[repr(C)]` size (`112` bytes, incl. the explicit padding).
     pub const LEN: usize = std::mem::size_of::<Self>();
 }
 
@@ -280,6 +292,57 @@ impl UserCollateral {
     pub const LEN: usize = 8 + 8 + 1;
 }
 
+// --- Position lifecycle (issue #5) ---
+
+/// Per-`(market, user, side)` position ledger, one PDA per user per market side.
+///
+/// Seed `[POSITION_SEED, market.key(), user.key(), side]` (see
+/// [`crate::constants::POSITION_SEED`] = `b"position"`). Lazily created on
+/// first fill/settlement (payer = user/cranker) and **retained** after a full
+/// close: `notional == 0` means the position is closed, and a re-open resets
+/// `entry_n_sum`/`entry_d_sum`/`open_slot`. Margin is ledger-only: `collateral`
+/// mirrors the reserved-margin bookkeeping in [`UserCollateral::reserved`], with
+/// no token movement on open or close.
+///
+/// `side` reuses the book-side encoding: `0` = Long/Bid, `1` = Short/Ask. It is
+/// both stored and part of the seed (self-describing, like `OrderBook.market`).
+#[account]
+pub struct Position {
+    /// The market this position trades on (also present in the PDA seed).
+    pub market: Pubkey,
+    /// The user holding the position (also present in the PDA seed).
+    pub owner: Pubkey,
+    /// Book side this position opens on: `0` = Long/Bid, `1` = Short/Ask.
+    pub side: u8,
+    /// Remaining position, in notional USDC microunits. `0` == closed.
+    pub notional: u64,
+    /// `Σ(total_lamports × fill_size)`: notional-weighted entry-index running sum.
+    ///
+    /// Stored as a native `u128` (borsh-serializes to 16 LE bytes); the entry
+    /// index snapshot rate `entry_n_sum / entry_d_sum` is computed at PnL time
+    /// after a shared power-of-two normalization — no intermediate rounding.
+    pub entry_n_sum: u128,
+    /// `Σ(pool_token_supply × fill_size)`: notional-weighted entry-index running sum.
+    pub entry_d_sum: u128,
+    /// Reserved margin for this position, in USDC microunits: always equals
+    /// `margin_required(notional, initial_margin_bps)`.
+    pub collateral: u64,
+    /// Last funding epoch this position was settled for (stored; written from #6).
+    pub last_funding_epoch: u64,
+    /// Slot at which the position was (re)created: the fill slot for inline
+    /// taker opens, or the settlement slot for maker re-opens via `settle_fill`.
+    pub open_slot: u64,
+    /// PDA bump seed.
+    pub bump: u8,
+}
+
+impl Position {
+    /// Serialized size of the account payload (excluding the 8-byte discriminator).
+    ///
+    /// Packed borsh layout: `32 + 32 + 1 + 8 + 16 + 16 + 8 + 8 + 8 + 1 = 130`.
+    pub const LEN: usize = 32 + 32 + 1 + 8 + 16 + 16 + 8 + 8 + 8 + 1;
+}
+
 /// Pure staleness predicate (saturating, overflow-safe for any `u64` inputs).
 ///
 /// `is_stale(last, window, cur) == cur.saturating_sub(last) >= window`.
@@ -338,7 +401,7 @@ pub fn update_message(oracle: &Pubkey, apy: u64, version: u64) -> [u8; 32] {
 mod tests {
     use anchor_lang::prelude::*;
 
-    use super::{Observation, Order, OrderBook, OutEvent, UserCollateral};
+    use super::{Observation, Order, OrderBook, OutEvent, Position, UserCollateral};
 
     /// Every zero-copy `LEN` constant must equal the in-memory `#[repr(C)]` size
     /// of its type — the exact invariant the `space = 8 + LEN` constraints rely
@@ -368,9 +431,60 @@ mod tests {
     #[test]
     fn len_constants_match_documented_sizes() {
         assert_eq!(Order::LEN, 64);
-        assert_eq!(OutEvent::LEN, 96);
+        assert_eq!(OutEvent::LEN, 112);
         assert_eq!(Observation::LEN, 32);
         assert_eq!(UserCollateral::LEN, 17);
-        assert_eq!(OrderBook::LEN, 21_080);
+        assert_eq!(OrderBook::LEN, 23_128);
+    }
+
+    /// `Position` is a borsh `#[account]`; its `LEN` must equal the packed borsh
+    /// payload size (excluding the discriminator), like `UserCollateral::LEN`.
+    #[test]
+    fn position_len_matches_borsh_payload() {
+        let pos = Position {
+            market: Pubkey::new_unique(),
+            owner: Pubkey::new_unique(),
+            side: 1,
+            notional: 1_000_000,
+            entry_n_sum: 1_234_567_890,
+            entry_d_sum: 9_876_543_210,
+            collateral: 100_000,
+            last_funding_epoch: 42,
+            open_slot: 7,
+            bump: 255,
+        };
+        assert_eq!(borsh::to_vec(&pos).unwrap().len(), Position::LEN);
+        // Pin the documented size so a field/constant edit cannot drift it.
+        assert_eq!(Position::LEN, 130);
+    }
+
+    /// The `Position` PDA seed `[POSITION_SEED, market, user, side]` must
+    /// round-trip: `create_program_address` fed the bump that
+    /// `find_program_address` returned reproduces the PDA, for both side
+    /// encodings (`0` = Long/Bid, `1` = Short/Ask).
+    #[test]
+    fn position_pda_seed_round_trip() {
+        use crate::constants::POSITION_SEED;
+
+        let market = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        for side in [0u8, 1u8] {
+            let seeds: &[&[u8]] = &[POSITION_SEED, market.as_ref(), user.as_ref(), &[side]];
+            let (pda, bump) = Pubkey::find_program_address(seeds, &crate::ID);
+            // `create_program_address` re-derives the PDA from the same seeds
+            // plus the bump byte `find_program_address` returned; a `Position`
+            // account stores exactly that `bump` to re-derive on every access.
+            let bump_seed = [bump];
+            let full_seeds: &[&[u8]] = &[
+                POSITION_SEED,
+                market.as_ref(),
+                user.as_ref(),
+                &[side],
+                &bump_seed,
+            ];
+            let created = Pubkey::create_program_address(full_seeds, &crate::ID).unwrap();
+            // Byte-level compare per AGENTS.md (no type-identity dependence).
+            assert_eq!(pda.as_ref(), created.as_ref());
+        }
     }
 }

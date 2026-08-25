@@ -75,3 +75,8 @@ pub const MAX_MATCH_STEPS: u64 = 8;
 
 /// Decimals of the USDC collateral mint (validated at vault initialization).
 pub const USDC_DECIMALS: u8 = 6;
+
+// --- Position lifecycle (issue #5) ---
+
+/// PDA seed for the per-`(market, user, side)` position account.
+pub const POSITION_SEED: &[u8] = b"position";

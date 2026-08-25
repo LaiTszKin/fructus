@@ -14,18 +14,20 @@ pub mod ed25519;
 pub mod error;
 pub mod exchange;
 pub mod orderbook;
+pub mod positions;
 pub mod state;
 
 use constants::{
     EVENT_QUEUE_LEN, MAX_MATCH_STEPS, MAX_ORDERS_PER_SIDE, ORACLE_SEED, ORDER_BOOK_SEED,
-    PERP_MARKET_SEED, TWAP_OBSERVATIONS, USDC_DECIMALS, USER_COLLATERAL_SEED, VAULT_SEED,
+    PERP_MARKET_SEED, POSITION_SEED, TWAP_OBSERVATIONS, USDC_DECIMALS, USER_COLLATERAL_SEED,
+    VAULT_SEED,
 };
 use error::FructusError;
 use exchange::{ExchangeRate, STAKE_POOL_PROGRAM_ID};
 use state::{
     apy_in_bounds, funding_k_in_bounds, initial_margin_in_bounds, maintenance_margin_in_bounds,
     max_funding_in_bounds, update_message, validate_version, OrderBook, OutEvent, PerpMarket,
-    UserCollateral, YieldOracle,
+    Position, UserCollateral, YieldOracle,
 };
 
 /// Validate that `account` is owned by the SPL Stake Pool program and carries
@@ -167,10 +169,15 @@ fn take_next_seq(book: &mut orderbook::Book) -> Result<u64> {
 /// Append an event to the bounded ring, assigning it the monotonic write-cursor
 /// value as its sequence number.
 ///
+/// `entry_total_lamports` / `entry_pool_token_supply` carry the fill-time index
+/// snapshot (FR-6/D8) and are stamped verbatim onto every `Fill`; pass `0` for
+/// non-fill events (Cancel/Residual). A fresh event is always un-settled
+/// (`settled = 0`); only `settle_fill` ever flips a `Fill` to `1`.
+///
 /// Backpressure (FR-8(f)/FR-9): the ring must never overwrite an event the
 /// permissionless `crank` has not yet drained. When it is full the incoming
 /// event is dropped rather than silently clobbering an undrained
-/// Fill/Cancel/Residual.
+/// Fill/Cancel/Residual (the caller decides how to surface the failure).
 fn append_event(
     account: &mut OrderBook,
     kind: u8,
@@ -179,6 +186,8 @@ fn append_event(
     side: u8,
     price: u64,
     size: u64,
+    entry_total_lamports: u64,
+    entry_pool_token_supply: u64,
 ) -> bool {
     let queued = account
         .event_write_cursor
@@ -195,13 +204,23 @@ fn append_event(
         side,
         price,
         size,
-        _pad: [0u8; 6],
+        entry_total_lamports,
+        entry_pool_token_supply,
+        settled: 0,
+        _pad: [0u8; 5],
     };
     account.event_write_cursor = account.event_write_cursor.wrapping_add(1);
     true
 }
 
-/// Append a `Fill` event for every fill in `fills`.
+/// Append a `Fill` event for every fill in `fills`, each stamped with the
+/// in-transaction index snapshot (`entry_total_lamports` /
+/// `entry_pool_token_supply`, read once from the market-bound `index_source`).
+///
+/// Fills are never silently dropped (D10): if ANY append fails because the
+/// event ring is full, the whole call fails with [`FructusError::BookFull`] and
+/// the taker-driven caller propagates it (`?`), so the fill always persists its
+/// event or the transaction reverts.
 ///
 /// Each maker's owner is carried directly on the fill (`Fill::maker_owner`),
 /// set by the engine at fill time, so no pre-match snapshot is needed.
@@ -209,9 +228,11 @@ fn emit_fill_events(
     account: &mut OrderBook,
     fills: &[orderbook::Fill],
     maker_side: orderbook::Side,
-) {
+    entry_total_lamports: u64,
+    entry_pool_token_supply: u64,
+) -> Result<()> {
     for f in fills {
-        append_event(
+        let appended = append_event(
             account,
             EVENT_KIND_FILL,
             f.maker_owner,
@@ -219,8 +240,12 @@ fn emit_fill_events(
             side_to_u8(maker_side),
             f.price,
             f.size,
+            entry_total_lamports,
+            entry_pool_token_supply,
         );
+        require!(appended, FructusError::BookFull);
     }
+    Ok(())
 }
 
 /// Most recent TWAP sample, or `None` when nothing has been recorded yet.
@@ -270,7 +295,10 @@ fn record_observation(account: &mut OrderBook, mid: Option<u64>, now_slot: u64) 
 
 /// Match a crossing limit taker inline and settle its remainder.
 ///
-/// * Every fill appends a `Fill` event (maker owner carried on the fill).
+/// * Every fill appends a `Fill` event (maker owner carried on the fill),
+///   stamped with the in-transaction index snapshot (FR-6/D8); a fill that
+///   cannot be appended fails the whole call with `BookFull` (fills are never
+///   silently dropped — D10).
 /// * A budget-interrupted remainder (`MAX_MATCH_STEPS` fills reached with a
 ///   crossable maker still available) is re-queued as a `Residual` event.
 /// * An unfilled, no-longer-crossing remainder rests at the limit price (and is
@@ -283,6 +311,8 @@ fn match_limit_taker(
     account: &mut OrderBook,
     book: &mut orderbook::Book,
     incoming: orderbook::Order,
+    entry_total_lamports: u64,
+    entry_pool_token_supply: u64,
 ) -> Result<()> {
     let maker_side = opposite(incoming.side);
     let outcome = orderbook::match_order(
@@ -292,7 +322,13 @@ fn match_limit_taker(
         MAX_MATCH_STEPS,
     );
 
-    emit_fill_events(account, &outcome.fills, maker_side);
+    emit_fill_events(
+        account,
+        &outcome.fills,
+        maker_side,
+        entry_total_lamports,
+        entry_pool_token_supply,
+    )?;
 
     let total_filled: u64 = outcome.fills.iter().map(|f| f.size).sum();
     let remaining = incoming.size.saturating_sub(total_filled);
@@ -309,6 +345,8 @@ fn match_limit_taker(
                 side_to_u8(residual.side),
                 residual.price,
                 residual.size,
+                0,
+                0,
             );
             // Backpressure (FR-8(f)/FR-9): the ring is full, so the deferred
             // residual cannot be persisted. Fail the transaction rather than
@@ -352,6 +390,431 @@ fn match_limit_taker(
         None => {}
     }
     Ok(())
+}
+
+/// Drain up to `CRANK_BATCH_LEN` events from the ring, resuming any `Residual`
+/// entries against the live book.
+///
+/// The crank must never wedge the ring (FR-6): the read cursor always advances
+/// past the head event before it is handled, and a `Residual` is resumed only
+/// when the ring can hold EVERY fill its match would persist — otherwise the
+/// whole remainder is cancelled up front without consuming any maker (D10':
+/// all-or-nothing; D10: fills are never silently dropped). Residuals arise only
+/// from the position-neutral `place_limit_order` (D10′), so cancelling an
+/// unresumable remainder loses no position.
+///
+/// Returns `Ok(true)` when the book was mutated (a residual was resumed — its
+/// `seq` was consumed) and must be persisted; `Ok(false)` when the batch was
+/// pure consume (fills/cancels), a residual was cancelled by the capacity
+/// gate, or the ring was empty.
+fn drain_events(
+    account: &mut OrderBook,
+    book: &mut orderbook::Book,
+    entry_total_lamports: u64,
+    entry_pool_token_supply: u64,
+) -> Result<bool> {
+    let mut processed: u64 = 0;
+    let mut book_dirty = false;
+    while processed < CRANK_BATCH_LEN && account.event_read_cursor < account.event_write_cursor {
+        let idx = (account.event_read_cursor % EVENT_QUEUE_LEN as u64) as usize;
+        let event = account.events[idx];
+        account.event_read_cursor = account
+            .event_read_cursor
+            .checked_add(1)
+            .ok_or(FructusError::ArithmeticOverflow)?;
+        processed = processed
+            .checked_add(1)
+            .ok_or(FructusError::ArithmeticOverflow)?;
+
+        match event.kind {
+            EVENT_KIND_RESIDUAL => {
+                let side = side_from_u8(event.side)?;
+                // All-or-nothing resume (D10'/FR-6): a `Residual` is resumed
+                // only when the ring has capacity to persist EVERY event its
+                // match would append (one `Fill` per matched maker, plus one
+                // `Residual` if the budget hits again); otherwise the whole
+                // remainder is cancelled WITHOUT consuming any maker or seq —
+                // a maker is never matched without a persisted, settle-able
+                // `Fill` event (D10: fills are never silently dropped). The
+                // dry-run probe below runs the engine on a clone of the book
+                // (cheap: at most `MAX_ORDERS_PER_SIDE` orders per side) to
+                // learn the fill count before touching the real book.
+                let incoming = orderbook::Order {
+                    owner: event.owner,
+                    side,
+                    price: event.price,
+                    size: event.size,
+                    seq: book.next_seq,
+                };
+                let mut probe = book.clone();
+                let probe_outcome = orderbook::match_order(
+                    &mut probe,
+                    incoming.clone(),
+                    orderbook::OrderKind::Limit,
+                    MAX_MATCH_STEPS,
+                );
+                let events_needed = probe_outcome.fills.len()
+                    + if probe_outcome.residual.is_some() {
+                        1
+                    } else {
+                        0
+                    };
+                // The read cursor already advanced past this head event, so the
+                // ring holds `EVENT_QUEUE_LEN - (write - read)` free slots.
+                let queued = account
+                    .event_write_cursor
+                    .saturating_sub(account.event_read_cursor);
+                let free = (EVENT_QUEUE_LEN as u64).saturating_sub(queued);
+                if events_needed as u64 > free {
+                    msg!(
+                        "crank cancelled unresumable residual owner={} size={}: \
+                         needs {events_needed} event(s), ring has {free} free",
+                        event.owner,
+                        event.size
+                    );
+                    continue;
+                }
+                let seq = take_next_seq(book)?;
+                let incoming = orderbook::Order {
+                    owner: event.owner,
+                    side,
+                    price: event.price,
+                    size: event.size,
+                    seq,
+                };
+                // `take_next_seq` already advanced, so the book is dirty either
+                // way. A resumed residual must be consumed, never rejected (F2):
+                // if the engine cannot finish it (a pure self-trade), cancel it
+                // here so the shared crank is never wedged. The read cursor
+                // already advanced past this event. (The capacity gate above
+                // precludes `BookFull`, so the only residual failure left is a
+                // pure self-trade.)
+                book_dirty = true;
+                if match_limit_taker(
+                    account,
+                    book,
+                    incoming,
+                    entry_total_lamports,
+                    entry_pool_token_supply,
+                )
+                .is_err()
+                {
+                    msg!(
+                        "crank cancelled unresumable residual owner={} size={}",
+                        event.owner,
+                        event.size
+                    );
+                }
+            }
+            EVENT_KIND_FILL | EVENT_KIND_CANCEL => {
+                // Emit (log) and consume; there is no settlement this iteration,
+                // so fills/cancels have no further on-chain effect.
+                msg!(
+                    "crank consumed event seq={} kind={} owner={} side={} price={} size={}",
+                    event.seq,
+                    event.kind,
+                    event.owner,
+                    event.side,
+                    event.price,
+                    event.size
+                );
+            }
+            _ => {
+                msg!("crank skipped unknown event kind={}", event.kind);
+            }
+        }
+    }
+    Ok(book_dirty)
+}
+
+// --- Position lifecycle adapters (issue #5) --------------------------------
+//
+// The handlers below are thin Anchor adapters over the pure `positions` API
+// (`margin_required` / `accumulate_entry`, property-tested in `positions.rs`)
+// plus the order-book engine from issue #3. The helpers in this section are
+// deliberately account-plumbing-free so the lib handler tests can drive them
+// directly with plain structs.
+
+/// Apply open-intent fills to a position and its margin ledger (REQ-3/REQ-5).
+///
+/// * `notional += Σ fill.size` (checked; the engine never over-fills).
+/// * Entry running sums accumulate the **fill-time snapshot**
+///   (`entry_total_lamports` / `entry_pool_token_supply`) weighted by each
+///   fill's size (D6). A closed position (`notional == 0`, retained account)
+///   **re-opens**: the sums are reset to the first fill's weighted snapshot and
+///   `open_slot` becomes the current slot (FR-2/FR-5); a live position keeps
+///   its `open_slot` and accumulates.
+/// * Margin is reserved incrementally: `UserCollateral.reserved` grows by the
+///   `margin_required` delta of the new notional (ceiling, D11), gated by the
+///   free-collateral seam (`InsufficientFreeCollateral`, REQ-7).
+///
+/// All computation happens before any field is written, so a failure (margin
+/// shortfall / overflow) leaves both accounts untouched (atomic revert).
+fn apply_open_fills(
+    position: &mut Position,
+    user_collateral: &mut UserCollateral,
+    initial_margin_bps: u16,
+    fills: &[orderbook::Fill],
+    entry_total_lamports: u64,
+    entry_pool_token_supply: u64,
+    now_slot: u64,
+) -> Result<()> {
+    if fills.is_empty() {
+        return Ok(());
+    }
+    let reopening = position.notional == 0;
+    let mut n_sum = if reopening { 0 } else { position.entry_n_sum };
+    let mut d_sum = if reopening { 0 } else { position.entry_d_sum };
+    let mut notional_delta: u64 = 0;
+    for f in fills {
+        notional_delta = notional_delta
+            .checked_add(f.size)
+            .ok_or(FructusError::ArithmeticOverflow)?;
+        let (nn, nd) = positions::accumulate_entry(
+            n_sum,
+            d_sum,
+            entry_total_lamports,
+            entry_pool_token_supply,
+            f.size,
+        )
+        .ok_or(FructusError::ArithmeticOverflow)?;
+        n_sum = nn;
+        d_sum = nd;
+    }
+    let new_notional = position
+        .notional
+        .checked_add(notional_delta)
+        .ok_or(FructusError::ArithmeticOverflow)?;
+    let new_collateral = positions::margin_required(new_notional, initial_margin_bps)
+        .ok_or(FructusError::ArithmeticOverflow)?;
+    // Margin is monotonic non-decreasing in notional (ceiling formula), so the
+    // incremental delta is well-defined; reservation grows by exactly that
+    // delta (REQ-7), checked against the free-collateral seam (D11).
+    let incremental = new_collateral
+        .checked_sub(position.collateral)
+        .ok_or(FructusError::ArithmeticOverflow)?;
+    let new_reserved = user_collateral
+        .reserved
+        .checked_add(incremental)
+        .ok_or(FructusError::ArithmeticOverflow)?;
+    collateral::free_collateral(user_collateral.deposited, new_reserved)
+        .ok_or(FructusError::InsufficientFreeCollateral)?;
+
+    position.notional = new_notional;
+    position.entry_n_sum = n_sum;
+    position.entry_d_sum = d_sum;
+    position.collateral = new_collateral;
+    if reopening {
+        position.open_slot = now_slot;
+    }
+    user_collateral.reserved = new_reserved;
+    Ok(())
+}
+
+/// Apply close-intent fills to a position and its margin ledger (REQ-4).
+///
+/// * `notional -= Σ fill.size` — never below zero (the handler pre-checks
+///   `size <= notional` and the engine never over-fills; the `checked_sub` is
+///   defensive and maps to `InvalidCloseSize`).
+/// * `collateral` is recomputed down from the new notional and
+///   `UserCollateral.reserved` is released by exactly that delta (REQ-7).
+/// * Entry running sums, `open_slot`, and `last_funding_epoch` are unchanged
+///   (average-cost convention); no PnL settlement (D4).
+fn apply_close_fills(
+    position: &mut Position,
+    user_collateral: &mut UserCollateral,
+    initial_margin_bps: u16,
+    fills: &[orderbook::Fill],
+) -> Result<()> {
+    if fills.is_empty() {
+        return Ok(());
+    }
+    let mut notional_delta: u64 = 0;
+    for f in fills {
+        notional_delta = notional_delta
+            .checked_add(f.size)
+            .ok_or(FructusError::ArithmeticOverflow)?;
+    }
+    let new_notional = position
+        .notional
+        .checked_sub(notional_delta)
+        .ok_or(FructusError::InvalidCloseSize)?;
+    let new_collateral = positions::margin_required(new_notional, initial_margin_bps)
+        .ok_or(FructusError::ArithmeticOverflow)?;
+    // Margin is monotonic non-decreasing in notional, so closing can only
+    // release reservation (never below zero; D11's exact-sum invariant).
+    let released = position
+        .collateral
+        .checked_sub(new_collateral)
+        .ok_or(FructusError::ArithmeticOverflow)?;
+    let new_reserved = user_collateral
+        .reserved
+        .checked_sub(released)
+        .ok_or(FructusError::ArithmeticOverflow)?;
+
+    position.notional = new_notional;
+    position.collateral = new_collateral;
+    user_collateral.reserved = new_reserved;
+    Ok(())
+}
+
+/// Place the `open_position` order against the book and return its fills.
+///
+/// * `price == 0` → market (IOC, `OrderKind::Market`): matches to exhaustion;
+///   any unfilled remainder is cancelled, never rested.
+/// * `price > 0` non-crossing → rests at the limit price (no fills).
+/// * `price > 0` crossing → bounded match (`MAX_MATCH_STEPS`); a
+///   **budget-hit remainder is cancelled** (IOC-style on the remainder, D10′)
+///   — never re-queued as a `Residual` event (the crank therefore never needs
+///   position accounts); a no-longer-crossing remainder (opposite book
+///   exhausted) rests at its limit price; a *still*-crossing remainder can
+///   only be a self-trade — rejected with `SelfTrade` when nothing filled,
+///   otherwise cancelled so the legitimate non-self fills survive (F4).
+///
+/// Every fill appends a stamped `Fill` event (snapshot FR-6/D8); a full event
+/// ring fails with `BookFull` — fills are never silently dropped (D10).
+fn match_open_taker(
+    account: &mut OrderBook,
+    book: &mut orderbook::Book,
+    incoming: orderbook::Order,
+    entry_total_lamports: u64,
+    entry_pool_token_supply: u64,
+) -> Result<Vec<orderbook::Fill>> {
+    let outcome = if incoming.price == 0 {
+        // Market (IOC): no step budget — the opposite side holds at most
+        // `MAX_ORDERS_PER_SIDE` makers, bounding the loop (same reasoning as
+        // `place_market_order`); `residual` is always `None`.
+        orderbook::match_order(
+            book,
+            incoming.clone(),
+            orderbook::OrderKind::Market,
+            u64::MAX,
+        )
+    } else if !orderbook::would_cross(book, &incoming) {
+        // Non-crossing limit: rest at the limit price, no fills.
+        orderbook::post_limit(book, incoming)?;
+        return Ok(Vec::new());
+    } else {
+        orderbook::match_order(
+            book,
+            incoming.clone(),
+            orderbook::OrderKind::Limit,
+            MAX_MATCH_STEPS,
+        )
+    };
+
+    emit_fill_events(
+        account,
+        &outcome.fills,
+        opposite(incoming.side),
+        entry_total_lamports,
+        entry_pool_token_supply,
+    )?;
+
+    let total_filled: u64 = outcome.fills.iter().map(|f| f.size).sum();
+    let remaining = incoming.size.saturating_sub(total_filled);
+    if incoming.price > 0 && remaining > 0 {
+        let remainder = orderbook::Order {
+            owner: incoming.owner,
+            side: incoming.side,
+            price: incoming.price,
+            size: remaining,
+            seq: incoming.seq,
+        };
+        match outcome.residual {
+            Some(_) => {
+                // Budget hit (D10′): the still-crossable remainder is cancelled
+                // — never re-queued as a Residual, never rested.
+            }
+            None => {
+                // The opposite book is exhausted (or only self-owned makers
+                // remain crossable).
+                if orderbook::would_cross(book, &remainder) {
+                    // Still crosses: only a self-owned maker can be crossable.
+                    // A pure self-trade (nothing filled) rejects; otherwise the
+                    // self-crossing remainder is cancelled so the legitimate
+                    // non-self fills survive (F4 semantics).
+                    if total_filled == 0 {
+                        return Err(FructusError::SelfTrade.into());
+                    }
+                } else {
+                    // No longer crosses: rest at the limit price, unless the
+                    // side is at capacity (then cancel — BookFull from a
+                    // partial fill must not revert the fills that did match).
+                    let side_full = match remainder.side {
+                        orderbook::Side::Bid => book.bids.len() >= MAX_ORDERS_PER_SIDE,
+                        orderbook::Side::Ask => book.asks.len() >= MAX_ORDERS_PER_SIDE,
+                    };
+                    if !side_full {
+                        orderbook::post_limit(book, remainder)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(outcome.fills)
+}
+
+/// Locate the pending `Fill` event at `seq` for maker settlement (REQ-5).
+///
+/// `slot = seq % EVENT_QUEUE_LEN`. Returns:
+/// * `Ok(None)` — the slot holds a `Fill` with `event.seq == seq` that is
+///   **already settled** (`settled != 0`): an idempotent no-op (D9).
+/// * `Ok(Some(event))` — a pending `Fill` (`kind == Fill`, `event.seq == seq`,
+///   `settled == 0`) carrying the fill-time snapshot for settlement.
+/// * `Err(EventNotFound)` — any other slot content: a ring-wrapped/never
+///   written slot (`event.seq != seq`, the OQ-1 liveness bound) or a
+///   non-Fill event (Cancel/Residual) at this seq.
+fn settle_event(account: &OrderBook, seq: u64) -> Result<Option<OutEvent>> {
+    let idx = (seq % EVENT_QUEUE_LEN as u64) as usize;
+    let event = account.events[idx];
+    if event.seq == seq && event.kind == EVENT_KIND_FILL && event.settled != 0 {
+        return Ok(None); // idempotent no-op (D9)
+    }
+    require!(event.seq == seq, FructusError::EventNotFound);
+    require!(event.kind == EVENT_KIND_FILL, FructusError::EventNotFound);
+    // Defensive: a matching Fill with `settled != 0` returned `Ok(None)` above,
+    // so this is unreachable — kept for the explicit state machine.
+    require!(event.settled == 0, FructusError::EventNotFound);
+    Ok(Some(event))
+}
+
+/// Derive the maker's `Position` / `UserCollateral` PDAs from the event's
+/// `owner` + `side` and verify the supplied account keys byte-for-byte
+/// (AGENTS.md), returning the `Position` PDA bump for the lazy-create CPI.
+///
+/// A mismatch fails with `ProgramError::InvalidAccountData` (no dedicated
+/// error variant — design §3 flow item 3).
+fn verify_maker_accounts(
+    market_key: &Pubkey,
+    event: &OutEvent,
+    position_key: &Pubkey,
+    collateral_key: &Pubkey,
+) -> Result<u8> {
+    let (position_pda, position_bump) = Pubkey::find_program_address(
+        &[
+            POSITION_SEED,
+            market_key.as_ref(),
+            event.owner.as_ref(),
+            &[event.side],
+        ],
+        &crate::ID,
+    );
+    if position_pda.as_ref() != position_key.as_ref() {
+        return Err(ProgramError::InvalidAccountData.into());
+    }
+    let (collateral_pda, _) = Pubkey::find_program_address(
+        &[
+            USER_COLLATERAL_SEED,
+            market_key.as_ref(),
+            event.owner.as_ref(),
+        ],
+        &crate::ID,
+    );
+    if collateral_pda.as_ref() != collateral_key.as_ref() {
+        return Err(ProgramError::InvalidAccountData.into());
+    }
+    Ok(position_bump)
 }
 
 declare_id!("8ZLiJ12eBiam4UP2HRp3M75CQAcc8GuUBz44zeHt6mjH");
@@ -505,6 +968,10 @@ pub mod fructus {
     }
 
     /// Post a limit order: rest if non-crossing, otherwise match inline.
+    ///
+    /// The market-bound `index_source` is validated and its exchange-rate
+    /// snapshot is stamped onto every emitted `Fill` (FR-6/D8), so resting
+    /// makers can later be settled at the fill-time index.
     pub fn place_limit_order<'info>(
         ctx: Context<'info, PlaceLimitOrder<'info>>,
         side: u8,
@@ -515,6 +982,9 @@ pub mod fructus {
         require!(size != 0, FructusError::InvalidSize);
         let side = side_from_u8(side)?;
         let owner = ctx.accounts.owner.key();
+        // The index snapshot is read once per tx (same slot ⇒ same rate) and
+        // stamped onto every Fill this order produces (FR-6/D8).
+        let rate = read_stake_pool(&ctx.accounts.index_source)?;
         let mut account = ctx.accounts.order_book.load_mut()?;
         let now_slot = Clock::get()?.slot;
 
@@ -536,8 +1006,16 @@ pub mod fructus {
             return Ok(());
         }
 
-        // Crossing: match inline; never rest a crossing order.
-        match_limit_taker(&mut account, &mut book, incoming)?;
+        // Crossing: match inline; never rest a crossing order. A Fill that
+        // cannot be appended (full event ring) fails the whole order with
+        // `BookFull` (D10) — fills are never silently dropped.
+        match_limit_taker(
+            &mut account,
+            &mut book,
+            incoming,
+            rate.total_lamports,
+            rate.pool_token_supply,
+        )?;
         save_book(&mut account, &book);
         record_observation(&mut account, orderbook::mid(&book), now_slot);
         Ok(())
@@ -545,6 +1023,9 @@ pub mod fructus {
 
     /// Cross the opposite book best-price-first. Market orders are IOC: any
     /// unfilled remainder is cancelled, never posted.
+    ///
+    /// The market-bound `index_source` is validated and its exchange-rate
+    /// snapshot is stamped onto every emitted `Fill` (FR-6/D8).
     pub fn place_market_order<'info>(
         ctx: Context<'info, PlaceMarketOrder<'info>>,
         side: u8,
@@ -553,6 +1034,9 @@ pub mod fructus {
         require!(size != 0, FructusError::InvalidSize);
         let side = side_from_u8(side)?;
         let owner = ctx.accounts.owner.key();
+        // The index snapshot is read once per tx (same slot ⇒ same rate) and
+        // stamped onto every Fill this order produces (FR-6/D8).
+        let rate = read_stake_pool(&ctx.accounts.index_source)?;
         let mut account = ctx.accounts.order_book.load_mut()?;
         let now_slot = Clock::get()?.slot;
 
@@ -571,10 +1055,18 @@ pub mod fructus {
         // book is exhausted"), so there is no step budget: the opposite side has
         // at most `MAX_ORDERS_PER_SIDE` makers, which bounds the loop. `Market`
         // is IOC, so `outcome.residual` is always `None` and any unfilled
-        // remainder (book exhausted) is simply cancelled, never posted.
+        // remainder (book exhausted) is simply cancelled, never posted. A Fill
+        // that cannot be appended (full event ring) fails the whole order with
+        // `BookFull` (D10) — fills are never silently dropped.
         let outcome =
             orderbook::match_order(&mut book, incoming, orderbook::OrderKind::Market, u64::MAX);
-        emit_fill_events(&mut account, &outcome.fills, maker_side);
+        emit_fill_events(
+            &mut account,
+            &outcome.fills,
+            maker_side,
+            rate.total_lamports,
+            rate.pool_token_supply,
+        )?;
 
         save_book(&mut account, &book);
         record_observation(&mut account, orderbook::mid(&book), now_slot);
@@ -598,6 +1090,8 @@ pub mod fructus {
             side_to_u8(removed.side),
             removed.price,
             removed.size,
+            0,
+            0,
         );
         save_book(&mut account, &book);
         record_observation(&mut account, orderbook::mid(&book), now_slot);
@@ -607,70 +1101,25 @@ pub mod fructus {
     /// Permissionless: drain the event queue in bounded batches and resume any
     /// `Residual` entries left behind by budget-interrupted takers. Never matches
     /// off-chain and takes no privileged state.
+    ///
+    /// The market-bound `index_source` is validated and its exchange-rate
+    /// snapshot is stamped onto every Fill a resumed residual produces (FR-6/D8).
+    /// The crank never wedges the ring: a `Residual` whose fills cannot be
+    /// appended (full ring) is cancelled rather than reverting the drain.
     pub fn crank<'info>(ctx: Context<'info, Crank<'info>>) -> Result<()> {
+        // The index snapshot is read once per tx (same slot ⇒ same rate) and
+        // stamped onto every Fill this batch produces (FR-6/D8).
+        let rate = read_stake_pool(&ctx.accounts.index_source)?;
         let mut account = ctx.accounts.order_book.load_mut()?;
         let now_slot = Clock::get()?.slot;
 
         let mut book = load_book(&account);
-        let mut book_dirty = false;
-
-        let mut processed: u64 = 0;
-        while processed < CRANK_BATCH_LEN && account.event_read_cursor < account.event_write_cursor
-        {
-            let idx = (account.event_read_cursor % EVENT_QUEUE_LEN as u64) as usize;
-            let event = account.events[idx];
-            account.event_read_cursor = account
-                .event_read_cursor
-                .checked_add(1)
-                .ok_or(FructusError::ArithmeticOverflow)?;
-            processed = processed
-                .checked_add(1)
-                .ok_or(FructusError::ArithmeticOverflow)?;
-
-            match event.kind {
-                EVENT_KIND_RESIDUAL => {
-                    let side = side_from_u8(event.side)?;
-                    let seq = take_next_seq(&mut book)?;
-                    let incoming = orderbook::Order {
-                        owner: event.owner,
-                        side,
-                        price: event.price,
-                        size: event.size,
-                        seq,
-                    };
-                    // `take_next_seq` already advanced, so the book is dirty
-                    // either way. A resumed residual must be consumed, never
-                    // rejected (F2): if the engine cannot finish it (a pure
-                    // self-trade, or a full event ring), cancel it here so the
-                    // shared crank is never wedged. The read cursor already
-                    // advanced past this event.
-                    book_dirty = true;
-                    if match_limit_taker(&mut account, &mut book, incoming).is_err() {
-                        msg!(
-                            "crank cancelled unresumable residual owner={} size={}",
-                            event.owner,
-                            event.size
-                        );
-                    }
-                }
-                EVENT_KIND_FILL | EVENT_KIND_CANCEL => {
-                    // Emit (log) and consume; there is no settlement this iteration,
-                    // so fills/cancels have no further on-chain effect.
-                    msg!(
-                        "crank consumed event seq={} kind={} owner={} side={} price={} size={}",
-                        event.seq,
-                        event.kind,
-                        event.owner,
-                        event.side,
-                        event.price,
-                        event.size
-                    );
-                }
-                _ => {
-                    msg!("crank skipped unknown event kind={}", event.kind);
-                }
-            }
-        }
+        let book_dirty = drain_events(
+            &mut account,
+            &mut book,
+            rate.total_lamports,
+            rate.pool_token_supply,
+        )?;
 
         if book_dirty {
             save_book(&mut account, &book);
@@ -833,6 +1282,375 @@ pub mod fructus {
 
         Ok(())
     }
+
+    /// Open a position on `side` (0 = Long/Bid, 1 = Short/Ask) by routing an
+    /// order through the CLOB. `price == 0` selects a market (IOC) order;
+    /// `price > 0` selects a limit order that rests when non-crossing and
+    /// cancels a budget-hit remainder (D10′). Taker fills settle inline: the
+    /// position grows (`notional += fill.size`), the entry running sums
+    /// accumulate the in-transaction index snapshot, and margin is reserved
+    /// against the user's free collateral (REQ-3/REQ-7).
+    pub fn open_position<'info>(
+        ctx: Context<'info, OpenPosition<'info>>,
+        side: u8,
+        size: u64,
+        price: u64,
+    ) -> Result<()> {
+        positions::validate_open_args(side, size)?;
+        let side = side_from_u8(side)?;
+        let owner = ctx.accounts.owner.key();
+        // The index snapshot is read once per tx (same slot ⇒ same rate) and
+        // stamped onto every Fill this order produces (FR-6/D8).
+        let rate = read_stake_pool(&ctx.accounts.index_source)?;
+        let mut account = ctx.accounts.order_book.load_mut()?;
+        let now_slot = Clock::get()?.slot;
+
+        let mut book = load_book(&account);
+        let seq = take_next_seq(&mut book)?;
+        let incoming = orderbook::Order {
+            owner,
+            side,
+            price,
+            size,
+            seq,
+        };
+        let fills = match_open_taker(
+            &mut account,
+            &mut book,
+            incoming,
+            rate.total_lamports,
+            rate.pool_token_supply,
+        )?;
+
+        if !fills.is_empty() {
+            // Lazily create the per-(market, user, side) `Position` on first
+            // fill (mirror `deposit_collateral`; payer = user). "Needs
+            // creation" means the PDA is still a pristine system account —
+            // empty data, system-owned, zero lamports (F5): an
+            // attacker-created account at the PDA (with data, or rent-funded
+            // but empty) must not be mistaken for never-created.
+            if ctx.accounts.position.data_is_empty()
+                && ctx.accounts.position.owner == &system_program::ID
+                && ctx.accounts.position.lamports() == 0
+            {
+                let rent = Rent::get()?;
+                let space = 8 + Position::LEN;
+                let market_key = ctx.accounts.market.key();
+                let side_byte = side_to_u8(side);
+                let bump = ctx.bumps.position;
+                let seeds: &[&[u8]] = &[
+                    POSITION_SEED,
+                    market_key.as_ref(),
+                    owner.as_ref(),
+                    &[side_byte],
+                    &[bump],
+                ];
+                system_program::create_account(
+                    CpiContext::new(
+                        ctx.accounts.system_program.key(),
+                        system_program::CreateAccount {
+                            from: ctx.accounts.owner.to_account_info(),
+                            to: ctx.accounts.position.to_account_info(),
+                        },
+                    )
+                    .with_signer(&[seeds]),
+                    rent.minimum_balance(space),
+                    space as u64,
+                    &crate::ID,
+                )?;
+            } else if ctx.accounts.position.owner != &crate::ID {
+                // F2: an account at the PDA that is neither pristine nor
+                // program-owned is an attacker squat (system-owned, with data
+                // or rent-funded): Solana forbids a program from mutating an
+                // account it does not own, so the (market, user, side) can
+                // never be reclaimed on-chain. Fail with the dedicated error
+                // instead of the generic owner check, so the brick is
+                // diagnosable (`reset_position` reports the same error and
+                // reclaims program-owned stuck positions).
+                return Err(FructusError::PositionPdaSquatted.into());
+            }
+
+            // The ledger must pre-exist (D13): a missing `UserCollateral` is a
+            // free-collateral error (REQ-7), not an account-format error.
+            require!(
+                !ctx.accounts.user_collateral.data_is_empty(),
+                FructusError::InsufficientFreeCollateral
+            );
+
+            // Settle the taker's fills inline (D2): notional, entry sums, and
+            // reserved margin update atomically or the tx reverts.
+            let mut position =
+                Account::<Position>::try_from_unchecked(ctx.accounts.position.as_ref())?;
+            position.bump = ctx.bumps.position;
+            position.market = ctx.accounts.market.key();
+            position.owner = owner;
+            position.side = side_to_u8(side);
+            let mut user_collateral = Account::<UserCollateral>::try_from_unchecked(
+                ctx.accounts.user_collateral.as_ref(),
+            )?;
+            apply_open_fills(
+                &mut position,
+                &mut user_collateral,
+                ctx.accounts.market.initial_margin_bps,
+                &fills,
+                rate.total_lamports,
+                rate.pool_token_supply,
+                now_slot,
+            )?;
+            position.exit(&crate::ID)?;
+            user_collateral.exit(&crate::ID)?;
+        }
+
+        save_book(&mut account, &book);
+        record_observation(&mut account, orderbook::mid(&book), now_slot);
+        Ok(())
+    }
+
+    /// Close `size` of the position on `side` (0 = Long, 1 = Short) by placing
+    /// a **market-IOC order on the opposite side** (an ask closes a long, a
+    /// bid closes a short) — never rests (D5). Fills reduce the position
+    /// (`notional -= fill.size`, never below zero), recompute collateral down
+    /// (releasing reserved margin), and leave the entry sums unchanged; no PnL
+    /// settlement (D4). `size == 0` → `InvalidSize`; no live position →
+    /// `PositionNotFound`; `size > notional` → `InvalidCloseSize` (REQ-4).
+    pub fn close_position<'info>(
+        ctx: Context<'info, ClosePosition<'info>>,
+        side: u8,
+        size: u64,
+    ) -> Result<()> {
+        require!(size != 0, FructusError::InvalidSize);
+        let side = side_from_u8(side)?;
+        let owner = ctx.accounts.owner.key();
+        // The index snapshot is read once per tx and stamped onto every Fill
+        // this order produces (FR-6/D8), so the opposite-side makers can later
+        // settle at the fill-time index.
+        let rate = read_stake_pool(&ctx.accounts.index_source)?;
+        let mut account = ctx.accounts.order_book.load_mut()?;
+        let now_slot = Clock::get()?.slot;
+
+        // The position must exist and be live before any book mutation (FR-4).
+        // "Exists" means a real program-owned `Position` account: an
+        // attacker-squatted system account with data at the PDA must not pass
+        // the gate (F5) — `try_from_unchecked` would otherwise fail the owner
+        // check and brick the close, freezing the reserved margin. F2: a squat
+        // is distinguished from a never-opened position with the dedicated
+        // `PositionPdaSquatted` error (Solana forbids the program from
+        // reclaiming an account it does not own; `reset_position` reports the
+        // same error and reclaims program-owned stuck positions).
+        if ctx.accounts.position.owner != &crate::ID {
+            if ctx.accounts.position.data_is_empty() {
+                return Err(FructusError::PositionNotFound.into());
+            }
+            return Err(FructusError::PositionPdaSquatted.into());
+        }
+        let mut position = Account::<Position>::try_from_unchecked(ctx.accounts.position.as_ref())?;
+        require!(position.notional > 0, FructusError::PositionNotFound);
+        require!(size <= position.notional, FructusError::InvalidCloseSize);
+
+        let mut book = load_book(&account);
+        let seq = take_next_seq(&mut book)?;
+        let incoming = orderbook::Order {
+            owner,
+            side: opposite(side),
+            price: 0,
+            size,
+            seq,
+        };
+        // Market (IOC) on the opposite side: matches to exhaustion, remainder
+        // cancelled, never posted (see `place_market_order` for the budget
+        // reasoning). Fills rest on the position's own side, so their events
+        // carry `side` as the maker side.
+        let outcome =
+            orderbook::match_order(&mut book, incoming, orderbook::OrderKind::Market, u64::MAX);
+        emit_fill_events(
+            &mut account,
+            &outcome.fills,
+            side,
+            rate.total_lamports,
+            rate.pool_token_supply,
+        )?;
+
+        if !outcome.fills.is_empty() {
+            // The ledger backs the position's reserved margin, so it must
+            // exist; releasing reservation never fails (D11 exact-sum).
+            let mut user_collateral = Account::<UserCollateral>::try_from_unchecked(
+                ctx.accounts.user_collateral.as_ref(),
+            )?;
+            apply_close_fills(
+                &mut position,
+                &mut user_collateral,
+                ctx.accounts.market.initial_margin_bps,
+                &outcome.fills,
+            )?;
+            position.exit(&crate::ID)?;
+            user_collateral.exit(&crate::ID)?;
+        }
+
+        save_book(&mut account, &book);
+        record_observation(&mut account, orderbook::mid(&book), now_slot);
+        Ok(())
+    }
+
+    /// Permissionless maker-side settlement: book one resting maker's `Fill`
+    /// from the event queue (REQ-5). `slot = seq % EVENT_QUEUE_LEN`; an
+    /// already-settled `Fill` is an idempotent no-op, a stale slot or non-Fill
+    /// event is `EventNotFound`. The maker's `Position` / `UserCollateral`
+    /// PDAs are derived from the event's `owner` + `side` and verified
+    /// byte-for-byte (mismatch → `ProgramError::InvalidAccountData`); a
+    /// missing ledger is `InsufficientFreeCollateral` (D13). Open-intent:
+    /// a closed position re-opens (`entry :=` event snapshot × size,
+    /// `open_slot :=` now), a live position accumulates the event-carried
+    /// snapshot; margin is reserved against the maker's free collateral and
+    /// the event is marked settled only on success (retryable on shortfall).
+    /// No `index_source`: the event carries the fill-time snapshot (REQ-6).
+    pub fn settle_fill<'info>(ctx: Context<'info, SettleFill<'info>>, seq: u64) -> Result<()> {
+        let market = &ctx.accounts.market;
+        let mut account = ctx.accounts.order_book.load_mut()?;
+        let now_slot = Clock::get()?.slot;
+
+        let Some(event) = settle_event(&account, seq)? else {
+            return Ok(()); // idempotent no-op (D9)
+        };
+
+        let position_bump = verify_maker_accounts(
+            &market.key(),
+            &event,
+            &ctx.accounts.position.key(),
+            &ctx.accounts.user_collateral.key(),
+        )?;
+
+        // The maker's ledger must pre-exist (D13): a missing `UserCollateral`
+        // is a free-collateral error, not an account-format error.
+        require!(
+            !ctx.accounts.user_collateral.data_is_empty(),
+            FructusError::InsufficientFreeCollateral
+        );
+
+        // Lazily create the maker's `Position` on first settlement
+        // (payer = cranker, D13). "Needs creation" means the PDA is still a
+        // pristine system account — empty data, system-owned, zero lamports
+        // (F5): an attacker-created account at the PDA (with data, or
+        // rent-funded but empty) must not be mistaken for never-created.
+        if ctx.accounts.position.data_is_empty()
+            && ctx.accounts.position.owner == &system_program::ID
+            && ctx.accounts.position.lamports() == 0
+        {
+            let rent = Rent::get()?;
+            let space = 8 + Position::LEN;
+            let market_key = market.key();
+            let seeds: &[&[u8]] = &[
+                POSITION_SEED,
+                market_key.as_ref(),
+                event.owner.as_ref(),
+                &[event.side],
+                &[position_bump],
+            ];
+            system_program::create_account(
+                CpiContext::new(
+                    ctx.accounts.system_program.key(),
+                    system_program::CreateAccount {
+                        from: ctx.accounts.payer.to_account_info(),
+                        to: ctx.accounts.position.to_account_info(),
+                    },
+                )
+                .with_signer(&[seeds]),
+                rent.minimum_balance(space),
+                space as u64,
+                &crate::ID,
+            )?;
+        } else if ctx.accounts.position.owner != &crate::ID {
+            // F2: an account at the PDA that is neither pristine nor
+            // program-owned is an attacker squat (system-owned, with data or
+            // rent-funded): Solana forbids a program from mutating an account
+            // it does not own, so the (market, user, side) can never be
+            // reclaimed on-chain — fail with the dedicated error so the brick
+            // is diagnosable (`reset_position` reports the same error and
+            // reclaims program-owned stuck positions).
+            return Err(FructusError::PositionPdaSquatted.into());
+        }
+
+        let mut position = Account::<Position>::try_from_unchecked(ctx.accounts.position.as_ref())?;
+        position.bump = position_bump;
+        position.market = market.key();
+        position.owner = event.owner;
+        position.side = event.side;
+        let mut user_collateral =
+            Account::<UserCollateral>::try_from_unchecked(ctx.accounts.user_collateral.as_ref())?;
+
+        // Open-intent maker settlement: the event carries the fill-time
+        // snapshot (D7); re-open resets, live positions accumulate (D6).
+        let fill = [orderbook::Fill {
+            maker_seq: event.seq,
+            maker_owner: event.owner,
+            taker_owner: event.counterparty,
+            size: event.size,
+            price: event.price,
+        }];
+        apply_open_fills(
+            &mut position,
+            &mut user_collateral,
+            market.initial_margin_bps,
+            &fill,
+            event.entry_total_lamports,
+            event.entry_pool_token_supply,
+            now_slot,
+        )?;
+
+        position.exit(&crate::ID)?;
+        user_collateral.exit(&crate::ID)?;
+
+        // Mark settled — only on success, so a margin shortfall leaves the
+        // event un-settled and retryable (FR-5).
+        account.events[(seq % EVENT_QUEUE_LEN as u64) as usize].settled = 1;
+        Ok(())
+    }
+
+    /// Position-PDA recovery (F2): reset a **closed** (`notional == 0`)
+    /// `Position` in place — zeroing its fields so the next `open_position` /
+    /// `settle_fill` lazy-create gate starts fresh — and reject anything else
+    /// with a dedicated, diagnosable error.
+    ///
+    /// * Program-owned, closed position → reset (fields zeroed in place; the
+    ///   account stays program-owned and rent-funded, so no lamport moves).
+    /// * Program-owned, LIVE position (`notional > 0`) → `PositionNotFound`:
+    ///   a live position must be unwound through `close_position`, which
+    ///   releases its reserved margin; resetting it here would orphan the
+    ///   ledger reservation.
+    /// * System-owned account at the PDA (an attacker squat) →
+    ///   `PositionPdaSquatted`: Solana's ownership rule forbids a program from
+    ///   mutating an account it does not own, so a squat is permanently
+    ///   unreclaimable on-chain — the dedicated error makes the brick
+    ///   diagnosable (the `open_position` / `settle_fill` create-gates return
+    ///   the same error).
+    ///
+    /// Owner-gated: only the position's user may reclaim their own dormant
+    /// PDA (the `user` signer is bound into the PDA seed).
+    pub fn reset_position<'info>(
+        ctx: Context<'info, ResetPosition<'info>>,
+        side: u8,
+    ) -> Result<()> {
+        let _side = side_from_u8(side)?;
+        require!(
+            ctx.accounts.position.owner == &crate::ID,
+            FructusError::PositionPdaSquatted
+        );
+        let mut position = Account::<Position>::try_from_unchecked(ctx.accounts.position.as_ref())?;
+        require!(position.notional == 0, FructusError::PositionNotFound);
+        // Zero every field in place (fixed borsh layout). The retained
+        // closed-position convention (entry sums / open_slot) is intentionally
+        // cleared — the next open/settle re-open resets them anyway.
+        position.market = Pubkey::default();
+        position.owner = Pubkey::default();
+        position.side = 0;
+        position.notional = 0;
+        position.entry_n_sum = 0;
+        position.entry_d_sum = 0;
+        position.collateral = 0;
+        position.last_funding_epoch = 0;
+        position.open_slot = 0;
+        position.exit(&crate::ID)?;
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]
@@ -924,6 +1742,11 @@ pub struct PlaceLimitOrder<'info> {
     pub order_book: AccountLoader<'info, OrderBook>,
     #[account(seeds = [PERP_MARKET_SEED], bump = market.bump)]
     pub market: Account<'info, PerpMarket>,
+    /// CHECK: must byte-equal `market.index_source` (Anchor `address`
+    /// constraint) and pass the stake-pool owner/discriminator validation in
+    /// the handler; its exchange-rate snapshot is stamped onto every Fill.
+    #[account(address = market.index_source)]
+    pub index_source: UncheckedAccount<'info>,
     pub owner: Signer<'info>,
 }
 
@@ -937,6 +1760,11 @@ pub struct PlaceMarketOrder<'info> {
     pub order_book: AccountLoader<'info, OrderBook>,
     #[account(seeds = [PERP_MARKET_SEED], bump = market.bump)]
     pub market: Account<'info, PerpMarket>,
+    /// CHECK: must byte-equal `market.index_source` (Anchor `address`
+    /// constraint) and pass the stake-pool owner/discriminator validation in
+    /// the handler; its exchange-rate snapshot is stamped onto every Fill.
+    #[account(address = market.index_source)]
+    pub index_source: UncheckedAccount<'info>,
     pub owner: Signer<'info>,
 }
 
@@ -963,6 +1791,12 @@ pub struct Crank<'info> {
     pub order_book: AccountLoader<'info, OrderBook>,
     #[account(seeds = [PERP_MARKET_SEED], bump = market.bump)]
     pub market: Account<'info, PerpMarket>,
+    /// CHECK: must byte-equal `market.index_source` (Anchor `address`
+    /// constraint) and pass the stake-pool owner/discriminator validation in
+    /// the handler; its exchange-rate snapshot is stamped onto every Fill a
+    /// resumed residual produces.
+    #[account(address = market.index_source)]
+    pub index_source: UncheckedAccount<'info>,
     pub cranker: Signer<'info>,
 }
 
@@ -1043,12 +1877,139 @@ pub struct WithdrawCollateral<'info> {
     pub token_program: Program<'info, Token>,
 }
 
+#[derive(Accounts)]
+#[instruction(side: u8)]
+pub struct OpenPosition<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    #[account(seeds = [PERP_MARKET_SEED], bump = market.bump)]
+    pub market: Account<'info, PerpMarket>,
+    #[account(
+        mut,
+        seeds = [ORDER_BOOK_SEED, market.key().as_ref()],
+        bump
+    )]
+    pub order_book: AccountLoader<'info, OrderBook>,
+    /// CHECK: must byte-equal `market.index_source` (Anchor `address`
+    /// constraint) and pass the stake-pool owner/discriminator validation in
+    /// the handler; its exchange-rate snapshot is stamped onto every Fill.
+    #[account(address = market.index_source)]
+    pub index_source: UncheckedAccount<'info>,
+    /// CHECK: the per-(market, user, side) `Position` PDA (seed
+    /// `[POSITION_SEED, market, user, side_byte]`), lazily created by the
+    /// handler on first fill and retained after a full close (`notional == 0`
+    /// means closed).
+    #[account(
+        mut,
+        seeds = [POSITION_SEED, market.key().as_ref(), owner.key().as_ref(), &[side]],
+        bump
+    )]
+    pub position: UncheckedAccount<'info>,
+    /// CHECK: the per-(market, user) collateral ledger, created by
+    /// `deposit_collateral`; the handler rejects a missing ledger with
+    /// `InsufficientFreeCollateral` before reserving margin.
+    #[account(
+        mut,
+        seeds = [USER_COLLATERAL_SEED, market.key().as_ref(), owner.key().as_ref()],
+        bump
+    )]
+    pub user_collateral: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(side: u8)]
+pub struct ClosePosition<'info> {
+    pub owner: Signer<'info>,
+    #[account(seeds = [PERP_MARKET_SEED], bump = market.bump)]
+    pub market: Account<'info, PerpMarket>,
+    #[account(
+        mut,
+        seeds = [ORDER_BOOK_SEED, market.key().as_ref()],
+        bump
+    )]
+    pub order_book: AccountLoader<'info, OrderBook>,
+    /// CHECK: must byte-equal `market.index_source` (Anchor `address`
+    /// constraint) and pass the stake-pool owner/discriminator validation in
+    /// the handler; its exchange-rate snapshot is stamped onto every Fill.
+    #[account(address = market.index_source)]
+    pub index_source: UncheckedAccount<'info>,
+    /// CHECK: the per-(market, user, side) `Position` PDA; must already hold
+    /// data with `notional > 0` (the handler reports `PositionNotFound`
+    /// otherwise).
+    #[account(
+        mut,
+        seeds = [POSITION_SEED, market.key().as_ref(), owner.key().as_ref(), &[side]],
+        bump
+    )]
+    pub position: UncheckedAccount<'info>,
+    /// CHECK: the per-(market, user) collateral ledger, created by
+    /// `deposit_collateral`; closing releases reservation from it.
+    #[account(
+        mut,
+        seeds = [USER_COLLATERAL_SEED, market.key().as_ref(), owner.key().as_ref()],
+        bump
+    )]
+    pub user_collateral: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct SettleFill<'info> {
+    #[account(seeds = [PERP_MARKET_SEED], bump = market.bump)]
+    pub market: Account<'info, PerpMarket>,
+    #[account(
+        mut,
+        seeds = [ORDER_BOOK_SEED, market.key().as_ref()],
+        bump
+    )]
+    pub order_book: AccountLoader<'info, OrderBook>,
+    /// CHECK: the maker's `Position` PDA (seed
+    /// `[POSITION_SEED, market, event.owner, event.side]`); the handler
+    /// derives it from the `Fill` event and verifies the supplied key
+    /// byte-for-byte (`ProgramError::InvalidAccountData` on mismatch),
+    /// lazily creating it on first settlement.
+    #[account(mut)]
+    pub position: UncheckedAccount<'info>,
+    /// CHECK: the maker's collateral ledger (seed
+    /// `[USER_COLLATERAL_SEED, market, event.owner]`), verified in the handler
+    /// against the event-derived PDA; must pre-exist (`InsufficientFreeCollateral`
+    /// otherwise).
+    #[account(mut)]
+    pub user_collateral: UncheckedAccount<'info>,
+    /// CHECK: pays the lazy rent for the maker's first `Position` (any signer).
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(side: u8)]
+pub struct ResetPosition<'info> {
+    #[account(seeds = [PERP_MARKET_SEED], bump = market.bump)]
+    pub market: Account<'info, PerpMarket>,
+    /// CHECK: the per-(market, user, side) `Position` PDA (seed
+    /// `[POSITION_SEED, market, user, side_byte]`); the handler resets it in
+    /// place when it is a program-owned CLOSED position (`notional == 0`) and
+    /// rejects a live position (`PositionNotFound`) or a system-owned squat
+    /// (`PositionPdaSquatted`).
+    #[account(
+        mut,
+        seeds = [POSITION_SEED, market.key().as_ref(), user.key().as_ref(), &[side]],
+        bump
+    )]
+    pub position: UncheckedAccount<'info>,
+    /// CHECK: the position's user (bound into the PDA seed); signs to authorize
+    /// the reset of their own dormant position.
+    pub user: Signer<'info>,
+}
+
 #[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 mod handlers_tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn empty_account() -> OrderBook {
         OrderBook {
@@ -1153,6 +2114,8 @@ mod handlers_tests {
                 SIDE_BID,
                 i,
                 i,
+                0,
+                0,
             );
         }
         // The ring is exactly full: every event was written, seq == write cursor.
@@ -1170,6 +2133,8 @@ mod handlers_tests {
             SIDE_BID,
             999,
             999,
+            0,
+            0,
         );
         assert_eq!(
             account.event_write_cursor, EVENT_QUEUE_LEN as u64,
@@ -1190,6 +2155,8 @@ mod handlers_tests {
             SIDE_BID,
             999,
             999,
+            0,
+            0,
         );
         assert_eq!(account.event_write_cursor, EVENT_QUEUE_LEN as u64 + 1);
         assert_eq!(
@@ -1237,7 +2204,7 @@ mod handlers_tests {
         // Taker (owner 1) bids 12 into its own ask at 10: skipped by the engine,
         // then the remainder still crosses -> SelfTrade.
         let incoming = order(1, orderbook::Side::Bid, 12, 5, 1);
-        let result = match_limit_taker(&mut account, &mut book, incoming);
+        let result = match_limit_taker(&mut account, &mut book, incoming, 0, 0);
         assert!(result.is_err());
     }
 
@@ -1251,7 +2218,7 @@ mod handlers_tests {
         };
         // Taker bids 12 for size 5 into ask 10 (size 3): fills 3, rests 2 at 12.
         let incoming = order(1, orderbook::Side::Bid, 12, 5, 1);
-        match_limit_taker(&mut account, &mut book, incoming).unwrap();
+        match_limit_taker(&mut account, &mut book, incoming, 0, 0).unwrap();
         assert!(book.asks.is_empty());
         assert_eq!(book.bids.len(), 1);
         assert_eq!(book.bids[0].price, 12);
@@ -1272,10 +2239,1099 @@ mod handlers_tests {
         // MAX_MATCH_STEPS == 8, so 8 of the 10 makers fill and the remaining 2
         // are deferred as a Residual event.
         let incoming = order(1, orderbook::Side::Bid, 30, 10, 0);
-        match_limit_taker(&mut account, &mut book, incoming).unwrap();
+        match_limit_taker(&mut account, &mut book, incoming, 0, 0).unwrap();
         assert_eq!(book.asks.len(), 2);
         assert_eq!(account.event_write_cursor, 9); // 8 fills + 1 residual
         assert_eq!(account.events[8].kind, EVENT_KIND_RESIDUAL);
         assert_eq!(account.events[8].size, 2);
+    }
+
+    /// Every `Fill` event is stamped with the in-transaction index snapshot
+    /// (`entry_total_lamports` / `entry_pool_token_supply`, FR-6/D8) and starts
+    /// un-settled (`settled == 0`), so `settle_fill` can book the maker at the
+    /// fill-time index. Non-fill events (Cancel/Residual) carry a zero snapshot.
+    #[test]
+    fn fill_event_layout_and_stamp() {
+        let mut account = empty_account();
+        let mut book = orderbook::Book {
+            bids: vec![],
+            asks: vec![order(2, orderbook::Side::Ask, 10, 3, 0)],
+            next_seq: 1,
+        };
+        // Taker (owner 1) bids 12 into ask 10 (size 3): one fill, no remainder.
+        let incoming = order(1, orderbook::Side::Bid, 12, 3, 1);
+        match_limit_taker(&mut account, &mut book, incoming, 123_456_789, 987_654_321).unwrap();
+        assert!(book.asks.is_empty());
+
+        assert_eq!(account.event_write_cursor, 1);
+        let ev = account.events[0];
+        assert_eq!(ev.kind, EVENT_KIND_FILL);
+        assert_eq!(ev.seq, 0);
+        assert_eq!(ev.owner, Pubkey::from([2; 32]), "maker owner");
+        assert_eq!(ev.counterparty, Pubkey::from([1; 32]), "taker owner");
+        assert_eq!(
+            ev.side, SIDE_ASK,
+            "maker side (fills rest opposite the taker)"
+        );
+        assert_eq!(ev.price, 10);
+        assert_eq!(ev.size, 3);
+        assert_eq!(
+            ev.entry_total_lamports, 123_456_789,
+            "fill carries the in-transaction index numerator"
+        );
+        assert_eq!(
+            ev.entry_pool_token_supply, 987_654_321,
+            "fill carries the in-transaction index denominator"
+        );
+        assert_eq!(ev.settled, 0, "a fresh Fill is pending maker settlement");
+    }
+
+    /// Fills are never silently dropped (D10): `emit_fill_events` fails with
+    /// `BookFull` when the event ring is full, and the direct taker paths
+    /// (`place_limit_order` / `place_market_order` via `match_limit_taker`)
+    /// propagate that error instead of reporting success.
+    #[test]
+    fn fill_append_at_capacity_fails_book_full() {
+        // 1. `emit_fill_events` on a full ring fails BookFull.
+        let mut account = empty_account();
+        for i in 0..(EVENT_QUEUE_LEN as u64) {
+            append_event(
+                &mut account,
+                EVENT_KIND_CANCEL,
+                Pubkey::from([7; 32]),
+                Pubkey::default(),
+                SIDE_BID,
+                i,
+                i,
+                0,
+                0,
+            );
+        }
+        assert_eq!(account.event_write_cursor, EVENT_QUEUE_LEN as u64);
+        let fills = vec![orderbook::Fill {
+            maker_seq: 0,
+            maker_owner: Pubkey::from([2; 32]),
+            taker_owner: Pubkey::from([1; 32]),
+            size: 5,
+            price: 10,
+        }];
+        let err = emit_fill_events(&mut account, &fills, orderbook::Side::Ask, 111, 222)
+            .expect_err("a full ring must reject the fill, never silently drop it");
+        assert_eq!(
+            err,
+            FructusError::BookFull.into(),
+            "append failure surfaces as BookFull"
+        );
+        // The failed append must not advance the write cursor or touch a slot.
+        assert_eq!(account.event_write_cursor, EVENT_QUEUE_LEN as u64);
+        assert_eq!(
+            account.events[0].kind, EVENT_KIND_CANCEL,
+            "undrained slot untouched"
+        );
+
+        // 2. The taker path propagates: a crossing taker whose Fill cannot be
+        //    appended fails with BookFull (never Ok-with-dropped-fill).
+        let mut account = empty_account();
+        for i in 0..(EVENT_QUEUE_LEN as u64) {
+            append_event(
+                &mut account,
+                EVENT_KIND_CANCEL,
+                Pubkey::from([7; 32]),
+                Pubkey::default(),
+                SIDE_BID,
+                i,
+                i,
+                0,
+                0,
+            );
+        }
+        let mut book = orderbook::Book {
+            bids: vec![],
+            asks: vec![order(2, orderbook::Side::Ask, 10, 5, 0)],
+            next_seq: 1,
+        };
+        let incoming = order(1, orderbook::Side::Bid, 12, 5, 1);
+        let err = match_limit_taker(&mut account, &mut book, incoming, 111, 222)
+            .expect_err("a full ring must fail the taker's fill");
+        assert_eq!(err, FructusError::BookFull.into());
+    }
+
+    /// The crank never wedges the ring (FR-6): the read cursor always advances
+    /// past the head event, and a `Residual` is resumed only when the ring has
+    /// capacity to persist EVERY fill its match would produce — otherwise the
+    /// whole remainder is cancelled up front without consuming any maker
+    /// (D10': all-or-nothing; D10: fills are never silently dropped).
+    #[test]
+    fn crank_drains_ring_when_full() {
+        // Scenario 1: the ring is FULL and the head is a Residual that needs two
+        // fills. Only one slot frees after the head drains, so the resume cannot
+        // persist both fills: the capacity gate cancels the whole remainder up
+        // front — NO maker is consumed, NO fill is dropped (D10), and the ring
+        // still advances (the head event is consumed).
+        let mut account = empty_account();
+        let mut residual = OutEvent::default();
+        residual.seq = 0;
+        residual.kind = EVENT_KIND_RESIDUAL;
+        residual.side = SIDE_BID;
+        residual.owner = Pubkey::from([1; 32]);
+        residual.price = 30;
+        residual.size = 12;
+        account.events[0] = residual;
+        for i in 1..(EVENT_QUEUE_LEN as u64) {
+            let mut fill = OutEvent::default();
+            fill.seq = i;
+            fill.kind = EVENT_KIND_FILL;
+            fill.side = SIDE_BID;
+            fill.owner = Pubkey::from([7; 32]);
+            fill.size = 1;
+            account.events[i as usize] = fill;
+        }
+        account.event_write_cursor = EVENT_QUEUE_LEN as u64;
+
+        // Two crossable asks (5 + 5 at 10/11): the residual bid 30 @ 12 crosses
+        // both, so it needs two Fill events but only one slot frees after the
+        // head drains — the resume is cancelled, not partially executed.
+        let mut book = orderbook::Book {
+            bids: vec![],
+            asks: vec![
+                order(2, orderbook::Side::Ask, 10, 5, 0),
+                order(2, orderbook::Side::Ask, 11, 5, 1),
+            ],
+            next_seq: 2,
+        };
+
+        let dirty = drain_events(&mut account, &mut book, 100, 200).unwrap();
+        assert!(
+            !dirty,
+            "a capacity-cancelled residual mutates neither book nor seq"
+        );
+        assert!(
+            account.event_read_cursor > 0,
+            "crank must advance past the head event even when the ring is full"
+        );
+        assert_eq!(
+            book.asks.len(),
+            2,
+            "all-or-nothing: no maker is consumed when the ring cannot hold every fill"
+        );
+        assert!(
+            book.bids.is_empty(),
+            "the unresumable remainder is cancelled, never rested"
+        );
+        // The ring is untouched: the write cursor never advanced and slot 0
+        // still holds the unconsumed residual (nothing was dropped, nothing
+        // stamped, nothing settled).
+        assert_eq!(account.event_write_cursor, EVENT_QUEUE_LEN as u64);
+        let ev = account.events[0];
+        assert_eq!(ev.kind, EVENT_KIND_RESIDUAL);
+        assert_eq!(ev.entry_total_lamports, 0);
+        assert_eq!(ev.entry_pool_token_supply, 0);
+        assert_eq!(ev.settled, 0);
+
+        // Scenario 2: with ring capacity the same residual resumes fully — both
+        // fills are appended and stamped, and the non-crossing remainder rests.
+        let mut account = empty_account();
+        let mut residual = OutEvent::default();
+        residual.seq = 0;
+        residual.kind = EVENT_KIND_RESIDUAL;
+        residual.side = SIDE_BID;
+        residual.owner = Pubkey::from([1; 32]);
+        residual.price = 30;
+        residual.size = 12;
+        account.events[0] = residual;
+        account.event_write_cursor = 1;
+        let mut book = orderbook::Book {
+            bids: vec![],
+            asks: vec![
+                order(2, orderbook::Side::Ask, 10, 5, 0),
+                order(2, orderbook::Side::Ask, 11, 5, 1),
+            ],
+            next_seq: 2,
+        };
+
+        let dirty = drain_events(&mut account, &mut book, 100, 200).unwrap();
+        assert!(dirty);
+        assert_eq!(
+            account.event_read_cursor, account.event_write_cursor,
+            "ring drained"
+        );
+        assert_eq!(account.event_write_cursor, 3, "two fills appended");
+        for i in 1..3 {
+            let ev = account.events[i];
+            assert_eq!(ev.kind, EVENT_KIND_FILL);
+            assert_eq!(ev.entry_total_lamports, 100, "fill stamped");
+            assert_eq!(ev.entry_pool_token_supply, 200);
+            assert_eq!(ev.settled, 0);
+        }
+        assert!(book.asks.is_empty());
+        assert_eq!(book.bids.len(), 1, "remainder rests at its limit price");
+        assert_eq!(book.bids[0].price, 30);
+        assert_eq!(book.bids[0].size, 2);
+    }
+
+    // --- Position lifecycle (issue #5) -------------------------------------
+    //
+    // REQ-3 (open: inline taker settlement, margin reservation, budget-hit
+    // remainder cancelled), REQ-4 (close: opposite-side IOC, margin release,
+    // entry unchanged), REQ-5 (settle_fill: event state machine + PDA
+    // verification + open-intent re-open), REQ-7 (reserved writer, free seam).
+
+    fn position(
+        notional: u64,
+        n_sum: u128,
+        d_sum: u128,
+        collateral: u64,
+        open_slot: u64,
+    ) -> Position {
+        Position {
+            market: Pubkey::default(),
+            owner: Pubkey::default(),
+            side: 0,
+            notional,
+            entry_n_sum: n_sum,
+            entry_d_sum: d_sum,
+            collateral,
+            last_funding_epoch: 0,
+            open_slot,
+            bump: 0,
+        }
+    }
+
+    fn user_collateral(deposited: u64, reserved: u64) -> UserCollateral {
+        UserCollateral {
+            deposited,
+            reserved,
+            bump: 0,
+        }
+    }
+
+    fn fill(size: u64) -> orderbook::Fill {
+        orderbook::Fill {
+            maker_seq: 0,
+            maker_owner: Pubkey::from([2; 32]),
+            taker_owner: Pubkey::from([1; 32]),
+            size,
+            price: 10,
+        }
+    }
+
+    // --- REQ-3/REQ-7: open fills settle inline (notional, entry sums, margin) ---
+
+    #[test]
+    fn open_fills_accumulate_notional_entry_and_margin() {
+        let mut pos = position(0, 0, 0, 0, 0);
+        let mut uc = user_collateral(1_000_000_000, 0);
+        let fills = vec![fill(1_000_000), fill(2_000_000)];
+        apply_open_fills(
+            &mut pos,
+            &mut uc,
+            1_000,
+            &fills,
+            1_000_000_000,
+            1_000_000,
+            7,
+        )
+        .unwrap();
+        assert_eq!(pos.notional, 3_000_000);
+        // Both fills share the in-transaction snapshot: Σ rate × size (D6).
+        assert_eq!(pos.entry_n_sum, 1_000_000_000u128 * 3_000_000);
+        assert_eq!(pos.entry_d_sum, 1_000_000u128 * 3_000_000);
+        assert_eq!(
+            pos.collateral,
+            positions::margin_required(3_000_000, 1_000).unwrap()
+        );
+        assert_eq!(
+            uc.reserved, pos.collateral,
+            "reserved == position collateral"
+        );
+        assert_eq!(pos.open_slot, 7, "a fresh open records the fill slot");
+    }
+
+    #[test]
+    fn open_fills_reopen_resets_entry_and_open_slot() {
+        // A retained closed position (notional == 0) carries stale sums from a
+        // prior life; a re-open resets them (FR-2/FR-5).
+        let mut pos = position(0, 999, 888, 0, 1);
+        let mut uc = user_collateral(1_000_000, 0);
+        apply_open_fills(&mut pos, &mut uc, 1_000, &[fill(5)], 100, 10, 42).unwrap();
+        assert_eq!(pos.notional, 5);
+        assert_eq!(pos.entry_n_sum, 500, "entry := event snapshot × size");
+        assert_eq!(pos.entry_d_sum, 50);
+        assert_eq!(pos.open_slot, 42, "re-open stamps the current slot");
+        assert_eq!(
+            pos.collateral,
+            positions::margin_required(5, 1_000).unwrap()
+        );
+    }
+
+    #[test]
+    fn open_fills_accumulate_into_live_position() {
+        let collateral = positions::margin_required(100, 1_000).unwrap();
+        let mut pos = position(100, 1_000, 100, collateral, 1);
+        let mut uc = user_collateral(1_000_000, collateral);
+        apply_open_fills(&mut pos, &mut uc, 1_000, &[fill(50)], 100, 10, 99).unwrap();
+        assert_eq!(pos.notional, 150);
+        assert_eq!(pos.entry_n_sum, 1_000 + 100 * 50);
+        assert_eq!(pos.entry_d_sum, 100 + 10 * 50);
+        assert_eq!(
+            pos.open_slot, 1,
+            "adding to a live position keeps the open slot"
+        );
+        // Margin reservation grows by exactly the margin_required delta (REQ-7).
+        assert_eq!(uc.reserved, positions::margin_required(150, 1_000).unwrap());
+        assert_eq!(
+            uc.reserved - collateral,
+            positions::margin_required(150, 1_000).unwrap() - collateral
+        );
+    }
+
+    #[test]
+    fn open_fills_respect_free_collateral_seam() {
+        let mut pos = position(0, 0, 0, 0, 0);
+        let mut uc = user_collateral(100, 0); // far below the margin requirement
+        let err = apply_open_fills(
+            &mut pos,
+            &mut uc,
+            1_000,
+            &[fill(1_000_000)],
+            1_000_000_000,
+            1_000_000,
+            5,
+        )
+        .expect_err("reserving beyond free collateral must fail");
+        assert_eq!(err, FructusError::InsufficientFreeCollateral.into());
+        // Atomic: neither account is mutated by the failed reservation.
+        assert_eq!(pos.notional, 0);
+        assert_eq!(pos.entry_n_sum, 0);
+        assert_eq!(pos.entry_d_sum, 0);
+        assert_eq!(pos.collateral, 0);
+        assert_eq!(uc.reserved, 0);
+    }
+
+    #[test]
+    fn open_fills_noop_when_no_fills() {
+        let mut pos = position(0, 0, 0, 0, 0);
+        let mut uc = user_collateral(0, 0);
+        apply_open_fills(&mut pos, &mut uc, 1_000, &[], 0, 0, 5).unwrap();
+        assert_eq!(pos.notional, 0);
+        assert_eq!(pos.entry_n_sum, 0);
+        assert_eq!(uc.reserved, 0);
+    }
+
+    // --- REQ-4/REQ-7: close fills reduce notional and release margin ---
+
+    #[test]
+    fn close_fills_reduce_notional_and_release_margin() {
+        let collateral = positions::margin_required(1_000, 1_000).unwrap();
+        let mut pos = position(1_000, 7, 7, collateral, 3);
+        let mut uc = user_collateral(1_000_000, collateral);
+        apply_close_fills(&mut pos, &mut uc, 1_000, &[fill(600)]).unwrap();
+        assert_eq!(pos.notional, 400);
+        assert_eq!(
+            pos.collateral,
+            positions::margin_required(400, 1_000).unwrap()
+        );
+        assert_eq!(
+            uc.reserved, pos.collateral,
+            "reserved tracks the reduced margin"
+        );
+        assert_eq!(pos.entry_n_sum, 7, "entry sums unchanged on close");
+        assert_eq!(pos.entry_d_sum, 7);
+        assert_eq!(pos.open_slot, 3, "open_slot unchanged on close");
+    }
+
+    #[test]
+    fn close_fills_full_close_releases_all_margin() {
+        let collateral = positions::margin_required(1_000, 1_000).unwrap();
+        let mut pos = position(1_000, 7, 7, collateral, 3);
+        let mut uc = user_collateral(1_000_000, collateral);
+        apply_close_fills(&mut pos, &mut uc, 1_000, &[fill(1_000)]).unwrap();
+        assert_eq!(pos.notional, 0);
+        assert_eq!(pos.collateral, 0);
+        assert_eq!(uc.reserved, 0, "a full close releases all reservation");
+        assert_eq!(pos.entry_n_sum, 7, "closed position retains its entry sums");
+    }
+
+    #[test]
+    fn close_fills_never_below_zero() {
+        let collateral = positions::margin_required(100, 1_000).unwrap();
+        let mut pos = position(100, 7, 7, collateral, 3);
+        let mut uc = user_collateral(1_000_000, collateral);
+        let err = apply_close_fills(&mut pos, &mut uc, 1_000, &[fill(101)])
+            .expect_err("closing more than the position holds must fail");
+        assert_eq!(err, FructusError::InvalidCloseSize.into());
+        assert_eq!(pos.notional, 100, "no mutation on error");
+        assert_eq!(uc.reserved, collateral);
+    }
+
+    #[test]
+    fn close_fills_noop_when_no_fills() {
+        let mut pos = position(100, 7, 7, 10, 3);
+        let mut uc = user_collateral(1_000_000, 10);
+        apply_close_fills(&mut pos, &mut uc, 1_000, &[]).unwrap();
+        assert_eq!(pos.notional, 100);
+        assert_eq!(uc.reserved, 10);
+    }
+
+    // --- REQ-3: open order placement (market IOC / limit rest / D10′) ---
+
+    #[test]
+    fn open_position_market_settles_inline() {
+        let mut account = empty_account();
+        let mut book = orderbook::Book {
+            bids: vec![],
+            asks: vec![order(2, orderbook::Side::Ask, 10, 3, 0)],
+            next_seq: 1,
+        };
+        let incoming = order(1, orderbook::Side::Bid, 0, 3, 1); // market long
+        let fills = match_open_taker(&mut account, &mut book, incoming, 100, 200).unwrap();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].size, 3);
+        assert!(book.asks.is_empty());
+        assert!(book.bids.is_empty(), "market remainder is never rested");
+
+        let mut pos = position(0, 0, 0, 0, 0);
+        let mut uc = user_collateral(1_000_000, 0);
+        apply_open_fills(&mut pos, &mut uc, 10_000, &fills, 100, 200, 5).unwrap();
+        assert_eq!(pos.notional, 3);
+        assert_eq!(pos.entry_n_sum, 300);
+        assert_eq!(pos.entry_d_sum, 600);
+        assert_eq!(uc.reserved, positions::margin_required(3, 10_000).unwrap());
+    }
+
+    #[test]
+    fn open_limit_rests_when_non_crossing() {
+        let mut account = empty_account();
+        let mut book = orderbook::Book {
+            bids: vec![],
+            asks: vec![order(2, orderbook::Side::Ask, 10, 5, 0)],
+            next_seq: 1,
+        };
+        let incoming = order(1, orderbook::Side::Bid, 9, 5, 1); // below the ask
+        let fills = match_open_taker(&mut account, &mut book, incoming, 100, 200).unwrap();
+        assert!(fills.is_empty());
+        assert_eq!(book.bids.len(), 1, "non-crossing limit rests");
+        assert_eq!(book.bids[0].price, 9);
+        assert_eq!(account.event_write_cursor, 0, "no fills, no events");
+    }
+
+    #[test]
+    fn open_limit_cancels_budget_hit_remainder() {
+        let mut account = empty_account();
+        let asks: Vec<orderbook::Order> = (0..10)
+            .map(|i| order(2, orderbook::Side::Ask, 10 + i as u64, 1, i as u64))
+            .collect();
+        let mut book = orderbook::Book {
+            bids: vec![],
+            asks,
+            next_seq: 10,
+        };
+        // MAX_MATCH_STEPS == 8: 8 makers fill; the taker's 2-unit remainder
+        // hits the budget and is cancelled IOC-style (D10′) — never re-queued
+        // as a Residual, never rested.
+        let incoming = order(1, orderbook::Side::Bid, 30, 10, 0);
+        let fills = match_open_taker(&mut account, &mut book, incoming, 0, 0).unwrap();
+        assert_eq!(fills.len(), 8);
+        assert_eq!(fills.iter().map(|f| f.size).sum::<u64>(), 8);
+        assert_eq!(account.event_write_cursor, 8, "8 fills, no residual event");
+        assert!(
+            account.events.iter().all(|e| e.kind != EVENT_KIND_RESIDUAL),
+            "a budget-hit open remainder must never re-queue a Residual"
+        );
+        assert_eq!(book.asks.len(), 2, "unmatched makers stay");
+        assert!(
+            book.bids.is_empty(),
+            "the remainder is cancelled, never rested"
+        );
+    }
+
+    #[test]
+    fn open_limit_rests_exhausted_remainder() {
+        let mut account = empty_account();
+        let mut book = orderbook::Book {
+            bids: vec![],
+            asks: vec![
+                order(2, orderbook::Side::Ask, 10, 3, 0),
+                order(2, orderbook::Side::Ask, 11, 3, 1),
+            ],
+            next_seq: 2,
+        };
+        // Taker bids 12 for 10: fills 6 against the two asks, the remaining 4
+        // no longer crosses (book exhausted) and rests at the limit price.
+        let incoming = order(1, orderbook::Side::Bid, 12, 10, 2);
+        let fills = match_open_taker(&mut account, &mut book, incoming, 0, 0).unwrap();
+        assert_eq!(fills.iter().map(|f| f.size).sum::<u64>(), 6);
+        assert!(book.asks.is_empty());
+        assert_eq!(book.bids.len(), 1);
+        assert_eq!(book.bids[0].price, 12);
+        assert_eq!(book.bids[0].size, 4);
+    }
+
+    #[test]
+    fn open_limit_pure_self_trade_rejected() {
+        let mut account = empty_account();
+        let mut book = orderbook::Book {
+            bids: vec![],
+            asks: vec![order(1, orderbook::Side::Ask, 10, 5, 0)], // taker's own ask
+            next_seq: 1,
+        };
+        let incoming = order(1, orderbook::Side::Bid, 12, 5, 1);
+        let err = match_open_taker(&mut account, &mut book, incoming, 0, 0)
+            .expect_err("a pure self-trade must be rejected");
+        assert_eq!(err, FructusError::SelfTrade.into());
+    }
+
+    #[test]
+    fn open_limit_self_trade_cancels_remainder_when_filled() {
+        let mut account = empty_account();
+        let mut book = orderbook::Book {
+            bids: vec![],
+            asks: vec![
+                order(1, orderbook::Side::Ask, 9, 100, 0), // self-owned, better price
+                order(2, orderbook::Side::Ask, 10, 100, 1),
+            ],
+            next_seq: 2,
+        };
+        // Taker (owner 1) bids 10 for 150: the non-self ask fills 100; the only
+        // remaining crossable maker is self-owned — the remainder is cancelled,
+        // not used to revert the legitimate fills (F4 semantics).
+        let incoming = order(1, orderbook::Side::Bid, 10, 150, 2);
+        let fills = match_open_taker(&mut account, &mut book, incoming, 0, 0).unwrap();
+        assert_eq!(fills.iter().map(|f| f.size).sum::<u64>(), 100);
+        assert_eq!(book.asks.len(), 1, "self-owned ask is skipped, not filled");
+        assert_eq!(book.asks[0].seq, 0);
+        assert!(book.bids.is_empty(), "self-crossing remainder cancelled");
+    }
+
+    #[test]
+    fn open_market_remainder_cancelled() {
+        let mut account = empty_account();
+        let mut book = orderbook::Book {
+            bids: vec![],
+            asks: vec![order(2, orderbook::Side::Ask, 10, 3, 0)],
+            next_seq: 1,
+        };
+        let incoming = order(1, orderbook::Side::Bid, 0, 10, 1); // market long 10
+        let fills = match_open_taker(&mut account, &mut book, incoming, 0, 0).unwrap();
+        assert_eq!(
+            fills.iter().map(|f| f.size).sum::<u64>(),
+            3,
+            "market fills to exhaustion"
+        );
+        assert!(
+            book.bids.is_empty(),
+            "unfilled market remainder is cancelled"
+        );
+        assert_eq!(account.event_write_cursor, 1);
+    }
+
+    // --- REQ-3 (D10): a full event ring fails the open, never drops fills ---
+
+    #[test]
+    fn open_book_full_on_full_ring() {
+        let mut account = empty_account();
+        for i in 0..(EVENT_QUEUE_LEN as u64) {
+            append_event(
+                &mut account,
+                EVENT_KIND_CANCEL,
+                Pubkey::from([7; 32]),
+                Pubkey::default(),
+                SIDE_BID,
+                i,
+                i,
+                0,
+                0,
+            );
+        }
+        let mut book = orderbook::Book {
+            bids: vec![],
+            asks: vec![order(2, orderbook::Side::Ask, 10, 5, 0)],
+            next_seq: 1,
+        };
+        let incoming = order(1, orderbook::Side::Bid, 12, 5, 1);
+        let err = match_open_taker(&mut account, &mut book, incoming, 111, 222)
+            .expect_err("a full event ring must fail the open, never drop fills");
+        assert_eq!(err, FructusError::BookFull.into());
+    }
+
+    // --- REQ-5: settle_fill event state machine ---
+
+    #[test]
+    fn settle_event_returns_pending_fill() {
+        let mut account = empty_account();
+        let mut fill_ev = OutEvent::default();
+        fill_ev.seq = 5;
+        fill_ev.kind = EVENT_KIND_FILL;
+        fill_ev.settled = 0;
+        account.events[5] = fill_ev;
+        let ev = settle_event(&account, 5)
+            .unwrap()
+            .expect("a pending fill must be returned");
+        assert_eq!(ev.seq, 5);
+    }
+
+    #[test]
+    fn settle_event_idempotent_noop_for_settled_fill() {
+        let mut account = empty_account();
+        let mut fill_ev = OutEvent::default();
+        fill_ev.seq = 5;
+        fill_ev.kind = EVENT_KIND_FILL;
+        fill_ev.settled = 1;
+        account.events[5] = fill_ev;
+        assert!(
+            settle_event(&account, 5).unwrap().is_none(),
+            "an already-settled fill is an idempotent no-op (D9)"
+        );
+    }
+
+    #[test]
+    fn settle_event_stale_slot_is_event_not_found() {
+        let mut account = empty_account();
+        // The ring slot for seq 5 holds a DIFFERENT event (wrapped/overwritten).
+        let mut other = OutEvent::default();
+        other.seq = 6;
+        other.kind = EVENT_KIND_FILL;
+        account.events[5] = other;
+        let err = settle_event(&account, 5).expect_err("a stale slot must fail");
+        assert_eq!(err, FructusError::EventNotFound.into());
+    }
+
+    #[test]
+    fn settle_event_non_fill_is_event_not_found() {
+        let mut account = empty_account();
+        let mut cancel = OutEvent::default();
+        cancel.seq = 5;
+        cancel.kind = EVENT_KIND_CANCEL;
+        account.events[5] = cancel;
+        let err = settle_event(&account, 5).expect_err("a non-Fill event cannot be settled");
+        assert_eq!(err, FructusError::EventNotFound.into());
+    }
+
+    // --- REQ-5: maker PDA derivation + supplied-account verification ---
+
+    #[test]
+    fn verify_maker_accounts_accepts_derived_pdas() {
+        let market = Pubkey::from([9; 32]);
+        let owner = Pubkey::from([5; 32]);
+        let mut event = OutEvent::default();
+        event.owner = owner;
+        event.side = SIDE_ASK;
+        let (pos_pda, pos_bump) = Pubkey::find_program_address(
+            &[POSITION_SEED, market.as_ref(), owner.as_ref(), &[SIDE_ASK]],
+            &crate::ID,
+        );
+        let (uc_pda, _) = Pubkey::find_program_address(
+            &[USER_COLLATERAL_SEED, market.as_ref(), owner.as_ref()],
+            &crate::ID,
+        );
+        assert_eq!(
+            verify_maker_accounts(&market, &event, &pos_pda, &uc_pda).unwrap(),
+            pos_bump,
+            "correctly derived accounts pass and return the position bump"
+        );
+    }
+
+    #[test]
+    fn verify_maker_accounts_rejects_mismatch() {
+        let market = Pubkey::from([9; 32]);
+        let owner = Pubkey::from([5; 32]);
+        let mut event = OutEvent::default();
+        event.owner = owner;
+        event.side = SIDE_BID;
+        let (pos_pda, _) = Pubkey::find_program_address(
+            &[POSITION_SEED, market.as_ref(), owner.as_ref(), &[SIDE_BID]],
+            &crate::ID,
+        );
+        let (uc_pda, _) = Pubkey::find_program_address(
+            &[USER_COLLATERAL_SEED, market.as_ref(), owner.as_ref()],
+            &crate::ID,
+        );
+        // Wrong position key.
+        let err = verify_maker_accounts(&market, &event, &Pubkey::from([1; 32]), &uc_pda)
+            .expect_err("a mismatched position account must fail");
+        assert_eq!(err, ProgramError::InvalidAccountData.into());
+        // Wrong collateral key.
+        let err = verify_maker_accounts(&market, &event, &pos_pda, &Pubkey::from([1; 32]))
+            .expect_err("a mismatched collateral account must fail");
+        assert_eq!(err, ProgramError::InvalidAccountData.into());
+    }
+
+    // --- REQ-5: full maker-settlement flow (open-intent re-open) ---
+
+    #[test]
+    fn settle_fill_flow_reopens_and_books_maker() {
+        let market = Pubkey::from([9; 32]);
+        let owner = Pubkey::from([5; 32]);
+        let mut account = empty_account();
+        let mut fill_ev = OutEvent::default();
+        fill_ev.seq = 3;
+        fill_ev.kind = EVENT_KIND_FILL;
+        fill_ev.owner = owner;
+        fill_ev.side = SIDE_ASK; // the maker asked => short position
+        fill_ev.size = 1_000_000;
+        fill_ev.price = 10;
+        fill_ev.entry_total_lamports = 2_000_000_000;
+        fill_ev.entry_pool_token_supply = 1_000_000;
+        account.events[3] = fill_ev;
+
+        let event = settle_event(&account, 3).unwrap().unwrap();
+        let (pos_pda, _) = Pubkey::find_program_address(
+            &[POSITION_SEED, market.as_ref(), owner.as_ref(), &[SIDE_ASK]],
+            &crate::ID,
+        );
+        let (uc_pda, _) = Pubkey::find_program_address(
+            &[USER_COLLATERAL_SEED, market.as_ref(), owner.as_ref()],
+            &crate::ID,
+        );
+        verify_maker_accounts(&market, &event, &pos_pda, &uc_pda).unwrap();
+
+        // The maker's position is closed (retained): settlement re-opens it at
+        // the event-carried snapshot and stamps the settlement slot (FR-5).
+        let mut pos = position(0, 999, 888, 0, 0);
+        pos.side = SIDE_ASK;
+        let mut uc = user_collateral(1_000_000_000, 0);
+        let fill = [orderbook::Fill {
+            maker_seq: event.seq,
+            maker_owner: event.owner,
+            taker_owner: event.counterparty,
+            size: event.size,
+            price: event.price,
+        }];
+        apply_open_fills(
+            &mut pos,
+            &mut uc,
+            1_000,
+            &fill,
+            event.entry_total_lamports,
+            event.entry_pool_token_supply,
+            77,
+        )
+        .unwrap();
+        assert_eq!(pos.notional, 1_000_000);
+        assert_eq!(pos.entry_n_sum, 2_000_000_000u128 * 1_000_000);
+        assert_eq!(pos.entry_d_sum, 1_000_000u128 * 1_000_000);
+        assert_eq!(
+            pos.open_slot, 77,
+            "maker re-open stamps the settlement slot"
+        );
+        assert_eq!(uc.reserved, pos.collateral, "maker margin reserved");
+    }
+
+    // --- Property-based invariants over the account adapters (issue #5) ------
+    //
+    // The deterministic tests above pin specific scenarios; these proptests pin
+    // the general contracts design.md §5 demands of the adapters (REQ-3/4/5/7),
+    // driving the private adapter functions directly so the lib PBT suite
+    // exercises them at high run count.
+
+    proptest! {
+        // REQ-3/REQ-7 (I-close/atomicity): open fills settle inline — notional,
+        // entry sums, and margin track margin_required(new_notional) exactly;
+        // a shortfall is atomic (neither account mutated).
+        #[test]
+        fn apply_open_fills_accounting(
+            deposited in 0u64..1_000_000_000_000_000u64,
+            initial_margin_bps in 1u16..=10_000,
+            fill_sizes in proptest::collection::vec(1u64..1_000_000u64, 1..8),
+            entry_total_lamports in 1u64..1_000_000_000_000_000u64,
+            entry_pool_token_supply in 1u64..1_000_000_000_000_000u64,
+            now_slot in 0u64..1_000_000_000u64,
+        ) {
+            let fills: Vec<orderbook::Fill> = fill_sizes.iter()
+                .map(|&s| orderbook::Fill {
+                    maker_seq: 0,
+                    maker_owner: Pubkey::from([2u8; 32]),
+                    taker_owner: Pubkey::from([1u8; 32]),
+                    size: s,
+                    price: 10,
+                })
+                .collect();
+            let total: u64 = fill_sizes.iter().sum();
+            let margin = positions::margin_required(total, initial_margin_bps).unwrap();
+
+            if margin <= deposited {
+                // Branch A: the whole batch is affordable.
+                let mut position = position(0, 0, 0, 0, 0);
+                let mut uc = user_collateral(deposited, 0);
+                apply_open_fills(
+                    &mut position,
+                    &mut uc,
+                    initial_margin_bps,
+                    &fills,
+                    entry_total_lamports,
+                    entry_pool_token_supply,
+                    now_slot,
+                )
+                .unwrap();
+                prop_assert_eq!(position.notional, total, "notional accumulates the fills");
+                prop_assert_eq!(
+                    position.collateral,
+                    margin,
+                    "collateral tracks margin_required(new_notional)"
+                );
+                prop_assert_eq!(uc.reserved, margin, "reserved grows by the margin delta");
+                prop_assert!(
+                    uc.reserved <= uc.deposited,
+                    "free = deposited - reserved is never negative"
+                );
+                prop_assert_eq!(
+                    position.entry_n_sum,
+                    (entry_total_lamports as u128) * (total as u128),
+                    "entry_n_sum := snapshot numerator x Σ fill size (single-tx snapshot)"
+                );
+                prop_assert_eq!(
+                    position.entry_d_sum,
+                    (entry_pool_token_supply as u128) * (total as u128),
+                    "entry_d_sum := snapshot denominator x Σ fill size"
+                );
+                prop_assert_eq!(position.open_slot, now_slot, "a fresh open records the fill slot");
+            } else {
+                // Branch B: reserving the batch rate exceeds free collateral.
+                let mut position = position(0, 0, 0, 0, 0);
+                let mut uc = user_collateral(deposited, 0);
+                let err = apply_open_fills(
+                    &mut position,
+                    &mut uc,
+                    initial_margin_bps,
+                    &fills,
+                    entry_total_lamports,
+                    entry_pool_token_supply,
+                    now_slot,
+                )
+                .expect_err("a margin shortfall must fail the open");
+                prop_assert_eq!(err, FructusError::InsufficientFreeCollateral.into());
+                // Atomic: neither account is mutated by the failed reservation.
+                prop_assert_eq!(position.notional, 0);
+                prop_assert_eq!(position.entry_n_sum, 0);
+                prop_assert_eq!(position.entry_d_sum, 0);
+                prop_assert_eq!(position.collateral, 0);
+                prop_assert_eq!(uc.reserved, 0);
+            }
+        }
+
+        // REQ-4/REQ-7 (I-close-non-negative): close fills reduce notional,
+        // release exactly the margin delta, leave the entry sums unchanged, and
+        // never drive notional below 0 (atomic on an over-close).
+        #[test]
+        fn apply_close_fills_accounting(
+            start_notional in 1u64..1_000_000u64,
+            close_sizes in proptest::collection::vec(1u64..1_000_000u64, 1..8),
+            initial_margin_bps in 1u16..=10_000,
+            extra_reserved in 0u64..1_000_000u64,
+        ) {
+            let close_total: u64 = close_sizes.iter().sum();
+            let collateral = positions::margin_required(start_notional, initial_margin_bps).unwrap();
+            let mut position = position(start_notional, 12345u128, 67890u128, collateral, 7);
+            let mut uc = user_collateral(
+                1_000_000_000_000u64,
+                collateral.checked_add(extra_reserved).unwrap(),
+            );
+            let reserved_before = uc.reserved;
+            let fills: Vec<orderbook::Fill> = close_sizes.iter()
+                .map(|&s| orderbook::Fill {
+                    maker_seq: 0,
+                    maker_owner: Pubkey::from([2u8; 32]),
+                    taker_owner: Pubkey::from([1u8; 32]),
+                    size: s,
+                    price: 10,
+                })
+                .collect();
+
+            if close_total <= start_notional {
+                apply_close_fills(&mut position, &mut uc, initial_margin_bps, &fills).unwrap();
+                let new_notional = start_notional - close_total;
+                let new_collateral =
+                    positions::margin_required(new_notional, initial_margin_bps).unwrap();
+                let released = collateral - new_collateral;
+                prop_assert_eq!(position.notional, new_notional, "never below zero");
+                prop_assert_eq!(position.collateral, new_collateral, "collateral recomputed down");
+                prop_assert_eq!(
+                    uc.reserved,
+                    reserved_before - released,
+                    "reserved releases exactly the margin delta (never below 0)"
+                );
+                prop_assert_eq!(position.entry_n_sum, 12345u128, "entry sums unchanged on close");
+                prop_assert_eq!(position.entry_d_sum, 67890u128);
+                prop_assert_eq!(position.open_slot, 7, "open_slot unchanged on close");
+            } else {
+                let err = apply_close_fills(&mut position, &mut uc, initial_margin_bps, &fills)
+                    .expect_err("closing more than the position holds must fail");
+                prop_assert_eq!(err, FructusError::InvalidCloseSize.into());
+                // Atomic: no mutation on error.
+                prop_assert_eq!(position.notional, start_notional);
+                prop_assert_eq!(position.collateral, collateral);
+                prop_assert_eq!(uc.reserved, reserved_before);
+            }
+        }
+
+        // REQ-5/D9/OQ-1 (idempotent settle + event-not-found): a settled Fill is
+        // an idempotent no-op, a pending Fill is returned, and a stale slot or a
+        // non-Fill event at the seq's slot is EventNotFound.
+        #[test]
+        fn settle_event_state_machine(
+            seq in 0u64..10_000_000u64,
+            event_seq in 0u64..10_000_000u64,
+            kind in any::<u8>(),
+            settled in any::<u8>(),
+        ) {
+            let mut account = empty_account();
+            let idx = (seq % EVENT_QUEUE_LEN as u64) as usize;
+            let mut ev = OutEvent::default();
+            ev.seq = event_seq;
+            ev.kind = kind;
+            ev.settled = settled;
+            account.events[idx] = ev;
+            let result = settle_event(&account, seq);
+            if event_seq == seq && kind == EVENT_KIND_FILL {
+                if settled != 0 {
+                    prop_assert_eq!(result, Ok(None), "settled Fill -> idempotent no-op (D9)");
+                } else {
+                    let ev = result.unwrap().expect("a pending Fill is returned");
+                    prop_assert_eq!(ev.seq, seq);
+                }
+            } else {
+                prop_assert_eq!(
+                    result,
+                    Err(FructusError::EventNotFound.into()),
+                    "a stale slot / non-Fill event is EventNotFound (OQ-1)"
+                );
+            }
+        }
+
+        // REQ-5: the maker's Position/UserCollateral PDAs are derived from the
+        // event's owner + side and verified byte-for-byte; a mismatch on either
+        // key is InvalidAccountData.
+        #[test]
+        fn verify_maker_accounts_binds_owner_and_side(
+            market_byte in any::<u8>(),
+            owner_byte in any::<u8>(),
+            side in 0u8..2u8,
+            swap_pos in any::<bool>(),
+            swap_coll in any::<bool>(),
+        ) {
+            let market = Pubkey::from([market_byte; 32]);
+            let owner = Pubkey::from([owner_byte; 32]);
+            let mut event = OutEvent::default();
+            event.owner = owner;
+            event.side = side;
+            let (pos_pda, pos_bump) = Pubkey::find_program_address(
+                &[POSITION_SEED, market.as_ref(), owner.as_ref(), &[side]],
+                &crate::ID,
+            );
+            let (coll_pda, _) = Pubkey::find_program_address(
+                &[USER_COLLATERAL_SEED, market.as_ref(), owner.as_ref()],
+                &crate::ID,
+            );
+            let pos_key = if swap_pos { Pubkey::new_unique() } else { pos_pda };
+            let coll_key = if swap_coll { Pubkey::new_unique() } else { coll_pda };
+            let r = verify_maker_accounts(&market, &event, &pos_key, &coll_key);
+            if swap_pos || swap_coll {
+                prop_assert_eq!(
+                    r,
+                    Err(ProgramError::InvalidAccountData.into()),
+                    "a non-matching account key must be rejected"
+                );
+            } else {
+                prop_assert_eq!(
+                    r.unwrap(),
+                    pos_bump,
+                    "matching derived accounts pass and return the position bump"
+                );
+            }
+        }
+
+        // REQ-7/D11 (I-accounting): the single per-(market,user) collateral
+        // ledger reserves the SUM of the long and short position collateral; free
+        // = deposited - reserved and is never negative; an unaffordable second
+        // side fails atomically (open leaves the ledger at the long margin).
+        #[test]
+        fn reserved_is_sum_of_long_and_short_collateral(
+            deposited in 0u64..10_000_000_000_000u64,
+            long_n in 1u64..1_000_000u64,
+            short_n in 1u64..1_000_000u64,
+            initial_margin_bps in 1u16..=10_000,
+        ) {
+            let c_long = positions::margin_required(long_n, initial_margin_bps).unwrap();
+            let c_short = positions::margin_required(short_n, initial_margin_bps).unwrap();
+            let c_sum = c_long.checked_add(c_short).unwrap();
+            let long_fill = [orderbook::Fill {
+                maker_seq: 0,
+                maker_owner: Pubkey::from([2u8; 32]),
+                taker_owner: Pubkey::from([1u8; 32]),
+                size: long_n,
+                price: 10,
+            }];
+            let short_fill = [orderbook::Fill {
+                maker_seq: 0,
+                maker_owner: Pubkey::from([3u8; 32]),
+                taker_owner: Pubkey::from([1u8; 32]),
+                size: short_n,
+                price: 10,
+            }];
+            let mut long_pos = position(0, 0, 0, 0, 0);
+            let mut short_pos = position(0, 0, 0, 0, 0);
+            let mut uc = user_collateral(deposited, 0);
+
+            if c_sum <= deposited {
+                apply_open_fills(&mut long_pos, &mut uc, initial_margin_bps, &long_fill, 100, 100, 1)
+                    .unwrap();
+                apply_open_fills(&mut short_pos, &mut uc, initial_margin_bps, &short_fill, 200, 100, 1)
+                    .unwrap();
+                prop_assert_eq!(long_pos.collateral, c_long);
+                prop_assert_eq!(short_pos.collateral, c_short);
+                prop_assert_eq!(
+                    uc.reserved,
+                    c_sum,
+                    "reserved == Σ collateral(long) + collateral(short)"
+                );
+                prop_assert_eq!(
+                    collateral::free_collateral(deposited, uc.reserved),
+                    Some(deposited - uc.reserved),
+                    "free = deposited - reserved, never negative"
+                );
+            } else {
+                // The long side opens only when its own margin fits; the short
+                // side then fails if c_long + c_short > deposited (atomic).
+                if c_long > deposited {
+                    let r = apply_open_fills(
+                        &mut long_pos,
+                        &mut uc,
+                        initial_margin_bps,
+                        &long_fill,
+                        100,
+                        100,
+                        1,
+                    );
+                    prop_assert_eq!(r, Err(FructusError::InsufficientFreeCollateral.into()));
+                } else {
+                    apply_open_fills(
+                        &mut long_pos,
+                        &mut uc,
+                        initial_margin_bps,
+                        &long_fill,
+                        100,
+                        100,
+                        1,
+                    )
+                    .unwrap();
+                    let r = apply_open_fills(
+                        &mut short_pos,
+                        &mut uc,
+                        initial_margin_bps,
+                        &short_fill,
+                        200,
+                        100,
+                        1,
+                    );
+                    prop_assert_eq!(
+                        r,
+                        Err(FructusError::InsufficientFreeCollateral.into()),
+                        "the short open must fail atomically when the sum exceeds deposited"
+                    );
+                    prop_assert_eq!(uc.reserved, c_long, "ledger unchanged by the failed short");
+                    prop_assert_eq!(short_pos.notional, 0);
+                }
+            }
+        }
     }
 }
