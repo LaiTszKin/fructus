@@ -1920,11 +1920,15 @@ pub mod fructus {
         .unwrap_or(false);
         require!(liquidatable, FructusError::NotLiquidatable);
 
-        // Apply the (partial/full) liquidation transition.
+        // Apply the (partial/full) liquidation transition. The surviving
+        // collateral is re-derived at the INITIAL margin ratio so that
+        // `position.collateral == margin_required(notional, initial_margin_bps)`
+        // holds after the liquidation (the state.rs invariant, as on open/close).
         let (remaining_collateral, reward) = liquidation::apply_liquidation(
             position.collateral,
             position.notional,
             amount,
+            market.initial_margin_bps,
             market.maintenance_margin_bps,
             LIQUIDATION_PENALTY_BPS,
         )

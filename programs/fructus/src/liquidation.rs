@@ -16,10 +16,14 @@
 //! * **Liquidatable** iff `equity < maintenance_margin` — a **strict** `<`; an
 //!   exactly-maintained position (`equity == maintenance`) is healthy (R-L2). A
 //!   position is therefore liquidated only when it is genuinely under-margin.
-//! * **Penalty**: a bps fraction of the collateral released by the liquidated
-//!   notional, paid to the liquidator out of the position's collateral (R-L3) —
-//!   the liquidator incentive. For a full liquidation the released collateral is
-//!   the whole `position_collateral`.
+//! * **Penalty**: a bps fraction of the collateral released by the liquidation,
+//!   paid to the liquidator out of the position's collateral (R-L3) — the
+//!   liquidator incentive. The surviving collateral is re-derived at the
+//!   **initial** margin ratio (`state.rs`: `position.collateral ==
+//!   margin_required(notional, initial_margin_bps)`), so the released collateral
+//!   is `position_collateral − margin_required(notional − amount,
+//!   initial_margin_bps)`; for a full liquidation it is the whole
+//!   `position_collateral` (a closed position holds zero collateral).
 //!
 //! All arithmetic is signed `i128` with `checked_*`/`saturating_*` — no panicking
 //! math (AGENTS.md).
@@ -85,41 +89,61 @@ pub fn liquidation_penalty(collateral: u64, penalty_bps: u16) -> Option<u64> {
     u64::try_from(exact / 10_000).ok()
 }
 
-/// Apply a liquidation of `amount` notional to a position (R-L3).
+/// Apply a liquidation of `amount` notional to a position (R-L3), preserving the
+/// documented `Position.collateral == margin_required(notional,
+/// initial_margin_bps)` invariant (see `state.rs`) — the SAME invariant that
+/// `apply_open_fills` / `apply_close_fills` maintain on the open/close paths.
 ///
 /// * `amount == 0` or `amount > notional` → [`LiquidateError::InvalidAmount`].
-/// * The liquidated notional releases its maintenance-margin backing
-///   `release = maintenance_margin(amount, maintenance_bps)`.
-/// * The liquidator reward is `liquidation_penalty(release, penalty_bps)`, paid
-///   out of the position's collateral **after** the released backing — but capped
-///   so the position holder's remaining collateral never goes negative
-///   (`reward ≤ C − release`, clamped).
-/// * The position holder keeps `remaining = C − release − reward` (at least `0`).
+/// * The position is backed at the **initial** margin ratio, so liquidating
+///   `amount` reduces the surviving exposure to `notional - amount` and the
+///   position keeps `remaining = margin_required(notional - amount,
+///   initial_margin_bps)` (clamped to the collateral actually held). For a full
+///   liquidation (`amount == notional`) the surviving notional is `0` and
+///   `margin_required(0, _) == 0` — a closed (zero-notional) position holds
+///   **zero** collateral, all of it released.
+/// * The collateral freed by the liquidation is `released = position_collateral -
+///   remaining`; the liquidator reward is the penalty share of that freed
+///   collateral (`liquidation_penalty(released, penalty_bps)`, which never
+///   exceeds `released`, so `remaining + reward ≤ position_collateral` — no value
+///   is created and the surviving collateral never goes negative).
 ///
 /// Returns the **position's** remaining collateral and the liquidator's reward.
 /// The caller derives the remaining notional (`notional − amount`) and credits
 /// the reward to the liquidator's collateral ledger. Both return values are
 /// always non-negative (never an insolvent negative remaining collateral).
+///
+/// `maintenance_bps` is retained for signature/API stability; the collateral
+/// release is computed at the initial-margin ratio (the documented invariant),
+/// not at the maintenance ratio — `maintenance_bps` remains the **health**
+/// threshold (`liquidatable`), not a release parameter.
 pub fn apply_liquidation(
     position_collateral: u64,
     notional: u64,
     amount: u64,
-    maintenance_bps: u16,
+    initial_margin_bps: u16,
+    _maintenance_bps: u16,
     penalty_bps: u16,
 ) -> std::result::Result<(u64, u64), LiquidateError> {
     if amount == 0 || amount > notional {
         return Err(LiquidateError::InvalidAmount);
     }
-    // `release <= position_collateral` because `maintenance_bps <= initial_bps`
-    // and `amount <= notional` (margin is monotonic in both), so `saturating_sub`
-    // never clamps a legitimate release below its true value.
-    let release = maintenance_margin(amount, maintenance_bps).ok_or(LiquidateError::Overflow)?;
-    let raw_reward = liquidation_penalty(release, penalty_bps).ok_or(LiquidateError::Overflow)?;
-    // Cap the reward so the holder never ends up with a negative remaining
-    // collateral (the vault is never left insolvent by a liquidation).
-    let available = position_collateral.saturating_sub(release);
-    let reward = raw_reward.min(available);
-    let remaining = available.saturating_sub(reward);
+    // Surviving exposure-backed collateral at the INITIAL margin ratio — the
+    // documented invariant. `surviving_notional <= notional` and
+    // `margin_required` is monotonic non-decreasing in notional, so under the
+    // invariant `remaining <= position_collateral`. Clamp to the collateral
+    // actually held for non-invariant (arbitrary) callers, so the surviving
+    // collateral never exceeds what the position held.
+    let surviving_notional = notional - amount; // amount <= notional (checked above)
+    let remaining = margin_required(surviving_notional, initial_margin_bps)
+        .ok_or(LiquidateError::Overflow)?
+        .min(position_collateral);
+    // Collateral actually freed by the liquidation.
+    let released = position_collateral.saturating_sub(remaining);
+    // Liquidator reward = penalty share of the freed collateral.
+    // `liquidation_penalty` guarantees `reward <= released`, so
+    // `remaining + reward <= remaining + released == position_collateral`.
+    let reward = liquidation_penalty(released, penalty_bps).ok_or(LiquidateError::Overflow)?;
     Ok((remaining, reward))
 }
 
@@ -231,42 +255,62 @@ mod tests {
         #[test]
         fn full_liquidation_zeroes_exposure(
             notional in 1u64..1_000_000_000_000,
+            initial_margin_bps in 1u16..=10_000,
             maintenance_bps in 1u16..=10_000,
             penalty_bps in 1u16..=10_000,
         ) {
-            // The position's collateral for the full notional at maintenance bps
-            // (bottom-of-band; a real position at initial margin is >= this).
-            let position_collateral = maintenance_margin(notional, maintenance_bps).unwrap();
-            let (remaining, reward) =
-                apply_liquidation(position_collateral, notional, notional, maintenance_bps, penalty_bps).unwrap();
-            // Liquidating the whole notional releases its maintenance backing; the
-            // reward is a carve-out of whatever collateral remains after release.
-            let release = maintenance_margin(notional, maintenance_bps).unwrap();
-            let available = position_collateral.saturating_sub(release);
-            prop_assert_eq!(reward, liquidation_penalty(release, penalty_bps).unwrap().min(available));
-            prop_assert_eq!(remaining, available.saturating_sub(reward));
+            // Only a valid (maintenance < initial) market is reachable on-chain.
+            prop_assume!(maintenance_bps < initial_margin_bps);
+            // A real position is backed at the INITIAL margin ratio (state.rs).
+            let position_collateral = margin_required(notional, initial_margin_bps).unwrap();
+            let (remaining, reward) = apply_liquidation(
+                position_collateral,
+                notional,
+                notional,
+                initial_margin_bps,
+                maintenance_bps,
+                penalty_bps,
+            )
+            .unwrap();
+            // Full liquidation closes the position (notional -> 0): its surviving
+            // collateral must be margin_required(0, _) == 0 (all collateral released).
+            prop_assert_eq!(remaining, margin_required(0, initial_margin_bps).unwrap());
+            prop_assert_eq!(remaining, 0);
+            let released = position_collateral - remaining;
+            prop_assert_eq!(reward, liquidation_penalty(released, penalty_bps).unwrap());
             prop_assert!(remaining >= 0, "remaining collateral never negative");
             prop_assert!(reward >= 0, "reward never negative");
             prop_assert!(remaining + reward <= position_collateral, "no value created");
-            // Remaining notional (caller-derived) is zero for a full liquidation.
-            prop_assert_eq!(notional - notional, 0);
         }
 
         #[test]
         fn partial_liquidation_consumes_only_the_backed_portion(
             notional in 2u64..1_000_000_000_000,
             amount in 1u64..=1_000_000_000_000u64,
+            initial_margin_bps in 1u16..=10_000,
             maintenance_bps in 1u16..=10_000,
             penalty_bps in 1u16..=10_000,
         ) {
+            prop_assume!(maintenance_bps < initial_margin_bps);
             let amount = if amount > notional { notional } else { amount };
-            let position_collateral = maintenance_margin(notional, maintenance_bps).unwrap();
-            let (remaining, reward) =
-                apply_liquidation(position_collateral, notional, amount, maintenance_bps, penalty_bps).unwrap();
-            let release = maintenance_margin(amount, maintenance_bps).unwrap();
-            let available = position_collateral.saturating_sub(release);
-            prop_assert_eq!(reward, liquidation_penalty(release, penalty_bps).unwrap().min(available));
-            prop_assert_eq!(remaining, available.saturating_sub(reward));
+            let position_collateral = margin_required(notional, initial_margin_bps).unwrap();
+            let (remaining, reward) = apply_liquidation(
+                position_collateral,
+                notional,
+                amount,
+                initial_margin_bps,
+                maintenance_bps,
+                penalty_bps,
+            )
+            .unwrap();
+            // The surviving collateral equals margin_required(notional - amount,
+            // initial_margin_bps) — the documented invariant (like apply_close_fills).
+            prop_assert_eq!(
+                remaining,
+                margin_required(notional - amount, initial_margin_bps).unwrap()
+            );
+            let released = position_collateral - remaining;
+            prop_assert_eq!(reward, liquidation_penalty(released, penalty_bps).unwrap());
             prop_assert!(remaining >= 0, "remaining collateral never negative");
             prop_assert!(remaining + reward <= position_collateral, "no value created");
         }
@@ -274,17 +318,18 @@ mod tests {
         #[test]
         fn invalid_amounts_rejected(
             notional in 1u64..1_000_000_000_000,
+            initial_margin_bps in 1u16..=10_000,
             maintenance_bps in 1u16..=10_000,
             penalty_bps in 1u16..=10_000,
         ) {
-            let position_collateral = maintenance_margin(notional, maintenance_bps).unwrap();
+            let position_collateral = margin_required(notional, initial_margin_bps).unwrap();
             prop_assert_eq!(
-                apply_liquidation(position_collateral, notional, 0, maintenance_bps, penalty_bps),
+                apply_liquidation(position_collateral, notional, 0, initial_margin_bps, maintenance_bps, penalty_bps),
                 Err(LiquidateError::InvalidAmount)
             );
             let too_big = notional.saturating_add(1);
             prop_assert_eq!(
-                apply_liquidation(position_collateral, notional, too_big, maintenance_bps, penalty_bps),
+                apply_liquidation(position_collateral, notional, too_big, initial_margin_bps, maintenance_bps, penalty_bps),
                 Err(LiquidateError::InvalidAmount)
             );
         }
@@ -303,16 +348,25 @@ mod tests {
     #[test]
     fn liquidation_leaves_no_insolvency() {
         // A full liquidation must never leave a negative remaining collateral,
-        // even at the margin-edge where backing + reward == position collateral.
+        // and must not create value out of thin air.
         let notional = 1_000_000u64;
-        let bps = 1_000u16; // 10% maintenance
-        let position_collateral = maintenance_margin(notional, bps).unwrap();
+        let initial_bps = 2_000u16; // 20% initial margin
+        let maintenance_bps = 1_000u16; // 10% maintenance (health threshold)
+        let position_collateral = margin_required(notional, initial_bps).unwrap();
         for penalty_bps in [1u16, 500, 10_000] {
-            let (remaining, reward) =
-                apply_liquidation(position_collateral, notional, notional, bps, penalty_bps)
-                    .unwrap();
+            let (remaining, reward) = apply_liquidation(
+                position_collateral,
+                notional,
+                notional,
+                initial_bps,
+                maintenance_bps,
+                penalty_bps,
+            )
+            .unwrap();
             assert!(remaining >= 0);
             assert!(reward >= 0);
+            // Full liquidation closes the position: surviving collateral == 0.
+            assert_eq!(remaining, 0);
             // Holder total (remaining) + liquidator reward <= position collateral.
             assert!(remaining + reward <= position_collateral);
         }

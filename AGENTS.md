@@ -59,6 +59,15 @@
   clamp(funding_k·premium/APY_SCALE, ±max_funding)`; `premium > 0 ⇒ **longs pay shorts**`
   (long flow `−1`, short flow `+1`, exact opposites). Epoch = `slot / funding_epoch_slots`;
   settlement is idempotent (same epoch ⇒ no-op).
+- **Position collateral invariant** = `position.collateral ==
+  margin_required(notional, initial_margin_bps)`, maintained on open
+  (`apply_open_fills`), close (`apply_close_fills`), **AND** liquidate
+  (`apply_liquidation` re-derives the surviving collateral at the initial margin
+  ratio). `maintenance_margin_bps` is the health threshold (`liquidatable`, strict
+  `<`), never the release ratio. Any liquidation change must keep the surviving
+  collateral equal to `margin_required(notional − amount, initial_margin_bps)` and
+  never create value (`remaining + reward ≤ position_collateral`). A fully
+  liquidated (`notional == 0`) position holds **zero** collateral.
 - **Canonical signed message** = `sha256("fructus::update_apy" ‖ oracle ‖ apy_le ‖ version_le)`.
   Rust `update_message` and TS `updateMessage` must stay byte-identical; any change
   updates the cross-language vector test on both sides.

@@ -5,8 +5,10 @@ Unrealized PnL is **index-based** (trustless `positions::pnl` vs the live pool) 
 the health metric of R-L2 — while the order-book **TWAP** is the reserved
 liquidation reference price plus the window/staleness guard (R-L1/R-L4). A
 position is liquidatable iff its equity is **strictly** below the maintenance
-margin; the permissionless `liquidate` then releases the liquidated notional's
-maintenance backing and pays a penalty to the liquidator out of the position's
+margin; the permissionless `liquidate` then re-derives the position's surviving
+collateral at the **initial** margin ratio (`collateral ==
+margin_required(notional, initial_margin_bps)`, the documented invariant) and pays
+a penalty (of the released collateral) to the liquidator out of the position's
 collateral (R-L3). The math is a pure module (`crate::liquidation`) locked by
 `proptest`; the `liquidate` adapter in `lib.rs` applies it to the on-chain
 `Position` / `UserCollateral` accounts.
@@ -26,7 +28,7 @@ Units: `notional`/`collateral` are USDC microunits; `unrealized_pnl` is signed
 | `maintenance_margin` | `(notional: u64, maintenance_bps: u16) -> Option<u64>` | `margin_required(notional, bps)`, **ceiling** (R-L2) |
 | `liquidatable` | `(collateral: u64, unrealized_pnl: i128, notional: u64, maintenance_bps: u16) -> Option<bool>` | `equity < maintenance_margin`, **strict** `<` — equality is healthy (R-L2) |
 | `liquidation_penalty` | `(collateral: u64, penalty_bps: u16) -> Option<u64>` | `collateral·penalty_bps/10_000`, **ceiling** (R-L3) |
-| `apply_liquidation` | `(position_collateral: u64, notional: u64, amount: u64, maintenance_bps: u16, penalty_bps: u16) -> Result<(u64, u64), LiquidateError>` | Release the liquidated notional's backing + pay the penalty; returns `(position_remaining_collateral, liquidator_reward)` (R-L3) |
+| `apply_liquidation` | `(position_collateral: u64, notional: u64, amount: u64, initial_margin_bps: u16, maintenance_bps: u16, penalty_bps: u16) -> Result<(u64, u64), LiquidateError>` | Re-derive the surviving collateral at the **initial** margin ratio + pay the penalty; returns `(position_remaining_collateral, liquidator_reward)` (R-L3) |
 
 `LiquidateError::{InvalidAmount, Overflow}` maps to `FructusError::{InvalidSize,
 ArithmeticOverflow}`.
@@ -72,33 +74,40 @@ note below.
 3. Read the live pool rate, compute the index-based unrealized PnL over the
    **whole** `position.notional`, and check `liquidatable(...)` (strict `<`);
    otherwise `NotLiquidatable`.
-4. `apply_liquidation(position.collateral, notional, amount, maintenance_bps,
-   LIQUIDATION_PENALTY_BPS)`. This releases the maintenance backing of `amount`
-   and computes a penalty reward (capped so the victim's remaining collateral
-   never goes negative — the vault is never left insolvent).
+4. `apply_liquidation(position.collateral, notional, amount, initial_margin_bps,
+   maintenance_bps, LIQUIDATION_PENALTY_BPS)`. This re-derives the surviving
+   collateral at the **initial** margin ratio (the documented `state.rs`
+   invariant: `position.collateral == margin_required(notional,
+   initial_margin_bps)`) and computes a penalty reward on the collateral freed
+   by the liquidation (capped so no value is created — the vault is never left
+   insolvent).
 5. Reduce `position.notional -= amount` (full `amount == notional` zeroes the
-   exposure), set `position.collateral = remaining`, release the consumed
-   collateral from the victim's `UserCollateral.reserved`, and credit the
-   liquidator's `UserCollateral.deposited` (`liquidator_collateral`) with the
-   reward (ledger-only margin — no token movement).
+   exposure), set `position.collateral = remaining` (`== margin_required(notional
+   − amount, initial_margin_bps)`), release the consumed collateral from the
+   victim's `UserCollateral.reserved`, and credit the liquidator's
+   `UserCollateral.deposited` (`liquidator_collateral`) with the reward
+   (ledger-only margin — no token movement).
 
 ## Partial vs full (R-L3)
 
 ```
-release  = maintenance_margin(amount, maintenance_bps)      (the backing freed)
-reward   = liquidation_penalty(release, penalty_bps)        (min(.., available))
-available= position_collateral − release
-remaining= available − reward                               (the victim keeps this)
+remaining= margin_required(notional − amount, initial_margin_bps)   (invariant)
+released = position_collateral − remaining                          (the backing freed)
+reward   = liquidation_penalty(released, penalty_bps)               (≤ released)
 ```
 
-- **Partial** (`amount < notional`): only the liquidated portion's backing is
-  released; the victim keeps `remaining` collateral and the caller keeps the
-  `notional − amount` remaining exposure.
-- **Full** (`amount == notional`): the whole exposure closes, `position.notional
-  == 0`, and the reward is a carve-out of the surviving collateral.
+- **Partial** (`amount < notional`): the surviving collateral is re-derived at
+  the initial margin ratio of the surviving exposure; the victim keeps
+  `remaining` and the caller keeps the `notional − amount` remaining exposure.
+- **Full** (`amount == notional`): the surviving notional is `0`, so
+  `remaining == margin_required(0, _) == 0` — a closed (zero-notional) position
+  holds **zero** collateral and the whole backing is released.
 - **No value created**: `remaining + reward ≤ position_collateral` always; a
   full liquidation never leaves negative remaining collateral.
 - `amount == 0` or `amount > notional ⇒ InvalidAmount`.
+- `maintenance_bps` is the **health** threshold (`liquidatable`), not a release
+  parameter; the surviving collateral is always backed at the initial margin
+  ratio (exactly as `apply_open_fills` / `apply_close_fills`).
 
 ## Dependencies
 
