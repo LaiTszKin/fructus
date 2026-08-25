@@ -9,7 +9,25 @@ skip-lint = false
 [programs.localnet]
 fructus = "8ZLiJ12eBiam4UP2HRp3M75CQAcc8GuUBz44zeHt6mjH"
 
+# Devnet deployment (R-D1a).
+#
+# The id below is a VALID base58 pubkey PLACEHOLDER so `anchor build` keeps
+# working — it is NOT the real devnet program. POPULATE after a real devnet
+# deploy, and make it equal the `declare_id!` in programs/fructus/src/lib.rs
+# (Anchor derives every PerpMarket / OrderBook / Position PDA from the program
+# id, so deploying to a different address than `declare_id!` breaks all PDA
+# derivation). `scripts/deploy.sh` rejects this placeholder and tells you to
+# set PROGRAM_ID.
+[programs.devnet]
+fructus = "J2xccRtuG43drESLYznHhLhQkLTdfepcKYbiQ9BsJVaf"
+
 [provider]
+# Localnet is the ACTIVE DEFAULT profile and is left unchanged.
+#
+# Anchor reads a single `[provider]` table, so the devnet provider is selected
+# per-command rather than as a second table: `--provider.cluster devnet
+# --provider.wallet <path>`. `scripts/deploy.sh` passes both from env
+# (DEVNET_CLUSTER, DEVNET_WALLET), keeping the localnet default intact.
 cluster = "localnet"
 wallet = "~/.config/solana/id.json"
 

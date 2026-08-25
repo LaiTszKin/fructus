@@ -1,0 +1,22 @@
+{
+  "name": "fructus-scripts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Fructus devnet deploy + end-to-end lifecycle walk (issue #9). Run from this scripts/ directory.",
+  "scripts": {
+    "e2e": "tsx e2e.mts",
+    "e2e:network": "RUN_E2E=1 tsx e2e.mts",
+    "deploy": "bash deploy.sh",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.15.0",
+    "typescript": "^5.5.0"
+  }
+}
