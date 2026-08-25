@@ -69,8 +69,8 @@ export const YieldOracleLayout = {
   bump: 96,
 } as const;
 
-// --- OrderBook (`#[account(zero_copy)]`, `#[repr(C)]`), payload LEN = 23_128 -
-export const ORDER_BOOK_LEN = 23_128;
+// --- OrderBook (`#[account(zero_copy)]`, `#[repr(C)]`), payload LEN = 6_232 --
+export const ORDER_BOOK_LEN = 6_232;
 export const OrderBookLayout = {
   nextSeq: 0,
   bestBid: 8,
@@ -83,9 +83,9 @@ export const OrderBookLayout = {
   // header `_pad[7]` fills bytes 81..88
   headerLen: 88,
   bids: 88,
-  asks: 88 + 64 * 64, // 4_184
-  events: 88 + 64 * 64 + 64 * 64, // 8_280
-  observations: 88 + 64 * 64 + 64 * 64 + 128 * 112, // 22_616
+  asks: 88 + 16 * 64, // 1_112
+  events: 88 + 16 * 64 + 16 * 64, // 2_136
+  observations: 88 + 16 * 64 + 16 * 64 + 32 * 112, // 5_720
 } as const;
 
 // --- Order (zero-copy, `#[repr(C)]`), LEN = 64 --------------------------------

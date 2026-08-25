@@ -454,7 +454,7 @@ mod tests {
         assert_eq!(OutEvent::LEN, 112);
         assert_eq!(Observation::LEN, 32);
         assert_eq!(UserCollateral::LEN, 17);
-        assert_eq!(OrderBook::LEN, 23_128);
+        assert_eq!(OrderBook::LEN, 6_232);
     }
 
     /// `Position` is a borsh `#[account]`; its `LEN` must equal the packed borsh

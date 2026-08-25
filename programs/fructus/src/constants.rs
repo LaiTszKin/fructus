@@ -64,7 +64,13 @@ pub const USER_COLLATERAL_SEED: &[u8] = b"user_collateral";
 ///
 /// Drives the inline `[Order; MAX_ORDERS_PER_SIDE]` arrays in `OrderBook`, so it
 /// is a `usize` (used directly as an array length and compared with `Vec::len`).
-pub const MAX_ORDERS_PER_SIDE: usize = 64;
+///
+/// Sized so the whole zero-copy `OrderBook` account stays under the runtime's
+/// per-transaction account-growth cap (`MAX_PERMITTED_DATA_INCREASE = 10 KiB`):
+/// `8 + OrderBook::LEN = 6_240` bytes with `16` orders/side + `32` events. Any
+/// larger and the on-chain `initialize_order_book` inner-CPI allocation fails
+/// with `InvalidRealloc` (see docs/modules/order-book.md).
+pub const MAX_ORDERS_PER_SIDE: usize = 16;
 
 /// Maximum number of distinct price levels per side (FR-2(a) / REQ-4).
 ///
@@ -75,7 +81,10 @@ pub const MAX_ORDERS_PER_SIDE: usize = 64;
 pub const MAX_PRICE_LEVELS_PER_SIDE: usize = MAX_ORDERS_PER_SIDE;
 
 /// Length of the bounded on-chain event-queue ring (fills/cancels/residuals).
-pub const EVENT_QUEUE_LEN: usize = 128;
+///
+/// Sized with [`MAX_ORDERS_PER_SIDE`] so the `OrderBook` account fits the 10 KiB
+/// per-transaction data-growth cap (see the constant's doc comment).
+pub const EVENT_QUEUE_LEN: usize = 32;
 
 /// Number of entries in the TWAP observation ring.
 ///
@@ -92,7 +101,7 @@ pub const TWAP_OBSERVATIONS: usize = 16;
 /// (design D6/D7). Chosen `8`: each step rewrites one array slot plus
 /// `best_bid`/`best_ask` and appends an event + a TWAP observation, so 8 fills
 /// stay comfortably inside the default 200k CU budget while a worst-case full
-/// book (64 makers) is drained in at most 8 cranks.
+/// book (16 makers) is drained in at most 2 cranks.
 pub const MAX_MATCH_STEPS: u64 = 8;
 
 /// Decimals of the USDC collateral mint (validated at vault initialization).

@@ -12,6 +12,12 @@
 - `cd sdk && npm test` — trader SDK suite (52 tests; funding/PnL/layout vector)
 - `cd cli && npm test` — trader CLI suite (16 smoke + R-1 regression)
 - `cd scripts && npm run e2e` — offline devnet lifecyle dry-run (`RUN_E2E=1` = live)
+- `cd scripts && npm run setup` — self-contained devnet bootstrap: wallets +
+  airdrop SOL + self-owned collateral mint + own SPL stake pool (`INDEX_SOURCE`),
+  then validate + print the e2e env (`--preflight` = check only)
+- `cd integration && npm test` — SDK/CLI -> protocol integration PBT: drives the
+  real program (solana-test-validator + SDK builders) and asserts on-chain
+  invariants (`--test-force-exit`)
 - `cd trident-tests && cargo run --bin fuzz_0` — on-chain stateful fuzz smoke run
 - `cargo fmt --check` — format check
 
@@ -67,6 +73,14 @@
   (no `.exit()`); sub-structs use `#[zero_copy]` with `#[repr(C)]`, reordered fields +
   explicit `_pad` (bytemuck `Pod` forbids implicit padding); `bool` → `u8`, `u128` →
   `[u8; 16]`.
+- **`OrderBook` must stay under the 10 KiB per-tx data-growth cap**
+  (`MAX_PERMITTED_DATA_INCREASE`) — `initialize_order_book`'s inner-CPI allocation
+  fails with `InvalidRealloc` for a larger account (breaks on-chain init; the bank
+  CPI tests seed the account manually to avoid it). Current layout:
+  `MAX_ORDERS_PER_SIDE = 16`, `EVENT_QUEUE_LEN = 32`, `TWAP_OBSERVATIONS = 16` →
+  `OrderBook::LEN = 6_232` (account = `8 + LEN = 6_240` B). Any capacity/size change
+  must keep `8 + OrderBook::LEN ≤ 10_240` and be mirrored in `sdk/src/constants.ts` +
+  `account/{layout,decode}.ts` + `docs/{data-models,modules/order-book}.md`.
 - **Devnet deploy** — `scripts/deploy.sh` builds + deploys and records the program id /
   `PerpMarket` PDA; align `[programs.devnet]` with `declare_id!` (PDA derivation depends
   on the program id). A real deploy needs the program keypair + a funded devnet wallet.

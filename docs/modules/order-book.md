@@ -62,9 +62,9 @@ One PDA per market, seed `[ORDER_BOOK_SEED, market.key()]` with
 | `event_read_cursor` | u64 | index of the next event to drain |
 | `event_write_cursor` | u64 | index of the next event slot to write |
 | `twap_cursor` | u64 | index of the next TWAP observation slot |
-| `bids` | `[Order; 64]` | resting bids (side implied) |
-| `asks` | `[Order; 64]` | resting asks (side implied) |
-| `events` | `[OutEvent; 128]` | bounded event-queue ring |
+| `bids` | `[Order; 16]` | resting bids (side implied) |
+| `asks` | `[Order; 16]` | resting asks (side implied) |
+| `events` | `[OutEvent; 32]` | bounded event-queue ring |
 | `observations` | `[Observation; 16]` | TWAP ring |
 
 Each `Order` slot is `{ owner: Pubkey, price: u64, size: u64, seq: u64,
@@ -75,13 +75,16 @@ distinguishes an empty slot from a live order, so `price == 0` stays a
 **remaining** (unfilled) size. Full layouts and payload offsets are in
 [data-models.md](../data-models.md).
 
-Fixed capacities: `MAX_ORDERS_PER_SIDE = 64` (each resting order may occupy its
+Fixed capacities: `MAX_ORDERS_PER_SIDE = 16` (each resting order may occupy its
 own price level, since the book uses flat per-side arrays with a price-time
-comparator), `EVENT_QUEUE_LEN = 128`, `TWAP_OBSERVATIONS = 16`. Total payload is
-`23_128` bytes (`OrderBook::LEN`) — up from `21_080` because each `OutEvent`
-grew 96 → 112 bytes (the fill-time index snapshot + `settled` flag, issue #5);
-the account is zero-copy (`#[account(zero_copy)]`) because it exceeds the SBF
-4 KiB stack limit for borsh deserialization — handlers access it in place via
+comparator), `EVENT_QUEUE_LEN = 32`, `TWAP_OBSERVATIONS = 16`. Total payload is
+`6_232` bytes (`OrderBook::LEN`), so the single account is `8 + LEN = 6_240`
+bytes on-chain. The capacities are sized so the account fits the SBF runtime's
+per-transaction account-growth cap (`MAX_PERMITTED_DATA_INCREASE = 10 KiB`): a
+larger book cannot be allocated by `initialize_order_book`'s inner-CPI
+`create_account` in one transaction and fails with `InvalidRealloc`. The account
+is zero-copy (`#[account(zero_copy)]`) because it exceeds the SBF 4 KiB stack
+limit for borsh deserialization — handlers access it in place via
 `AccountLoader::load_mut()`.
 
 ## Matching engine
@@ -98,7 +101,7 @@ the account is zero-copy (`#[account(zero_copy)]`) because it exceeds the SBF
    next-best maker fills instead.
 5. **Bounded batch** — a limit taker stops after `MAX_MATCH_STEPS = 8` fills,
    leaving any still-crossable remainder as a `Residual` for the crank (state is
-   never left corrupt). A market taker matches to exhaustion (bounded by the 64
+   never left corrupt). A market taker matches to exhaustion (bounded by the 16
    makers per side) and is IOC, so it never leaves a residual.
 
 `place_limit_order` posts a non-crossing order; a crossing order is matched
@@ -112,7 +115,7 @@ side is at capacity is cancelled rather than reverting the whole transaction.
 
 ## Event queue & crank
 
-Every book mutation appends an `OutEvent` to the bounded 128-entry ring:
+Every book mutation appends an `OutEvent` to the bounded 32-entry ring:
 
 | `kind` | Value | Emitted when |
 | --- | --- | --- |
@@ -190,8 +193,8 @@ holds no privileged state, and cannot mint or move value.
 - **Market orders are IOC** — an unfilled remainder is silently cancelled, never
   posted, and never over-fills.
 - **Compute bound is a fixed step budget** (`MAX_MATCH_STEPS = 8`), not runtime CU
-  introspection — deterministic and testable; a worst-case full book (64 makers)
-  drains in at most 8 cranks.
+  introspection — deterministic and testable; a worst-case full book (16 makers)
+  drains in at most 2 cranks.
 - **Event `seq` uses the write cursor** — monotonic across wraps; the read cursor
   advances only in `crank`.
 - **Fills are never silently dropped** — a `Fill` that cannot be appended to a

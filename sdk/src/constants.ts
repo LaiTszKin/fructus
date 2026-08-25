@@ -20,11 +20,15 @@ export const LIQUIDATION_PENALTY_BPS = 500;
 /** Liquidation TWAP reference window, in slots (reuses the observation ring). */
 export const LIQUIDATION_TWAP_WINDOW = 16n;
 
-/** Number of resting orders per side of the on-chain order book. */
-export const MAX_ORDERS_PER_SIDE = 64;
+/** Number of resting orders per side of the on-chain order book.
+ *
+ * Sized so the zero-copy `OrderBook` account fits the SBF runtime's
+ * per-transaction data-growth cap (`MAX_PERMITTED_DATA_INCREASE = 10 KiB`):
+ * `8 + OrderBook::LEN = 6_240` bytes with `16` orders/side + `32` events. */
+export const MAX_ORDERS_PER_SIDE = 16;
 
 /** Length of the bounded on-chain event-queue ring. */
-export const EVENT_QUEUE_LEN = 128;
+export const EVENT_QUEUE_LEN = 32;
 
 /** Number of entries in the TWAP observation ring. */
 export const TWAP_OBSERVATIONS = 16;

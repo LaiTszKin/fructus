@@ -41,7 +41,7 @@ constraints + explicit checks in the handler.
 | — | `InvalidMaxFunding` | `max_funding > 1_000_000` on `initialize_market` |
 | — | `InvalidInitialMargin` | `initial_margin_bps` outside `(0, 10_000]` on `initialize_market` |
 | — | `InvalidMaintenanceMargin` | `maintenance_margin_bps` not in `(0, initial_margin_bps]` on `initialize_market` |
-| — | `BookFull` | limit order on a side already at `MAX_ORDERS_PER_SIDE` (64); or a deferred `Residual` that cannot be queued because the event ring is full (backpressure); or a `Fill` that cannot be appended to a full event ring on any fill-producing instruction (fills are never silently dropped — D10) |
+| — | `BookFull` | limit order on a side already at `MAX_ORDERS_PER_SIDE` (16); or a deferred `Residual` that cannot be queued because the event ring is full (backpressure); or a `Fill` that cannot be appended to a full event ring on any fill-producing instruction (fills are never silently dropped — D10) |
 | — | `BookAlreadyInitialized` | second `initialize_order_book` (the book account already holds data) |
 | — | `BookNotInitialized` | book op (`place_limit_order`/`place_market_order`/`cancel_order`/`crank`) before `initialize_order_book` |
 | — | `InvalidPrice` | zero `price`, or a crossing limit that cannot rest |

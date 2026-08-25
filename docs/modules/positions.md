@@ -201,7 +201,7 @@ deposited' = apply_pnl(deposited, pnl)                                          
 graph LR
     T[taker open/close] -->|inline fills| TP[Taker Position]
     T -->|Fill event + fill-time snapshot, settled=0| R[(event ring)]
-    S[settle_fill seq] -->|re-reads Fill at seq % 128| R
+    S[settle_fill seq] -->|re-reads Fill at seq % 32| R
     S -->|open-intent, event-carried snapshot| MP[Maker Position]
     S -->|margin reserved| UC[UserCollateral.reserved]
     S -->|settled = 1| R
@@ -232,8 +232,8 @@ graph LR
 An executed fill **always persists its event**: a full event ring fails the
 fill-producing transaction with `BookFull` (D10) — fills are never silently
 dropped, so a maker can always in principle settle. But an un-settled `Fill` is
-settle-able only while its ring slot survives: the 128-entry ring holds the 128
-**newest** events, so a maker has at most 128 newer events before its `Fill` is
+settle-able only while its ring slot survives: the 32-entry ring holds the 32
+**newest** events, so a maker has at most 32 newer events before its `Fill` is
 overwritten and `settle_fill` fails `EventNotFound`. Accepted MVP bound — the
 per-position settlement ledger is the over-engineering alternative. In
 practice: `settle_fill` promptly (or crank first to drain), and retry on

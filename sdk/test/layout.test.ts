@@ -33,7 +33,7 @@ import {
 // constants must be byte-identical with `programs/fructus/src/state.rs`, whose
 // unit tests pin `PerpMarket::LEN == 197`, `Position::LEN == 138`,
 // `UserCollateral::LEN == 17`, `Order::LEN == 64`, `OutEvent::LEN == 112`,
-// `Observation::LEN == 32`, `OrderBook::LEN == 23_128`. Field offsets follow the
+// `Observation::LEN == 32`, `OrderBook::LEN == 6_232`. Field offsets follow the
 // borsh / `#[repr(C)]` field order declared in `state.rs`.
 
 test("pinned payload sizes match the on-chain program", () => {
@@ -44,7 +44,7 @@ test("pinned payload sizes match the on-chain program", () => {
   assert.equal(ORDER_LEN, 64);
   assert.equal(OUT_EVENT_LEN, 112);
   assert.equal(OBSERVATION_LEN, 32);
-  assert.equal(ORDER_BOOK_LEN, 23_128);
+  assert.equal(ORDER_BOOK_LEN, 6_232);
 });
 
 test("PerpMarket offsets sum to LEN 197", () => {
@@ -139,11 +139,11 @@ test("Order / OutEvent / Observation and OrderBook array offsets", () => {
   // OrderBook header and array bases (bids -> asks -> events -> observations).
   assert.equal(OrderBookLayout.headerLen, 88);
   assert.equal(OrderBookLayout.bids, 88);
-  assert.equal(OrderBookLayout.asks, OrderBookLayout.bids + 64 * ORDER_LEN);
-  assert.equal(OrderBookLayout.events, OrderBookLayout.asks + 64 * ORDER_LEN);
+  assert.equal(OrderBookLayout.asks, OrderBookLayout.bids + 16 * ORDER_LEN);
+  assert.equal(OrderBookLayout.events, OrderBookLayout.asks + 16 * ORDER_LEN);
   assert.equal(
     OrderBookLayout.observations,
-    OrderBookLayout.events + 128 * OUT_EVENT_LEN,
+    OrderBookLayout.events + 32 * OUT_EVENT_LEN,
   );
   assert.equal(
     OrderBookLayout.observations + 16 * OBSERVATION_LEN,
@@ -277,10 +277,10 @@ test("decodeOrderBook reads the header and array elements", () => {
   assert.equal(ob.bids[0].active, 1);
   assert.equal(ob.bids[0].price, 1_050_000n);
   assert.equal(ob.bids[0].size, 1_000_000n);
-  assert.equal(ob.bids.length, 64);
+  assert.equal(ob.bids.length, 16);
   assert.equal(ob.bids[1].active, 0);
-  assert.equal(ob.asks.length, 64);
-  assert.equal(ob.events.length, 128);
+  assert.equal(ob.asks.length, 16);
+  assert.equal(ob.events.length, 32);
   assert.equal(ob.observations.length, 16);
   assert.equal(ob.observations[0].slot, 100n);
   assert.equal(ob.observations[0].cumulativeMid, 2_000_000n);

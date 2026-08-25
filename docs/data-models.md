@@ -67,13 +67,16 @@ padded so `bytemuck::Pod` has no implicit padding:
 | `market` | Pubkey | 48 | bound market (also in the PDA seed) |
 | `bump` | u8 | 80 | PDA bump |
 | `_pad` | `[u8; 7]` | 81 | explicit padding (8-align) |
-| `bids` | `[Order; 64]` | 88 | resting bids; 64 bytes each |
-| `asks` | `[Order; 64]` | 4184 | resting asks; 64 bytes each |
-| `events` | `[OutEvent; 128]` | 8280 | event-queue ring; 112 bytes each |
-| `observations` | `[Observation; 16]` | 22616 | TWAP ring; 32 bytes each |
+| `bids` | `[Order; 16]` | 88 | resting bids; 64 bytes each |
+| `asks` | `[Order; 16]` | 1112 | resting asks; 64 bytes each |
+| `events` | `[OutEvent; 32]` | 2136 | event-queue ring; 112 bytes each |
+| `observations` | `[Observation; 16]` | 5720 | TWAP ring; 32 bytes each |
 
-- `LEN = 23_128` (`size_of::<OrderBook>()`, excluding the 8-byte discriminator).
-- Fixed capacities: `MAX_ORDERS_PER_SIDE = 64`, `EVENT_QUEUE_LEN = 128`,
+- `LEN = 6_232` (`size_of::<OrderBook>()`, excluding the 8-byte discriminator;
+  the single account is `8 + LEN = 6_240` bytes). Sized so `initialize_order_book`
+  can allocate it in one transaction within the SBF `MAX_PERMITTED_DATA_INCREASE`
+  (10 KiB) cap.
+- Fixed capacities: `MAX_ORDERS_PER_SIDE = 16`, `EVENT_QUEUE_LEN = 32`,
   `TWAP_OBSERVATIONS = 16`. The book's side is implied by which array an `Order`
   sits in (`bids` vs `asks`), so no side byte is stored.
 - Zero-copy is required because the account exceeds the SBF 4 KiB stack limit for

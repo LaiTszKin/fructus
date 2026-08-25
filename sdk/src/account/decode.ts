@@ -217,7 +217,7 @@ export interface OrderBookState {
 }
 
 export function decodeOrderBook(data: Buffer | null): OrderBookState | null {
-  if (!data || !need(data, 23_128)) {
+  if (!data || !need(data, 6_232)) {
     return null;
   }
   const d = DISCRIMINATOR;
@@ -240,7 +240,7 @@ export function decodeOrderBook(data: Buffer | null): OrderBookState | null {
 
 function decodeOrders(data: Buffer, base: number): OrderState[] {
   const out: OrderState[] = [];
-  for (let i = 0; i < 64; i++) {
+  for (let i = 0; i < 16; i++) {
     const off = base + i * ORDER_LEN;
     out.push({
       owner: readPubkey(data, off + OrderLayout.owner),
@@ -255,7 +255,7 @@ function decodeOrders(data: Buffer, base: number): OrderState[] {
 
 function decodeEvents(data: Buffer, base: number): OutEventState[] {
   const out: OutEventState[] = [];
-  for (let i = 0; i < 128; i++) {
+  for (let i = 0; i < 32; i++) {
     const off = base + i * OUT_EVENT_LEN;
     out.push({
       seq: data.readBigUInt64LE(off + OutEventLayout.seq),
