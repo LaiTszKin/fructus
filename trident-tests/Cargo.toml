@@ -11,7 +11,12 @@ borsh = "1.5.3"
 
 [dependencies.trident-fuzz]
 version = "0.12.0"
+features = ["token"]
 
 [[bin]]
 name = "fuzz_0"
 path = "fuzz_0/test_fuzz.rs"
+
+[[bin]]
+name = "market"
+path = "market/test_fuzz.rs"
