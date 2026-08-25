@@ -173,6 +173,46 @@ pub fn validate_open_args(side: u8, size: u64) -> Result<()> {
     Ok(())
 }
 
+impl PositionSide {
+    /// Map the on-chain `position.side` byte (`0` = Long/Bid, `1` = Short/Ask)
+    /// back to the [`PositionSide`] enum, or `None` for an invalid encoding.
+    ///
+    /// The funding/settlement/liquidation handlers read `Position.side` (a `u8`,
+    /// matching the book-side encoding) and need the typed side to drive
+    /// [`pnl`] / [`crate::funding::SideFlow::from_position_side`]. Mirrors
+    /// `crate::side_from_u8`: only the SIDE_BID/SIDE_ASK encodings are accepted.
+    pub fn from_side_u8(side: u8) -> Option<Self> {
+        match side {
+            crate::SIDE_BID => Some(PositionSide::Long),
+            crate::SIDE_ASK => Some(PositionSide::Short),
+            _ => None,
+        }
+    }
+}
+
+/// Apply signed PnL to the deposited collateral (R-S2, R-S3).
+///
+/// * `pnl == 0` ⇒ `Some(deposited)` — settled but unchanged.
+/// * `pnl > 0` ⇒ `Some(deposited + pnl)` — a profit credits the vault ledger;
+///   returns `None` only on a positive overflow (checked add then `u64`
+///   conversion, so a gain that exceeds `u64` cannot silently wrap).
+/// * `pnl < 0` ⇒ `Some(deposited − |pnl|)` with the loss **clamped at `0`** so
+///   `deposited` never goes negative — the vault is never left insolvent by a
+///   settlement (R-S3). Clamping is total: a loss never returns `None`.
+///
+/// This is the pure ledger transition for `settle_close` (and the funding
+/// credit/debit via `settle_funding`): it never panics and never over-draws the
+/// collateral.
+pub fn apply_pnl(deposited: u64, pnl: i128) -> Option<u64> {
+    if pnl >= 0 {
+        let want = (deposited as u128).checked_add(pnl as u128)?;
+        u64::try_from(want).ok()
+    } else {
+        let debit = pnl.unsigned_abs().min(deposited as u128) as u64;
+        Some(deposited - debit)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +523,23 @@ mod tests {
         assert!(validate_open_args(1, 1).is_ok());
     }
 
+    // --- R-F5/R-S2/R-L2: `PositionSide::from_side_u8` (the handlers read the
+    // on-chain `position.side` byte and need the typed side to drive
+    // `funding::SideFlow` / `positions::pnl`) ---
+    //
+    // Mirrors `crate::side_from_u8`'s encoding: `0` = Long/Bid, `1` = Short/Ask,
+    // anything else is malformed and must map to `None` (the handler surfaces
+    // `InvalidAccountData` for a corrupt `position.side`).
+    #[test]
+    fn position_side_from_side_u8_encoding() {
+        assert_eq!(PositionSide::from_side_u8(0), Some(PositionSide::Long));
+        assert_eq!(PositionSide::from_side_u8(1), Some(PositionSide::Short));
+        // The on-chain `position.side` is a `u8`; every other byte is invalid.
+        for invalid in [2u8, 3, 127, 128, 255] {
+            assert_eq!(PositionSide::from_side_u8(invalid), None);
+        }
+    }
+
     // --- REQ-2 / REQ-8: equal components give the exact rate; normalize_sums
     // lands in the documented window ---
 
@@ -589,5 +646,132 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+// --- Issue #7: realized-yield settlement (R-S2, R-S3) -----------------------
+//
+// `close_position` stays lifecycle-only (D4) but records the closed notional in
+// `Position.closed_notional`; a permissionless `settle_close` realizes the
+// **signed** PnL (positions::pnl, trustless via the entry running sums) into the
+// user's `UserCollateral.deposited`. `apply_pnl` is the pure ledger transition:
+// positive PnL credits, negative PnL debits but is clamped so `deposited` never
+// goes below 0 (the vault is never insolvent — R-S3).
+
+#[cfg(test)]
+mod settlement_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn zero_pnl_keeps_deposited(deposited in 0u64..1_000_000_000_000) {
+            prop_assert_eq!(apply_pnl(deposited, 0), Some(deposited));
+        }
+
+        #[test]
+        fn positive_pnl_credits(deposited in 0u64..1_000_000_000_000, pnl in 0i128..1_000_000_000_000) {
+            let want = (deposited as i128) + pnl;
+            if want <= u64::MAX as i128 {
+                prop_assert_eq!(apply_pnl(deposited, pnl), Some(want as u64));
+            } else {
+                // Overflow returns None (checked add).
+                prop_assert_eq!(apply_pnl(deposited, pnl), None);
+            }
+        }
+
+        #[test]
+        fn negative_pnl_debits_but_never_negative(
+            deposited in 0u64..1_000_000_000_000,
+            loss in 1i128..1_000_000_000_000,
+        ) {
+            let out = apply_pnl(deposited, -loss).expect("apply_pnl is total on u64 x i128");
+            // Clamped at 0: the vault never goes negative (R-S3).
+            if (loss as u64) <= deposited {
+                prop_assert_eq!(out, deposited - (loss as u64));
+            } else {
+                prop_assert_eq!(out, 0, "loss clamped so deposited never negative");
+            }
+        }
+
+        #[test]
+        fn pnl_never_makes_deposited_negative(deposited in 0u64..1_000_000_000_000, pnl in -1_000_000_000_000i128..1_000_000_000_000) {
+            let out = apply_pnl(deposited, pnl).unwrap();
+            prop_assert!(out <= deposited || pnl > 0, "a loss never increases deposited");
+        }
+    }
+
+    // R-S2/R-S3 boundary + extreme inputs the property above's ranges cannot
+    // reach (the proptest ranges keep `want` far below `u64::MAX`, so the
+    // positive-overflow branch is dead-code coverage). Pin the exact overflow
+    // threshold and the clamp-at-zero extreme so the signed `apply_pnl` contract
+    // is fully locked (never panics, never None on a loss, None only on a
+    // positive overflow).
+    #[test]
+    fn apply_pnl_overflow_boundary_and_extremes() {
+        // Positive credit exactly to u64::MAX succeeds; one more overflows -> None.
+        assert_eq!(apply_pnl(0, u64::MAX as i128), Some(u64::MAX));
+        assert_eq!(apply_pnl(1, (u64::MAX as i128) - 1), Some(u64::MAX));
+        assert_eq!(
+            apply_pnl(1, u64::MAX as i128),
+            None,
+            "a positive credit past u64::MAX is None (checked), never a wrap"
+        );
+        // A negative loss clamps at 0 and is never None (R-S3 never insolvent).
+        assert_eq!(apply_pnl(0, -1), Some(0));
+        assert_eq!(apply_pnl(5, -5), Some(0));
+        assert_eq!(
+            apply_pnl(5, -6),
+            Some(0),
+            "loss clamps to the deposited floor"
+        );
+        assert_eq!(
+            apply_pnl(u64::MAX, i128::MIN),
+            Some(0),
+            "an extreme loss clamps deposited to 0"
+        );
+        assert_eq!(
+            apply_pnl(u64::MAX, 0),
+            Some(u64::MAX),
+            "zero pnl is a no-op"
+        );
+    }
+
+    // R-S2: settlement value is the index-based PnL (trustless), applied via
+    // apply_pnl — positive net to a winner, negative (clamped) to a loser.
+    #[test]
+    fn settle_close_long_profit_credits_collateral() {
+        // A long that profited on a rising index: entry (n0,d0) -> current higher.
+        let n0 = 100_000_000_000_000u64;
+        let d0 = 100_000_000_000_000u64;
+        let w = 1_000_000u64;
+        let notional = 5_000_000u64;
+        let (n_sum, d_sum) = accumulate_entry(0, 0, n0, d0, w).unwrap();
+        // Current rate higher (d1 = d0 / 2 => rate doubles).
+        let d1 = d0 / 2;
+        let pnl_long = pnl(n_sum, d_sum, n0, d1, notional, PositionSide::Long).unwrap();
+        assert!(pnl_long > 0, "long profits when the index rises");
+        let deposited = 100_000_000u64;
+        assert_eq!(
+            apply_pnl(deposited, pnl_long).unwrap(),
+            deposited + pnl_long as u64
+        );
+    }
+
+    #[test]
+    fn settle_close_long_loss_debits_but_clamped() {
+        let n0 = 100_000_000_000_000u64;
+        let d0 = 100_000_000_000_000u64;
+        let w = 1_000_000u64;
+        let notional = 5_000_000u64;
+        let (n_sum, d_sum) = accumulate_entry(0, 0, n0, d0, w).unwrap();
+        // Current rate LOWER (n1 = n0 / 2 => rate halves) -> long loses.
+        let n1 = n0 / 2;
+        let pnl_long = pnl(n_sum, d_sum, n1, d0, notional, PositionSide::Long).unwrap();
+        assert!(pnl_long < 0, "long loses when the index falls");
+        let deposited = 1_000_000u64;
+        let out = apply_pnl(deposited, pnl_long).unwrap();
+        // Clamped so deposited never goes negative.
+        assert!(out <= deposited);
     }
 }

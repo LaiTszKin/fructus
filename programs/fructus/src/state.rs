@@ -63,6 +63,20 @@ pub struct PerpMarket {
     pub authority: Pubkey,
     /// Collateral-custody vault PDA (derived from `VAULT_SEED`, not created at init).
     pub vault: Pubkey,
+    /// Last funding epoch this market was settled for — the epoch index of the
+    /// most recent `settle_funding` (R-F4). `0` before the first settlement.
+    pub funding_epoch: u64,
+    /// Stake-pool exchange-rate snapshot (numerator) at the last settlement: the
+    /// funding epoch baseline (R-F4). Combined with `index_d` it forms the
+    /// `ExchangeRate` the next `settle_funding` realizes yield against.
+    pub index_n: u64,
+    /// Stake-pool exchange-rate snapshot (denominator) at the last settlement
+    /// (R-F4). `index_n`/`index_d == 0` marks an un-initialized baseline.
+    pub index_d: u64,
+    /// Cumulative funding realized on this market, signed (`i128`): the running
+    /// sum of every `settle_funding` payment (R-F4). Net-additive; long flows are
+    /// negative, short flows positive.
+    pub funding_accumulator: i128,
     /// Market PDA bump seed.
     pub bump: u8,
 }
@@ -70,8 +84,9 @@ pub struct PerpMarket {
 impl PerpMarket {
     /// Serialized size of the account payload (excluding the 8-byte discriminator).
     ///
-    /// Packed borsh layout: `32 + 32 + 8 + 8 + 8 + 2 + 2 + 32 + 32 + 1 = 157`.
-    pub const LEN: usize = 32 + 32 + 8 + 8 + 8 + 2 + 2 + 32 + 32 + 1;
+    /// Packed borsh layout:
+    /// `32 + 32 + 8 + 8 + 8 + 2 + 2 + 32 + 32 + 8 + 8 + 8 + 16 + 1 = 197`.
+    pub const LEN: usize = 32 + 32 + 8 + 8 + 8 + 2 + 2 + 32 + 32 + 8 + 8 + 8 + 16 + 1;
 }
 
 // --- Order book + collateral vault (issues #3 & #4) ---
@@ -326,6 +341,13 @@ pub struct Position {
     pub collateral: u64,
     /// Last funding epoch this position was settled for (stored; written from #6).
     pub last_funding_epoch: u64,
+    /// Notional closed but not yet realized (written from #7).
+    ///
+    /// `close_position` stays lifecycle-only (D4) but records every closed fill
+    /// size here (it does NOT settle PnL); a permissionless `settle_close`
+    /// realizes the **signed** PnL over this notional into
+    /// `UserCollateral.deposited` and resets it to `0` (R-S1, R-S2/S3).
+    pub closed_notional: u64,
     /// Slot at which the position was (re)created: the fill slot for inline
     /// taker opens, or the settlement slot for maker re-opens via `settle_fill`.
     pub open_slot: u64,
@@ -336,8 +358,9 @@ pub struct Position {
 impl Position {
     /// Serialized size of the account payload (excluding the 8-byte discriminator).
     ///
-    /// Packed borsh layout: `32 + 32 + 1 + 8 + 16 + 16 + 8 + 8 + 8 + 1 = 130`.
-    pub const LEN: usize = 32 + 32 + 1 + 8 + 16 + 16 + 8 + 8 + 8 + 1;
+    /// Packed borsh layout:
+    /// `32 + 32 + 1 + 8 + 16 + 16 + 8 + 8 + 8 + 8 + 1 = 138`.
+    pub const LEN: usize = 32 + 32 + 1 + 8 + 16 + 16 + 8 + 8 + 8 + 8 + 1;
 }
 
 /// Pure staleness predicate (saturating, overflow-safe for any `u64` inputs).
@@ -398,7 +421,7 @@ pub fn update_message(oracle: &Pubkey, apy: u64, version: u64) -> [u8; 32] {
 mod tests {
     use anchor_lang::prelude::*;
 
-    use super::{Observation, Order, OrderBook, OutEvent, Position, UserCollateral};
+    use super::{Observation, Order, OrderBook, OutEvent, PerpMarket, Position, UserCollateral};
 
     /// Every zero-copy `LEN` constant must equal the in-memory `#[repr(C)]` size
     /// of its type — the exact invariant the `space = 8 + LEN` constraints rely
@@ -447,12 +470,38 @@ mod tests {
             entry_d_sum: 9_876_543_210,
             collateral: 100_000,
             last_funding_epoch: 42,
+            closed_notional: 900_000,
             open_slot: 7,
             bump: 255,
         };
         assert_eq!(borsh::to_vec(&pos).unwrap().len(), Position::LEN);
         // Pin the documented size so a field/constant edit cannot drift it.
-        assert_eq!(Position::LEN, 130);
+        assert_eq!(Position::LEN, 138);
+    }
+
+    /// `PerpMarket` is a borsh `#[account]`; its `LEN` must equal the packed
+    /// borsh payload size (excluding the 8-byte discriminator).
+    #[test]
+    fn perp_market_len_matches_borsh_payload() {
+        let market = PerpMarket {
+            index_source: Pubkey::new_unique(),
+            collateral_mint: Pubkey::new_unique(),
+            funding_k: 100_000,
+            max_funding: 10_000,
+            funding_epoch_slots: 1_000,
+            initial_margin_bps: 1_000,
+            maintenance_margin_bps: 500,
+            authority: Pubkey::new_unique(),
+            vault: Pubkey::new_unique(),
+            funding_epoch: 0,
+            index_n: 0,
+            index_d: 0,
+            funding_accumulator: 0,
+            bump: 255,
+        };
+        assert_eq!(borsh::to_vec(&market).unwrap().len(), PerpMarket::LEN);
+        // Pin the documented size so a field/constant edit cannot drift it.
+        assert_eq!(PerpMarket::LEN, 197);
     }
 
     /// The `Position` PDA seed `[POSITION_SEED, market, user, side]` must

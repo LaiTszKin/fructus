@@ -30,6 +30,28 @@ pub const MAX_FUNDING_MAX: u64 = APY_SCALE;
 /// Upper bound (inclusive) for margin ratios, expressed in basis points.
 pub const MAX_MARGIN_BPS: u16 = 10_000;
 
+/// Slots per Solana year (at the canonical 0.4 s slot time).
+///
+/// `(365.25 × 24 × 60 × 60) / 0.4 = 78_840_000`. Used by `settle_funding` to
+/// annualize a realized yield spanning a measured number of slots
+/// (`exchange::annualize(.., SLOTS_PER_YEAR)`).
+pub const SLOTS_PER_YEAR: u64 = 78_840_000;
+
+/// Liquidation penalty, in basis points (5% of the released collateral).
+///
+/// Paid to the liquidator out of the position's collateral (R-L3); wired by the
+/// `liquidate` handler as the `penalty_bps` of
+/// [`crate::liquidation::apply_liquidation`].
+pub const LIQUIDATION_PENALTY_BPS: u16 = 500;
+
+/// Liquidation TWAP reference window, in slots.
+///
+/// Reuses the `TWAP_OBSERVATIONS` ring value (16) as the on-chain window the
+/// `liquidate` handler reads the order-book TWAP against; a book that does not
+/// reach back a full window yields no reference price and the liquidation is
+/// refused (R-L1/R-L4 window/staleness guard).
+pub const LIQUIDATION_TWAP_WINDOW: u64 = 16;
+
 // --- Order book + collateral vault (issues #3 & #4) ---
 
 /// PDA seed for the order-book account (one per market, bound by the market key).

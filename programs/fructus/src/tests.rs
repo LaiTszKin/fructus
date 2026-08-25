@@ -1459,6 +1459,7 @@ proptest! {
             entry_d_sum: 0,
             collateral: 0,
             last_funding_epoch: 0,
+            closed_notional: 0,
             open_slot: 0,
             bump: 255,
         };

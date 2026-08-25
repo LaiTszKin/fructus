@@ -13,14 +13,16 @@ pub mod constants;
 pub mod ed25519;
 pub mod error;
 pub mod exchange;
+pub mod funding;
+pub mod liquidation;
 pub mod orderbook;
 pub mod positions;
 pub mod state;
 
 use constants::{
-    EVENT_QUEUE_LEN, MAX_MATCH_STEPS, MAX_ORDERS_PER_SIDE, ORACLE_SEED, ORDER_BOOK_SEED,
-    PERP_MARKET_SEED, POSITION_SEED, TWAP_OBSERVATIONS, USDC_DECIMALS, USER_COLLATERAL_SEED,
-    VAULT_SEED,
+    EVENT_QUEUE_LEN, LIQUIDATION_PENALTY_BPS, LIQUIDATION_TWAP_WINDOW, MAX_MATCH_STEPS,
+    MAX_ORDERS_PER_SIDE, ORACLE_SEED, ORDER_BOOK_SEED, PERP_MARKET_SEED, POSITION_SEED,
+    SLOTS_PER_YEAR, TWAP_OBSERVATIONS, USDC_DECIMALS, USER_COLLATERAL_SEED, VAULT_SEED,
 };
 use error::FructusError;
 use exchange::{ExchangeRate, STAKE_POOL_PROGRAM_ID};
@@ -651,9 +653,18 @@ fn apply_close_fills(
         .reserved
         .checked_sub(released)
         .ok_or(FructusError::ArithmeticOverflow)?;
+    // R-S1: record the notional handed back to the book so a later
+    // `settle_close` can realize its signed PnL (D4 keeps close lifecycle-only,
+    // so the closed notional is accumulated, not settled here). Computed up
+    // front so an overflow fails atomically before any field is written.
+    let new_closed_notional = position
+        .closed_notional
+        .checked_add(notional_delta)
+        .ok_or(FructusError::ArithmeticOverflow)?;
 
     position.notional = new_notional;
     position.collateral = new_collateral;
+    position.closed_notional = new_closed_notional;
     user_collateral.reserved = new_reserved;
     Ok(())
 }
@@ -817,6 +828,28 @@ fn verify_maker_accounts(
     Ok(position_bump)
 }
 
+/// Verify `collateral_key` is the per-`(market, owner)` `UserCollateral` PDA
+/// (seed `[USER_COLLATERAL_SEED, market, owner]`), byte-for-byte (AGENTS.md).
+///
+/// Used by the permissionless `settle_close` / `settle_funding` / `liquidate`
+/// adapters after reading `position.owner`: the caller provides the accounts, so
+/// the handler must bind them to the user's PDAs (`InvalidAccountData` on
+/// mismatch), mirroring `settle_fill`'s `verify_maker_accounts`.
+fn verify_collateral_pda(
+    market_key: &Pubkey,
+    owner: &Pubkey,
+    collateral_key: &Pubkey,
+) -> Result<()> {
+    let (collateral_pda, _) = Pubkey::find_program_address(
+        &[USER_COLLATERAL_SEED, market_key.as_ref(), owner.as_ref()],
+        &crate::ID,
+    );
+    if collateral_pda.as_ref() != collateral_key.as_ref() {
+        return Err(ProgramError::InvalidAccountData.into());
+    }
+    Ok(())
+}
+
 declare_id!("8ZLiJ12eBiam4UP2HRp3M75CQAcc8GuUBz44zeHt6mjH");
 
 #[program]
@@ -888,6 +921,13 @@ pub mod fructus {
         market.authority = ctx.accounts.authority.key();
         market.vault = vault;
         market.bump = ctx.bumps.market;
+        // Zero-init the funding state so the first `settle_funding` sees a
+        // clear "no baseline yet" (`index_n == index_d == 0`) and a zero
+        // accumulator (R-F4).
+        market.funding_epoch = 0;
+        market.index_n = 0;
+        market.index_d = 0;
+        market.funding_accumulator = 0;
         Ok(())
     }
 
@@ -1647,8 +1687,273 @@ pub mod fructus {
         position.entry_d_sum = 0;
         position.collateral = 0;
         position.last_funding_epoch = 0;
+        position.closed_notional = 0;
         position.open_slot = 0;
         position.exit(&crate::ID)?;
+        Ok(())
+    }
+
+    /// Permissionless: realize the **signed** realized-yield PnL of the notional
+    /// a position has closed (issue #7, R-S2/R-S3).
+    ///
+    /// `close_position` is lifecycle-only (D4): it reduces `notional`, releases
+    /// margin, and records the closed amount in `Position.closed_notional` but
+    /// settles nothing. `settle_close` settles that notional against the market's
+    /// live stake-pool index (`positions::pnl`, trustless via the entry running
+    /// sums) into the user's `UserCollateral.deposited` and resets
+    /// `closed_notional` to `0`. It depends **only** on `exchange.rs` data (the
+    /// entry sums + the current pool read) — never the mark oracle (R-S2).
+    ///
+    /// * `closed_notional == 0` is an idempotent no-op (R-S3).
+    /// * A positive PnL credits the ledger; a negative PnL debits it via
+    ///   [`positions::apply_pnl`], which clamps so `deposited` never goes
+    ///   negative (the vault is never insolvent — R-S3).
+    pub fn settle_close<'info>(ctx: Context<'info, SettleClose<'info>>) -> Result<()> {
+        let market = &ctx.accounts.market;
+        let position = &mut ctx.accounts.position;
+
+        // Bind the supplied accounts to the market + the user's PDAs
+        // (byte-level compare per AGENTS.md; `InvalidAccountData` on mismatch).
+        require!(
+            position.market == market.key(),
+            FructusError::PositionNotFound
+        );
+        let side = positions::PositionSide::from_side_u8(position.side)
+            .ok_or(ProgramError::InvalidAccountData)?;
+        verify_collateral_pda(
+            &market.key(),
+            &position.owner,
+            &ctx.accounts.user_collateral.key(),
+        )?;
+
+        let closed = position.closed_notional;
+        if closed == 0 {
+            return Ok(());
+        }
+
+        let rate = read_stake_pool(&ctx.accounts.index_source)?;
+        let pnl = positions::pnl(
+            position.entry_n_sum,
+            position.entry_d_sum,
+            rate.total_lamports,
+            rate.pool_token_supply,
+            closed,
+            side,
+        )
+        .ok_or(FructusError::ArithmeticOverflow)?;
+        let new_deposited = positions::apply_pnl(ctx.accounts.user_collateral.deposited, pnl)
+            .ok_or(FructusError::ArithmeticOverflow)?;
+        ctx.accounts.user_collateral.deposited = new_deposited;
+        position.closed_notional = 0;
+        Ok(())
+    }
+
+    /// Permissionless per-position funding accrual (issue #6, R-F5).
+    ///
+    /// Settles `epochs = cur_epoch - position.last_funding_epoch` **full**
+    /// elapsed epochs of funding for the position: the trustless on-chain
+    /// `index` (`annualize` of the stake-pool `realized_yield` harness, from the
+    /// market's last-settlement baseline `index_n/index_d` to the live pool
+    /// rate), the `mark` (order-book `mid`, falling back to `index` so a
+    /// one-sided/empty book yields `premium == 0`), the clamped
+    /// [`funding::funding_rate`], and the signed
+    /// [`funding::funding_payment`] applied to the user's collateral via
+    /// [`positions::apply_pnl`] (long flow negative on positive premium — R-F3).
+    ///
+    /// * `epochs == 0` is an idempotent no-op (re-settling the same epoch adds
+    ///   nothing — R-F5).
+    /// * On settlement the market baseline is advanced to the live pool rate and
+    ///   [`PerpMarket::funding_accumulator`] accumulates the signed payment.
+    ///
+    /// [INFERRED]: the MVP applies the **current** funding rate to all elapsed
+    /// epochs (not a per-epoch premium history) — a deterministic approximation
+    /// the accumulator makes net-additive.
+    pub fn settle_funding<'info>(ctx: Context<'info, SettleFunding<'info>>) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        let position = &mut ctx.accounts.position;
+
+        require!(
+            position.market == market.key(),
+            FructusError::PositionNotFound
+        );
+        let side = positions::PositionSide::from_side_u8(position.side)
+            .ok_or(ProgramError::InvalidAccountData)?;
+        verify_collateral_pda(
+            &market.key(),
+            &position.owner,
+            &ctx.accounts.user_collateral.key(),
+        )?;
+
+        let now_slot = Clock::get()?.slot;
+        let cur_epoch = funding::funding_epoch(now_slot, market.funding_epoch_slots);
+        let epochs = cur_epoch.saturating_sub(position.last_funding_epoch);
+        if epochs == 0 {
+            return Ok(()); // idempotent (R-F5)
+        }
+
+        // Trustless index: realized yield from the market's last-settlement
+        // baseline to the live pool rate, annualized over the elapsed epochs.
+        let rate = read_stake_pool(&ctx.accounts.index_source)?;
+        let elapsed_slots = epochs
+            .checked_mul(market.funding_epoch_slots)
+            .ok_or(FructusError::ArithmeticOverflow)?;
+        let index = if market.index_d == 0 {
+            // No baseline yet (first settlement): establish it now; no realized
+            // yield to annualize, so `index == 0` (premium = mark - 0).
+            0
+        } else {
+            let baseline = exchange::ExchangeRate {
+                total_lamports: market.index_n,
+                pool_token_supply: market.index_d,
+            };
+            let realized = baseline
+                .realized_yield(&rate)
+                .ok_or(FructusError::ArithmeticOverflow)?;
+            exchange::annualize(realized, elapsed_slots, SLOTS_PER_YEAR)
+                .ok_or(FructusError::ArithmeticOverflow)?
+        };
+
+        // Mark = order-book mid; fall back to index so a one-sided/empty book
+        // yields premium == 0 (no funding) rather than a spurious spike.
+        let order_book = ctx.accounts.order_book.load()?;
+        let book = load_book(&order_book);
+        let mark = orderbook::mid(&book).unwrap_or(index);
+
+        let premium = funding::premium(mark, index);
+        let funding_rate_value =
+            funding::funding_rate(premium, market.funding_k, market.max_funding);
+        let payment = funding::funding_payment(
+            position.notional,
+            funding_rate_value,
+            epochs,
+            funding::SideFlow::from_position_side(side),
+        );
+
+        let new_deposited = positions::apply_pnl(ctx.accounts.user_collateral.deposited, payment)
+            .ok_or(FructusError::ArithmeticOverflow)?;
+        ctx.accounts.user_collateral.deposited = new_deposited;
+        position.last_funding_epoch = cur_epoch;
+        market.funding_epoch = cur_epoch;
+        market.index_n = rate.total_lamports;
+        market.index_d = rate.pool_token_supply;
+        market.funding_accumulator = market
+            .funding_accumulator
+            .checked_add(payment)
+            .ok_or(FructusError::ArithmeticOverflow)?;
+        Ok(())
+    }
+
+    /// Permissionless liquidation (issue #8, R-L2/R-L3/R-L4).
+    ///
+    /// Liquidates `amount` of a position whose health is below its maintenance
+    /// margin. Unrealized PnL is **index-based** (trustless `positions::pnl` vs
+    /// the live pool) — the health metric of R-L2 — while the order-book **TWAP**
+    /// is the reserved liquidation reference price + the window/staleness guard
+    /// (R-L1/R-L4): a book that does not reach back a full
+    /// [`LIQUIDATION_TWAP_WINDOW`] yields no reference and the liquidation is
+    /// refused. `liquidatable` is a strict `<` — an exactly-maintained position
+    /// is healthy (R-L2).
+    ///
+    /// The liquidated notional releases its maintenance-margin backing, paying a
+    /// [`LIQUIDATION_PENALTY_BPS`] reward to the liquidator out of the position's
+    /// collateral (R-L3); `amount == notional` fully closes the exposure. Both
+    /// partial and full liquidations never leave the victim with negative
+    /// remaining collateral and never create value out of thin air.
+    ///
+    /// [INFERRED]: the on-chain PnL model uses the **index** (trustless) as the
+    /// health metric; the order-book TWAP is the reserved reference price +
+    /// staleness guard rather than the literal health input (confirm at review).
+    pub fn liquidate<'info>(ctx: Context<'info, Liquidate<'info>>, amount: u64) -> Result<()> {
+        let market = &ctx.accounts.market;
+        let position = &mut ctx.accounts.position;
+
+        require!(
+            position.market == market.key(),
+            FructusError::PositionNotFound
+        );
+        require!(position.notional > 0, FructusError::PositionNotFound);
+        let side = positions::PositionSide::from_side_u8(position.side)
+            .ok_or(ProgramError::InvalidAccountData)?;
+        verify_collateral_pda(
+            &market.key(),
+            &position.owner,
+            &ctx.accounts.user_collateral.key(),
+        )?;
+
+        // TWAP reference-price + window/staleness guard (R-L1/R-L4): a book that
+        // does not reach back a full window has no liquidation reference.
+        let now_slot = Clock::get()?.slot;
+        let order_book = ctx.accounts.order_book.load()?;
+        // The on-chain account stores `state::Observation` (raw `[u8;16]`
+        // cumulative); the pure `orderbook::twap` works over its own lightweight
+        // `orderbook::Observation`. Convert at the adapter boundary (only `slot`
+        // and the decoded cumulative accumulator matter to the TWAP).
+        let obs: Vec<orderbook::Observation> = order_book
+            .observations
+            .iter()
+            .map(|o| orderbook::Observation {
+                slot: o.slot,
+                cumulative_mid: u128::from_le_bytes(o.cumulative_mid),
+            })
+            .collect();
+        let twap = orderbook::twap(&obs, LIQUIDATION_TWAP_WINDOW, now_slot)
+            .ok_or(FructusError::NotLiquidatable)?;
+        let _reference_price = twap;
+
+        // Health metric: index-based unrealized PnL (R-L2).
+        let rate = read_stake_pool(&ctx.accounts.index_source)?;
+        let pnl = positions::pnl(
+            position.entry_n_sum,
+            position.entry_d_sum,
+            rate.total_lamports,
+            rate.pool_token_supply,
+            position.notional,
+            side,
+        )
+        .ok_or(FructusError::ArithmeticOverflow)?;
+        let liquidatable = liquidation::liquidatable(
+            position.collateral,
+            pnl,
+            position.notional,
+            market.maintenance_margin_bps,
+        )
+        .unwrap_or(false);
+        require!(liquidatable, FructusError::NotLiquidatable);
+
+        // Apply the (partial/full) liquidation transition.
+        let (remaining_collateral, reward) = liquidation::apply_liquidation(
+            position.collateral,
+            position.notional,
+            amount,
+            market.maintenance_margin_bps,
+            LIQUIDATION_PENALTY_BPS,
+        )
+        .map_err(FructusError::from)?;
+
+        // Reduce the position and release the consumed collateral from the
+        // victim's reserved ledger (ledger-only margin, no token movement).
+        let consumed = position.collateral.saturating_sub(remaining_collateral);
+        position.notional = position
+            .notional
+            .checked_sub(amount)
+            .ok_or(FructusError::ArithmeticOverflow)?;
+        position.collateral = remaining_collateral;
+        let new_reserved = ctx
+            .accounts
+            .user_collateral
+            .reserved
+            .checked_sub(consumed)
+            .ok_or(FructusError::ArithmeticOverflow)?;
+        ctx.accounts.user_collateral.reserved = new_reserved;
+
+        // Credit the liquidator reward to their collateral ledger (R-L3).
+        let new_liquidator_deposited = ctx
+            .accounts
+            .liquidator_collateral
+            .deposited
+            .checked_add(reward)
+            .ok_or(FructusError::ArithmeticOverflow)?;
+        ctx.accounts.liquidator_collateral.deposited = new_liquidator_deposited;
         Ok(())
     }
 }
@@ -2003,8 +2308,95 @@ pub struct ResetPosition<'info> {
     pub user: Signer<'info>,
 }
 
+#[derive(Accounts)]
+pub struct SettleClose<'info> {
+    #[account(seeds = [PERP_MARKET_SEED], bump = market.bump)]
+    pub market: Account<'info, PerpMarket>,
+    /// CHECK: the per-(market, user, side) `Position` PDA; the handler verifies
+    /// `position.market == market` and the user's `UserCollateral` PDA from
+    /// `position.owner` (byte-level), then settles `closed_notional > 0`.
+    #[account(mut)]
+    pub position: Account<'info, Position>,
+    /// CHECK: the per-(market, user) collateral ledger, verified against the
+    /// `position.owner`-derived PDA in the handler; the settled PnL is applied
+    /// to `deposited`.
+    #[account(mut)]
+    pub user_collateral: Account<'info, UserCollateral>,
+    /// CHECK: must byte-equal `market.index_source` (Anchor `address`
+    /// constraint) and pass the stake-pool owner/discriminator validation in
+    /// the handler; `settle_close` reads the live index from it and nothing else
+    /// (R-S2 — never the mark oracle).
+    #[account(address = market.index_source)]
+    pub index_source: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct SettleFunding<'info> {
+    #[account(mut, seeds = [PERP_MARKET_SEED], bump = market.bump)]
+    pub market: Account<'info, PerpMarket>,
+    /// CHECK: the per-(market, user, side) `Position` PDA; the handler verifies
+    /// `position.market == market` and the user's `UserCollateral` PDA from
+    /// `position.owner` (byte-level), then accrues funding.
+    #[account(mut)]
+    pub position: Account<'info, Position>,
+    /// CHECK: the per-(market, user) collateral ledger, verified against the
+    /// `position.owner`-derived PDA in the handler; the funding payment is
+    /// applied to `deposited`.
+    #[account(mut)]
+    pub user_collateral: Account<'info, UserCollateral>,
+    #[account(
+        seeds = [ORDER_BOOK_SEED, market.key().as_ref()],
+        bump
+    )]
+    pub order_book: AccountLoader<'info, OrderBook>,
+    /// CHECK: must byte-equal `market.index_source` (Anchor `address`
+    /// constraint) and pass the stake-pool owner/discriminator validation in
+    /// the handler; its snapshot and the market baseline derive the trustless
+    /// on-chain index (R-F5).
+    #[account(address = market.index_source)]
+    pub index_source: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct Liquidate<'info> {
+    #[account(seeds = [PERP_MARKET_SEED], bump = market.bump)]
+    pub market: Account<'info, PerpMarket>,
+    /// CHECK: the per-(market, user, side) `Position` PDA of the liquidated
+    /// account; the handler verifies `position.market == market` and the
+    /// victim's `UserCollateral` PDA from `position.owner`.
+    #[account(mut)]
+    pub position: Account<'info, Position>,
+    /// CHECK: the victim's per-(market, user) collateral ledger, verified in the
+    /// handler; its `reserved` releases the consumed collateral.
+    #[account(mut)]
+    pub user_collateral: Account<'info, UserCollateral>,
+    #[account(
+        seeds = [ORDER_BOOK_SEED, market.key().as_ref()],
+        bump
+    )]
+    pub order_book: AccountLoader<'info, OrderBook>,
+    /// CHECK: must byte-equal `market.index_source` (Anchor `address`
+    /// constraint) and pass the stake-pool owner/discriminator validation in
+    /// the handler; the index-based unrealized PnL health metric (R-L2).
+    #[account(address = market.index_source)]
+    pub index_source: UncheckedAccount<'info>,
+    /// The account liquidating the position (any signer; permissionless).
+    pub liquidator: Signer<'info>,
+    /// CHECK: the liquidator's per-(market, user) collateral ledger, seeded by
+    /// the `liquidator` signer; the liquidation penalty reward is credited here.
+    #[account(
+        mut,
+        seeds = [USER_COLLATERAL_SEED, market.key().as_ref(), liquidator.key().as_ref()],
+        bump
+    )]
+    pub liquidator_collateral: Account<'info, UserCollateral>,
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod review_tests;
 
 #[cfg(test)]
 mod handlers_tests {
@@ -2492,6 +2884,7 @@ mod handlers_tests {
             entry_d_sum: d_sum,
             collateral,
             last_funding_epoch: 0,
+            closed_notional: 0,
             open_slot,
             bump: 0,
         }

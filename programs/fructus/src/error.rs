@@ -50,6 +50,8 @@ pub enum FructusError {
     ArithmeticOverflow,
     #[msg("Position not found")]
     PositionNotFound,
+    #[msg("Position is not liquidatable (equity is at or above the maintenance margin)")]
+    NotLiquidatable,
     #[msg("Settlement event not found")]
     EventNotFound,
     #[msg("Close size exceeds position notional")]
