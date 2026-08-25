@@ -2,7 +2,8 @@
 
 On-chain data shapes: the oracle account, the perpetual-market account, the
 order book (with its inline `Order`/`OutEvent`/`Observation` sub-structs), the
-collateral ledger, and the derived exchange rate.
+collateral ledger, the per-`(market, user, side)` position ledger, and the
+derived exchange rate.
 
 ## `YieldOracle` (anchor account)
 
@@ -60,10 +61,10 @@ padded so `bytemuck::Pod` has no implicit padding:
 | `_pad` | `[u8; 7]` | 81 | explicit padding (8-align) |
 | `bids` | `[Order; 64]` | 88 | resting bids; 64 bytes each |
 | `asks` | `[Order; 64]` | 4184 | resting asks; 64 bytes each |
-| `events` | `[OutEvent; 128]` | 8280 | event-queue ring; 96 bytes each |
-| `observations` | `[Observation; 16]` | 20568 | TWAP ring; 32 bytes each |
+| `events` | `[OutEvent; 128]` | 8280 | event-queue ring; 112 bytes each |
+| `observations` | `[Observation; 16]` | 22616 | TWAP ring; 32 bytes each |
 
-- `LEN = 21_080` (`size_of::<OrderBook>()`, excluding the 8-byte discriminator).
+- `LEN = 23_128` (`size_of::<OrderBook>()`, excluding the 8-byte discriminator).
 - Fixed capacities: `MAX_ORDERS_PER_SIDE = 64`, `EVENT_QUEUE_LEN = 128`,
   `TWAP_OBSERVATIONS = 16`. The book's side is implied by which array an `Order`
   sits in (`bids` vs `asks`), so no side byte is stored.
@@ -92,11 +93,16 @@ padded so `bytemuck::Pod` has no implicit padding:
 | `size` | u64 | 16 | traded size (fill) or remaining size |
 | `owner` | Pubkey | 24 | order owner |
 | `counterparty` | Pubkey | 56 | matched counterparty (zero when unset) |
-| `kind` | u8 | 88 | `0` = Fill, `1` = Cancel, `2` = Residual |
-| `side` | u8 | 89 | `0` = Bid, `1` = Ask |
-| `_pad` | `[u8; 6]` | 90 | explicit padding (8-align) |
+| `entry_total_lamports` | u64 | 88 | fill-time index snapshot numerator (`total_lamports`); `0` on non-fill events |
+| `entry_pool_token_supply` | u64 | 96 | fill-time index snapshot denominator (`pool_token_supply`); `0` on non-fill events |
+| `settled` | u8 | 104 | `0` = Fill pending maker settlement; `1` = consumed by `settle_fill` (meaningless on other kinds) |
+| `kind` | u8 | 105 | `0` = Fill, `1` = Cancel, `2` = Residual |
+| `side` | u8 | 106 | `0` = Bid, `1` = Ask |
+| `_pad` | `[u8; 5]` | 107 | explicit padding (8-align) |
 
-- `LEN = 96`.
+- `LEN = 112`. The fill-time index snapshot (D7/D8) lets `settle_fill` book a
+  resting maker at the rate that was in effect when the fill executed — not at
+  settlement time — and the `settled` flag makes settlement idempotent.
 
 ### `Observation` (sub-struct)
 
@@ -117,11 +123,46 @@ user.key()]`. Borsh layout (after the 8-byte discriminator):
 | Field | Type | Offset (payload) | Notes |
 | --- | --- | --- | --- |
 | `deposited` | u64 | 0 | USDC credited to the user, microunits |
-| `reserved` | u64 | 8 | USDC reserved for open positions (stubbed `0`) |
+| `reserved` | u64 | 8 | USDC reserved for open positions; `= Σ` position collateral (issue #5) |
 | `bump` | u8 | 16 | PDA bump |
 
 - `LEN = 17`.
-- Lazily initialized on first deposit; `reserved` has no writer this iteration.
+- Lazily initialized on first deposit; `reserved` is written by the position
+  lifecycle (`open_position` / `close_position` / `settle_fill` reserve and
+  release margin atomically with the `Position` ledger).
+
+## `Position` (anchor account)
+
+One PDA per `(market, user, side)`, seed
+`[POSITION_SEED, market.key(), user.key(), side]` with
+`POSITION_SEED = b"position"`. Borsh layout (after the 8-byte discriminator):
+
+| Field | Type | Offset (payload) | Notes |
+| --- | --- | --- | --- |
+| `market` | Pubkey | 0 | bound market (also in the PDA seed) |
+| `owner` | Pubkey | 32 | user holding the position (also in the PDA seed) |
+| `side` | u8 | 64 | `0` = Long/Bid, `1` = Short/Ask (`SIDE_BID`/`SIDE_ASK`) |
+| `notional` | u64 | 65 | remaining position, USDC microunits; `0` == closed |
+| `entry_n_sum` | u128 | 73 | `Σ(total_lamports × fill_size)` — notional-weighted entry-index running sum |
+| `entry_d_sum` | u128 | 89 | `Σ(pool_token_supply × fill_size)` — notional-weighted entry-index running sum |
+| `collateral` | u64 | 105 | reserved margin = `margin_required(notional, initial_margin_bps)` (ceiling division) |
+| `last_funding_epoch` | u64 | 113 | stored; `0` this iteration (#6 writes it) |
+| `open_slot` | u64 | 121 | (re)creation slot: fill slot (inline taker opens) or settlement slot (maker re-opens via `settle_fill`) |
+| `bump` | u8 | 129 | PDA bump |
+
+- `LEN = 130`.
+- Lazily created on first fill/settlement (payer = user/cranker) and **retained**
+  after a full close; `notional == 0` means closed. A re-open resets
+  `entry_n_sum` / `entry_d_sum` / `open_slot`.
+- The entry index is stored as notional-weighted running sums (exact
+  average-cost accounting, no intermediate rounding); the snapshot rate
+  `entry_n_sum / entry_d_sum` is computed at PnL time after a shared
+  power-of-two normalization (`positions::normalize_sums`).
+- `u128` fields borsh-serialize to 16 LE bytes; as a plain borsh `#[account]`
+  (well under the 4 KiB zero-copy threshold) the `Position` declares native
+  `u128` fields — no per-access byte conversion.
+- Margin is ledger-only: `collateral` mirrors the reserved-margin bookkeeping in
+  `UserCollateral.reserved`; no token movement on open or close.
 
 ## `ExchangeRate` (derived, not stored)
 
@@ -143,6 +184,7 @@ erDiagram
     PerpMarket ||--|| StakePoolAccount : "index_source"
     PerpMarket ||--|| OrderBook : "book bound by market key"
     PerpMarket ||--o{ UserCollateral : "ledger per (market, user)"
+    PerpMarket ||--o{ Position : "position per (market, user, side)"
     PerpMarket ||--|| VaultTokenAccount : "collateral custody (seed vault)"
     ExchangeRate ||--|| StakePoolAccount : "reads"
     YieldOracle {
@@ -176,6 +218,17 @@ erDiagram
     UserCollateral {
         u64 deposited
         u64 reserved
+    }
+    Position {
+        Pubkey market
+        Pubkey owner
+        u8 side
+        u64 notional
+        u128 entry_n_sum
+        u128 entry_d_sum
+        u64 collateral
+        u64 last_funding_epoch
+        u64 open_slot
     }
     ExchangeRate {
         u64 total_lamports

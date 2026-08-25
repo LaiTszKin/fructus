@@ -23,6 +23,7 @@ trustless settlement reference, off-chain keeper, and fuzz harness) and the
 | Understand trustless settlement | [modules/settlement.md](modules/settlement.md) |
 | Understand the perpetual market | [modules/market.md](modules/market.md) |
 | Understand the on-chain order book | [modules/order-book.md](modules/order-book.md) |
+| Understand the position lifecycle | [modules/positions.md](modules/positions.md) |
 | Understand the collateral vault | [modules/collateral.md](modules/collateral.md) |
 | Understand the off-chain keeper | [modules/publisher.md](modules/publisher.md) |
 | Run tests / fuzz | [testing.md](testing.md) |
@@ -39,6 +40,7 @@ trustless settlement reference, off-chain keeper, and fuzz harness) and the
 - [modules/settlement.md](modules/settlement.md) — trustless exchange rate / yield
 - [modules/market.md](modules/market.md) — perpetual market + `initialize_market`
 - [modules/order-book.md](modules/order-book.md) — order book + matching engine + mark/twap
+- [modules/positions.md](modules/positions.md) — position lifecycle (open/close long & short)
 - [modules/collateral.md](modules/collateral.md) — collateral vault + deposit/withdraw
 - [modules/publisher.md](modules/publisher.md) — off-chain keeper
 - [api-reference.md](api-reference.md) — instruction reference + signature scheme

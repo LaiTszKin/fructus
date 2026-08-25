@@ -4,8 +4,10 @@
 account plus a per-`(market, user)` ledger of `deposited` / `reserved`, with
 `deposit_collateral` / `withdraw_collateral` moving funds and updating the ledger
 atomically. The free-collateral seam (`free_collateral() = deposited − reserved`)
-is the hook the position lifecycle (#5) will later use to keep collateral backing
-open margin from being withdrawn.
+is the hook the position lifecycle (#5) uses to keep collateral backing open
+margin from being withdrawn: every open reserves margin, every close releases
+it, and `withdraw_collateral` rejects anything that would push free collateral
+negative.
 
 ## Public API
 
@@ -47,12 +49,14 @@ One PDA per `(market, user)`, seed
 | Field | Type | Notes |
 | --- | --- | --- |
 | `deposited` | u64 | USDC credited to the user, microunits |
-| `reserved` | u64 | USDC reserved for open positions (stubbed to `0` this iteration) |
+| `reserved` | u64 | USDC reserved for open positions; `= Σ` position collateral (issue #5) |
 | `bump` | u8 | PDA bump |
 
 - Lazily initialized on **first deposit** (payer = user), both fields zero.
-- `reserved` has **no writer** this iteration (no positions yet), so
-  `free_collateral() == deposited` always holds. The layout + offset is in
+- `reserved` is written by the position lifecycle — `open_position` /
+  `settle_fill` add `margin_required(notional, im_bps)` per position,
+  `close_position` releases it — atomically with the `Position` ledger, and the
+  pair is never negative. The layout + offset is in
   [data-models.md](../data-models.md).
 
 ## Deposit / withdraw flow
@@ -79,12 +83,14 @@ Both are atomic — any error unwinds the transfer and the ledger write.
 ## `free_collateral()` seam
 
 `free_collateral(deposited, reserved) = deposited − reserved` is the single
-predicate every withdrawal checks. It is a pure, property-tested function and
-returns `None` only on the invariant violation `reserved > deposited`. Because
-`reserved` is stubbed to `0`, the check reduces to `amount <= deposited` today;
-when issue #5 raises `reserved` for open positions, the **same** check will
-reject withdrawing collateral that still backs margin — no new withdrawal path is
-needed.
+predicate every withdrawal checks — and, since issue #5, every `open_position`
+and `settle_fill` margin check too. It is a pure, property-tested function and
+returns `None` only on the invariant violation `reserved > deposited`. With
+`reserved = Σ` position collateral, the **same** check rejects withdrawing
+collateral that still backs margin, and rejects an open whose margin shortfall
+would leave `reserved > deposited` — no new withdrawal path was needed. A
+missing ledger (no deposit yet) reports `InsufficientFreeCollateral` rather
+than an account-format error.
 
 ## Dependencies
 

@@ -6,17 +6,20 @@ accumulator **inline** — no per-order PDA accounts, no off-chain book, no
 oracle. The matching engine is a pure, dependency-free Rust module
 (`crate::orderbook`) so its invariants are locked by `proptest` before any
 instruction runs. `mid()` is the book-derived mark; `twap()` is the windowed
-time-weighted mid primitive that liquidation (#8) will consume.
+time-weighted mid primitive that liquidation (#8) will consume. Every `Fill`
+event carries the **fill-time index snapshot** (`entry_total_lamports` /
+`entry_pool_token_supply`) plus a `settled` flag so the position lifecycle (#5)
+can book resting makers at the rate in effect when they filled.
 
 ## Public API
 
 | Instruction | Signature | Description |
 | --- | --- | --- |
 | `initialize_order_book` | `()` | Create the market-bound `OrderBook` PDA (authority-gated) |
-| `place_limit_order` | `(side: u8, price: u64, size: u64)` | Post a limit order: rest if non-crossing, otherwise match inline |
-| `place_market_order` | `(side: u8, size: u64)` | Cross best-price-first; immediate-or-cancel, never over-fills |
+| `place_limit_order` | `(side: u8, price: u64, size: u64)` | Post a limit order: rest if non-crossing, otherwise match inline; every `Fill` stamped with the in-tx index snapshot |
+| `place_market_order` | `(side: u8, size: u64)` | Cross best-price-first; immediate-or-cancel, never over-fills; `Fill`s stamped with the in-tx index snapshot |
 | `cancel_order` | `(seq: u64)` | Remove one resting order (owner-only) |
-| `crank` | `()` | Permissionless: drain the event queue + resume budget-interrupted takers |
+| `crank` | `()` | Permissionless: drain the event queue + resume budget-interrupted takers; `Fill`s from a resumed residual stamped with the in-tx index snapshot |
 
 | Pure function | Signature | Description |
 | --- | --- | --- |
@@ -34,9 +37,9 @@ time-weighted mid primitive that liquidation (#8) will consume.
 - **Price** is the traded yield level in `APY_SCALE` (`1_000_000`) fixed point,
   with a tick size of one micro-unit. `1.0` == `1_000_000`; the zero price is
   **invalid** for a live order (`InvalidPrice`). Price is stored as `u64`.
-- **Size** is notional USDC microunits (6 decimals). The matching invariants are
-  unit-agnostic, so issue #5 can revisit the notional mapping without touching
-  the engine.
+- **Size** is notional USDC microunits (6 decimals). Issue #5 reuses this exact
+  unit for position notionals — the matching invariants stay unit-agnostic, so
+  the notional mapping never touches the engine.
 - **`seq`** is a monotonically increasing order id (`OrderBook.next_seq`),
   assigned on acceptance and used as the tie-breaker for time priority.
 - **Side** is implied by which array a resting order sits in (`bids` vs `asks`)
@@ -75,9 +78,11 @@ distinguishes an empty slot from a live order, so `price == 0` stays a
 Fixed capacities: `MAX_ORDERS_PER_SIDE = 64` (each resting order may occupy its
 own price level, since the book uses flat per-side arrays with a price-time
 comparator), `EVENT_QUEUE_LEN = 128`, `TWAP_OBSERVATIONS = 16`. Total payload is
-`21_080` bytes (`OrderBook::LEN`); the account is zero-copy
-(`#[account(zero_copy)]`) because it exceeds the SBF 4 KiB stack limit for borsh
-deserialization — handlers access it in place via `AccountLoader::load_mut()`.
+`23_128` bytes (`OrderBook::LEN`) — up from `21_080` because each `OutEvent`
+grew 96 → 112 bytes (the fill-time index snapshot + `settled` flag, issue #5);
+the account is zero-copy (`#[account(zero_copy)]`) because it exceeds the SBF
+4 KiB stack limit for borsh deserialization — handlers access it in place via
+`AccountLoader::load_mut()`.
 
 ## Matching engine
 
@@ -116,15 +121,31 @@ Every book mutation appends an `OutEvent` to the bounded 128-entry ring:
 | `Residual` | `2` | a budget-interrupted limit taker's remainder is deferred |
 
 `OutEvent` carries `seq` (monotonic), `owner`, `counterparty`, `side` (`0` =
-Bid, `1` = Ask), `price`, and `size`. The write cursor assigns the sequence and
-wraps around the ring.
+Bid, `1` = Ask), `price`, and `size`; a `Fill` additionally carries the
+**fill-time index snapshot** (`entry_total_lamports` / `entry_pool_token_supply`,
+stamped by the fill-producing instruction) and a `settled` flag (`0` = pending
+maker settlement, flipped to `1` by `settle_fill`). The write cursor assigns the
+sequence and wraps around the ring.
+
+Every fill-producing instruction — `place_limit_order`, `place_market_order`,
+`crank`, and the position instructions `open_position` / `close_position` (issue
+#5) — takes the **market-bound `index_source`** account (readonly; must
+byte-equal `market.index_source`, plus stake-pool owner/discriminator
+validation) and stamps its in-transaction exchange-rate snapshot verbatim onto
+every `Fill` it emits, so a resting maker is settled at the rate that was in
+effect when the fill executed. `cancel_order` is not fill-producing and takes no
+`index_source`. A `Fill` that cannot be appended (full ring) fails the whole
+transaction with `BookFull` — fills are never silently dropped (D10).
 
 `crank` is **permissionless** (any signer) and drains up to `CRANK_BATCH_LEN = 8`
 events per call: `Fill`/`Cancel` are emitted (logged) and consumed, while a
 `Residual` is re-matched against the (now crossable) book — which may again
 defer a residual. A `Residual` the engine cannot finish (a pure self-trade, or a
 remainder that cannot rest) is cancelled and logged rather than reverting the
-transaction, so the shared crank is never wedged. It never matches off-chain,
+transaction, so the shared crank is never wedged. Fills a resumed residual
+produces are stamped with the crank's in-transaction snapshot. The crank takes
+**no position accounts** — residuals arise only from the position-neutral
+`place_limit_order`, so it never settles positions. It never matches off-chain,
 holds no privileged state, and cannot mint or move value.
 
 ## mark() / twap()
@@ -172,3 +193,13 @@ holds no privileged state, and cannot mint or move value.
   drains in at most 8 cranks.
 - **Event `seq` uses the write cursor** — monotonic across wraps; the read cursor
   advances only in `crank`.
+- **Fills are never silently dropped** — a `Fill` that cannot be appended to a
+  full ring fails the fill-producing transaction with `BookFull` (the taker
+  retries after a crank), so an executed fill always persists its event and the
+  maker can always settle (liveness bound in [positions.md](positions.md)).
+- **`index_source` is market-bound** — every fill-producing instruction takes
+  the readonly account and requires it to byte-equal `market.index_source`; the
+  snapshot is read once per tx and stamped onto every `Fill`, so no instruction
+  can stamp a non-canonical rate.
+- **The book stays position-neutral** — `place_*`/`crank` never touch a taker's
+  position; they only stamp fills for the maker's later `settle_fill`.
