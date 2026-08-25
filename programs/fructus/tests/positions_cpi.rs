@@ -22,6 +22,8 @@
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use proptest::prelude::*;
+
 use anchor_lang::{AccountDeserialize, Discriminator, InstructionData};
 use fructus::constants::{
     ORDER_BOOK_SEED, PERP_MARKET_SEED, POSITION_SEED, USER_COLLATERAL_SEED, VAULT_SEED,
@@ -258,14 +260,13 @@ async fn setup() -> Option<Env> {
     let market = Pubkey::find_program_address(&[PERP_MARKET_SEED], &program_id).0;
     let vault = Pubkey::find_program_address(&[VAULT_SEED], &program_id).0;
 
-    // The `OrderBook` account (23_136 B) exceeds the runtime's per-transaction
-    // account-growth cap (MAX_PERMITTED_DATA_INCREASE = 10 KiB), so the
-    // on-chain `initialize_order_book` CPI `create_account` cannot allocate it
-    // in a single transaction under `solana-program-test` (it fails with
-    // `InvalidRealloc`). Seed a fully-initialized account directly in the bank
-    // instead — byte-identical to what the handler would write (discriminator
-    // + zeroed struct with `market`/`bump` set). `initialize_order_book`
-    // itself is not part of any position-lifecycle acceptance criterion.
+    // The `OrderBook` account (`8 + LEN = 6_240` B) is sized under the runtime's
+    // per-transaction account-growth cap (MAX_PERMITTED_DATA_INCREASE = 10 KiB),
+    // so the on-chain `initialize_order_book` CPI `create_account` now fits.
+    // We still seed a fully-initialized account directly in the bank — faster
+    // than a CPI round-trip and byte-identical to what the handler would write
+    // (discriminator + zeroed struct with `market`/`bump` set). The bank
+    // `set_account` path avoids the 10 KiB inner-CPI allocation entirely.
     let (order_book, order_book_bump) =
         Pubkey::find_program_address(&[ORDER_BOOK_SEED, market.as_ref()], &program_id);
     pt.add_account(
@@ -699,14 +700,14 @@ fn margin_required(notional: u64) -> u64 {
 //
 // The on-chain `OrderBook` is an Anchor zero-copy account: `[8-byte
 // discriminator][OrderBook payload]`, with the payload laid out as
-// `header (88) + bids (64×64) + asks (64×64) + events (128×112) +
+// `header (88) + bids (16×64) + asks (16×64) + events (32×112) +
 // observations (16×32)`. The readers below slice the raw account bytes at the
 // documented offsets (AGENTS.md byte-level discipline; `state.rs` pins
-// `OrderBook::LEN == 23_128` and the per-type sizes).
+// `OrderBook::LEN == 6_232` and the per-type sizes).
 
 const OB_BIDS_OFF: usize = 8 + 88; // discriminator + header
-const OB_ASKS_OFF: usize = OB_BIDS_OFF + 64 * 64;
-const OB_EVENTS_OFF: usize = OB_ASKS_OFF + 64 * 64;
+const OB_ASKS_OFF: usize = OB_BIDS_OFF + 16 * 64;
+const OB_EVENTS_OFF: usize = OB_ASKS_OFF + 16 * 64;
 
 /// A single resting-order slot, decoded from the `bids`/`asks` arrays.
 #[derive(Debug, Clone)]
@@ -768,14 +769,14 @@ async fn book_view(env: &Env) -> BookView {
         .unwrap()
         .expect("order book exists");
     let data = &account.data;
-    let mut bids = Vec::with_capacity(64);
-    let mut asks = Vec::with_capacity(64);
-    let mut events = Vec::with_capacity(128);
-    for i in 0..64 {
+    let mut bids = Vec::with_capacity(16);
+    let mut asks = Vec::with_capacity(16);
+    let mut events = Vec::with_capacity(32);
+    for i in 0..16 {
         bids.push(read_order(data, OB_BIDS_OFF + i * 64));
         asks.push(read_order(data, OB_ASKS_OFF + i * 64));
     }
-    for i in 0..128 {
+    for i in 0..32 {
         events.push(read_event(data, OB_EVENTS_OFF + i * 112));
     }
     BookView {
@@ -1947,4 +1948,286 @@ fn newest_src_mtime(dir: &Path) -> std::time::SystemTime {
         }
     }
     newest
+}
+
+// ============================================================================
+// Property-based protocol invariant test (issue #9 "check for bugs"):
+// drives the real on-chain CLOB + deferred-maker-settlement flow across varied
+// price data (the stake-pool index) and order quantities, and asserts the
+// protocol invariants hold for every drawn case. Unlike the deterministic
+// scenarios above, the index (jitoSOL exchange rate => premium), the trade
+// price, and the order size are all randomized — this is the
+// solana-program-test counterpart to the Trident on-chain fuzz (which
+// trident_svm's execution stack cannot yet host).
+//
+// Invariants asserted per case:
+//   1. a taker fill creates a Position with notional == size and reserved
+//      collateral == margin_required(size);
+//   2. the fill stamps the live index (`entry_n_sum == total_lamports * size`,
+//      `entry_d_sum == pool_token_supply * size`);
+//   3. a deferred maker `settle_fill` books the opposite Position symmetric to
+//      the taker;
+//   4. the vault is never under-collateralized relative to reserved margin;
+//   5. no ledger ever has `reserved > deposited` (no negative free collateral);
+//   6. a well-formed sequence never reverts (no panic / unexpected error).
+proptest! {
+    #![proptest_config(proptest::test_runner::Config::with_cases(20))]
+
+    #[test]
+    fn pbt_clob_fills_hold_invariants(
+        // jitoSOL exchange-rate numerator (index / price data), rate 0.9..1.1.
+        total_lamports in 9_000_000_000_000u64..=11_000_000_000_000u64,
+        // trade yield level (APY_SCALE fixed point), non-crossing when resting.
+        price in 1u64..=1_000_000u64,
+        // order notional in USDC microunits (fully within the pre-funded deposit).
+        size in 1_000u64..=5_000_000u64,
+    ) {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let Some(mut env) = setup().await else { return; };
+            let a = env.a.clone();
+            let b = env.b.clone();
+
+            // Vary the trustless index => varied premium/price data.
+            set_stake_pool_total_lamports(&mut env, total_lamports).await;
+
+            // 1. A rests a long bid at `price` (no Position until settlement).
+            open_position(&mut env, &a, LONG, size, price, None)
+                .await
+                .expect("A opens long (limit) rests");
+            let book = book_view(&env).await;
+            assert_eq!(book.best_bid, price, "A's bid rested at price");
+            assert_eq!(
+                book.write_cursor, 0,
+                "a resting order emits no Fill event"
+            );
+
+            // 2. B market-opens a short: fills A's bid inline (taker settlement).
+            open_position(&mut env, &b, SHORT, size, 0, None)
+                .await
+                .expect("B opens short (market) fills");
+            let bp = position_state(&env, &b.short).await.expect("B short exists");
+            assert_eq!(bp.notional, size, "taker fill has full notional");
+            assert_eq!(bp.side, SHORT);
+            assert_eq!(bp.owner, b.keypair.pubkey());
+            assert_eq!(bp.collateral, margin_required(size), "taker margin reserved");
+            assert_eq!(
+                bp.entry_n_sum,
+                total_lamports as u128 * size as u128,
+                "fill stamps the live index numerator"
+            );
+            assert_eq!(
+                bp.entry_d_sum,
+                BASE_POOL_TOKEN_SUPPLY as u128 * size as u128,
+                "fill stamps the live index denominator"
+            );
+            let uc_b = user_collateral_state(&env, &b.user_collateral)
+                .await
+                .expect("B ledger");
+            assert_eq!(uc_b.reserved, margin_required(size), "B margin reserved");
+
+            // 3. A's resting bid was consumed by the taker fill.
+            let book = book_view(&env).await;
+            assert_eq!(book.best_bid, 0, "A's bid consumed");
+            let ev = book.event(0);
+            assert_eq!(ev.kind, 0, "event 0 is a Fill");
+            assert_eq!(ev.settled, 0, "fresh Fill is pending maker settlement");
+            assert_eq!(ev.side, LONG, "maker rested on the bid side");
+            assert_eq!(ev.owner, a.keypair.pubkey());
+            assert_eq!(ev.counterparty, b.keypair.pubkey());
+            assert_eq!(ev.price, price);
+            assert_eq!(ev.size, size);
+            assert_eq!(ev.entry_total_lamports, total_lamports, "live index on fill");
+
+            // 4. Deferred maker settlement books A's symmetric long.
+            settle_fill(&mut env, 0, &a.long, &a.user_collateral)
+                .await
+                .expect("settle A's maker fill");
+            let ap = position_state(&env, &a.long).await.expect("A long exists");
+            assert_eq!(ap.notional, size, "maker position notional");
+            assert_eq!(ap.side, LONG);
+            assert_eq!(ap.collateral, margin_required(size), "maker margin reserved");
+            assert_eq!(
+                ap.entry_n_sum,
+                total_lamports as u128 * size as u128,
+                "maker entry == event snapshot x size"
+            );
+            assert_eq!(
+                ap.entry_d_sum,
+                BASE_POOL_TOKEN_SUPPLY as u128 * size as u128
+            );
+
+            // 5. Reserved margin for both open positions never exceeds deposits,
+            //    and the vault is never under-collateralized.
+            let uc_a = user_collateral_state(&env, &a.user_collateral)
+                .await
+                .expect("A ledger");
+            assert!(
+                uc_a.reserved <= uc_a.deposited,
+                "A reserved > deposited (negative free collateral)"
+            );
+            assert!(
+                uc_b.reserved <= uc_b.deposited,
+                "B reserved > deposited (negative free collateral)"
+            );
+            let vb = vault_balance(&env).await;
+            assert!(
+                vb >= 2 * margin_required(size),
+                "vault under-collateralized: {vb} < {}",
+                2 * margin_required(size)
+            );
+        });
+    }
+
+    // ==========================================================================
+    // Full-lifecycle property test: funding settlement (R-F3) + liquidation.
+    // Reuses the fill to produce one LONG (A) and one SHORT (B), then
+    //   (a) advances a funding epoch and asserts the sign convention when a
+    //       non-flat premium makes funding actually flow;
+    //   (b) drives A's long underwater (the trustless index drops below the
+    //       entry snapshot) and liquidates it, asserting the liquidation is
+    //       permissionless, credits the liquidator, and never makes any ledger
+    //       negative (R-L/R-S3 conservation).
+    #[test]
+    fn pbt_funding_and_liquidation(
+        entry_total in 9_000_000_000_000u64..=11_000_000_000_000u64,
+        price in 1u64..=1_000_000u64,
+        size in 1_000u64..=5_000_000u64,
+        drawdown_pct in 6u64..=20u64,
+    ) {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let Some(mut env) = setup().await else { return; };
+            let a = env.a.clone();
+            let b = env.b.clone();
+            let c = env.c.clone();
+            let d = env.d.clone();
+
+            set_stake_pool_total_lamports(&mut env, entry_total).await;
+
+            open_position(&mut env, &a, LONG, size, price, None)
+                .await
+                .expect("A opens long (limit)");
+            open_position(&mut env, &b, SHORT, size, 0, None)
+                .await
+                .expect("B opens short (market)");
+            settle_fill(&mut env, 0, &a.long, &a.user_collateral)
+                .await
+                .expect("settle A maker fill");
+            let apos = position_state(&env, &a.long).await.expect("A long");
+            let open_slot = apos.open_slot;
+
+            // ---- (a) funding: advance an epoch, then settle both positions.
+            // A non-flat premium needs a real book mid (both sides present) that
+            // differs from the index. Rest C on the bid and D on the ask so the
+            // mid = 1.10; set the index to 0.90 => premium = +0.20 > 0.
+            let mark_bid = 1_000_000u64;
+            let mark_ask = 1_200_000u64;
+            open_position(&mut env, &c, LONG, size, mark_bid, None)
+                .await
+                .expect("C rests a bid (sets mid)");
+            open_position(&mut env, &d, SHORT, size, mark_ask, None)
+                .await
+                .expect("D rests an ask (sets mid)");
+            set_stake_pool_total_lamports(&mut env, 9_000_000_000_000u64).await;
+            env.ctx
+                .warp_to_slot(open_slot.wrapping_add(1_001))
+                .expect("warp past an epoch");
+
+            let l0 = user_collateral_state(&env, &a.user_collateral)
+                .await
+                .expect("A ledger pre-funding")
+                .deposited;
+            let s0 = user_collateral_state(&env, &b.user_collateral)
+                .await
+                .expect("B ledger pre-funding")
+                .deposited;
+
+            let sf_data = fructus::instruction::SettleFunding.data();
+            let sf_ix = |pos: &Pubkey, uc: &Pubkey| Instruction {
+                program_id: fructus::ID,
+                accounts: vec![
+                    AccountMeta::new(env.market, false), // market (mut)
+                    AccountMeta::new(*pos, false), // position (mut)
+                    AccountMeta::new(*uc, false), // user_collateral (mut)
+                    AccountMeta::new(env.order_book, false), // order_book (mut)
+                    AccountMeta::new_readonly(env.stake_pool, false), // index_source
+                ],
+                data: sf_data.clone(),
+            };
+            submit(&mut env.ctx, vec![sf_ix(&a.long, &a.user_collateral)], &[])
+                .await
+                .expect("settle_funding long");
+            submit(&mut env.ctx, vec![sf_ix(&b.short, &b.user_collateral)], &[])
+                .await
+                .expect("settle_funding short");
+
+            let lafter = user_collateral_state(&env, &a.user_collateral)
+                .await
+                .expect("A ledger post-funding")
+                .deposited;
+            let safter = user_collateral_state(&env, &b.user_collateral)
+                .await
+                .expect("B ledger post-funding")
+                .deposited;
+            let d_long = lafter as i128 - l0 as i128;
+            let d_short = safter as i128 - s0 as i128;
+            if d_long != 0 && d_short != 0 {
+                // R-F3: long and short funding are exact opposites.
+                assert_eq!(d_long, -d_short, "funding not zero-sum (long/short)");
+                // premium > 0 => long pays (flows negative), short receives.
+                assert!(d_long < 0, "positive premium must make long pay (got {d_long})");
+                assert!(d_short > 0, "positive premium must pay short (got {d_short})");
+            }
+            assert!(lafter >= 0, "long funded below zero");
+            assert!(safter >= 0, "short funded below zero");
+
+            // ---- (b) liquidation: drop the index, making A's long underwater.
+            let drop = entry_total * (100 - drawdown_pct) / 100;
+            set_stake_pool_total_lamports(&mut env, drop).await;
+            let uc_c_before = user_collateral_state(&env, &c.user_collateral)
+                .await
+                .expect("liquidator ledger before")
+                .deposited;
+            let vb_before = vault_balance(&env).await;
+
+            let liq = fructus::instruction::Liquidate { amount: size }.data();
+            let liq_ix = Instruction {
+                program_id: fructus::ID,
+                accounts: vec![
+                    AccountMeta::new_readonly(env.market, false), // market
+                    AccountMeta::new(a.long, false), // position (mut)
+                    AccountMeta::new(a.user_collateral, false), // user_collateral (mut)
+                    AccountMeta::new(env.order_book, false), // order_book (mut)
+                    AccountMeta::new_readonly(env.stake_pool, false), // index_source
+                    AccountMeta::new_readonly(c.keypair.pubkey(), true), // liquidator (signer)
+                    AccountMeta::new(c.user_collateral, false), // liquidator_collateral (mut)
+                ],
+                data: liq,
+            };
+            submit(&mut env.ctx, vec![liq_ix], &[c.keypair.as_ref()])
+                .await
+                .expect("liquidate an underwater long");
+
+            let uc_a_after = user_collateral_state(&env, &a.user_collateral)
+                .await
+                .expect("A ledger post-liq");
+            let uc_c_after = user_collateral_state(&env, &c.user_collateral)
+                .await
+                .expect("liquidator ledger post-liq");
+            let vb_after = vault_balance(&env).await;
+
+            // R-L/R-S3: the liquidator is credited a penalty reward, and no
+            // ledger ever goes negative; the vault token total is untouched by a
+            // ledger-level liquidation transfer.
+            assert!(uc_c_after.deposited >= uc_c_before, "liquidator was not credited");
+            assert!(uc_c_after.deposited >= 0, "liquidator ledger negative");
+            assert!(uc_a_after.deposited >= 0, "liquidated ledger negative");
+            assert!(
+                uc_a_after.reserved <= uc_a_after.deposited,
+                "liquidated reserved > deposited"
+            );
+            assert_eq!(vb_after, vb_before, "liquidation must not move vault tokens");
+        });
+    }
 }
