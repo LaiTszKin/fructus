@@ -669,13 +669,27 @@ fn apply_close_fills(
         .checked_add(notional_delta)
         .ok_or(FructusError::ArithmeticOverflow)?;
     // Capture the entry basis the closed notional is priced at (the position's
-    // avg-cost basis `entry_n_sum / entry_d_sum` at close time). Closing never
-    // changes the entry sums (D6), so this is exact — and a re-open (which
-    // RESETS the live entry sums for the new notional) leaves this pair intact,
-    // so `settle_close` prices the closed amount at its own close-time basis and
-    // the re-open never reframes it (R-S1/R-S2).
-    let new_closed_entry_n = position.entry_n_sum;
-    let new_closed_entry_d = position.entry_d_sum;
+    // avg-cost basis `entry_n_sum / entry_d_sum` at close time), then ACCUMULATE
+    // it into the closed-entry running sums as a notional-weighted harmonic-mean
+    // representation. Closing never changes the entry sums (D6), so the per-unit
+    // components are recovered exactly; a re-open (which RESETS the live entry
+    // sums for the new notional) leaves `closed_entry_*` intact, so `settle_close`
+    // prices each closed amount at its own close-time basis and the re-open never
+    // reframes it (R-S1/R-S2). The scale of `add_n`/`add_d` (any multiple) cancels
+    // in the harmonic ratio, but we use per-unit components so a single-generation
+    // close preserves the position's entry sums verbatim.
+    let live_notional = position.notional; // > 0 (handler pre-checks size <= notional)
+    let add_n = (position.entry_n_sum / live_notional as u128) as u64;
+    let add_d = (position.entry_d_sum / live_notional as u128) as u64;
+    let (new_closed_entry_n, new_closed_entry_d) = positions::accumulate_closed_entry(
+        position.closed_entry_n_sum,
+        position.closed_entry_d_sum,
+        position.closed_notional,
+        add_n,
+        add_d,
+        notional_delta,
+    )
+    .ok_or(FructusError::ArithmeticOverflow)?;
 
     position.notional = new_notional;
     position.collateral = new_collateral;

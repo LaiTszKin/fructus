@@ -213,6 +213,57 @@ pub fn apply_pnl(deposited: u64, pnl: i128) -> Option<u64> {
     }
 }
 
+/// Accumulate a newly-closed amount `q` (at per-unit entry-basis components
+/// `add_n`/`add_d`) into the closed-entry running sums (R-S2, R-S1).
+///
+/// `settle_close` prices the pending `closed_notional` in a single
+/// `pnl(closed_entry_*, ..., closed_notional)` call, so the closed-entry running
+/// sums must be a representation in which each closed generation is realized at
+/// **its own** entry basis — not an average that a re-open could reframe. This is
+/// the **notional-weighted harmonic mean** of the per-generations' entry rates:
+///
+/// ```text
+/// closed_entry_n_sum / closed_entry_d_sum == closed_notional / Σ (closed_i / rate_i)
+/// ```
+///
+/// i.e. `pnl(closed_entry_*, cur, closed_notional) == Σ_i pnl(closed_i's basis)`.
+/// A re-open resets the LIVE `entry_*` but never touches this pair, so a prior
+/// closed amount's basis is never reframed (R-S1/R-S2).
+///
+/// `cur_n_sum` / `cur_d_sum` are the current closed-entry running sums (with the
+/// invariant `cur_n_sum == cur_notional * S_den`, `S_den` being the running
+/// product of per-generation rate numerators), `cur_notional` the current
+/// `closed_notional`, `q` the amount being closed now, and `add_n`/`add_d` the
+/// per-unit entry-basis (numerator/denominator) of the amount being closed (the
+/// position's avg-cost basis at close time). `None` only on `u128` overflow.
+/// Because the scale of `add_n`/`add_d` cancels in the rate ratio, and a
+/// single-generation close is scaled by `q` back to the position's entry sums,
+/// the closed-entry sums stay consistent with the `Σ` entry-basis convention.
+pub fn accumulate_closed_entry(
+    cur_n_sum: u128,
+    cur_d_sum: u128,
+    cur_notional: u64,
+    add_n: u64,
+    add_d: u64,
+    q: u64,
+) -> Option<(u128, u128)> {
+    // S = Σ (closed_i / rate_i) as a fraction S_num / S_den, with the invariant
+    // cur_n_sum == cur_notional * S_den, so S_den = cur_n_sum / cur_notional.
+    let (s_num, s_den) = if cur_notional == 0 {
+        (0u128, 1u128)
+    } else {
+        (cur_d_sum, cur_n_sum / cur_notional as u128)
+    };
+    // S' = S + q * (add_d / add_n) = (s_num*add_n + q*add_d*s_den) / (s_den*add_n).
+    let s_den_new = s_den.checked_mul(add_n as u128)?;
+    let s_num_new = s_num
+        .checked_mul(add_n as u128)?
+        .checked_add((q as u128).checked_mul(add_d as u128)?.checked_mul(s_den)?)?;
+    let new_notional = (cur_notional as u128).checked_add(q as u128)?;
+    let n_new = new_notional.checked_mul(s_den_new)?;
+    Some((n_new, s_num_new))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
