@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 3995f75f5192c1c7c11e2d88081197e2f22b2930d1f8264ab22dcf42e3f2f5fd # shrinks to collateral = 0, pnl_value = 0, notional = 10494819408152444453, bps = 17577
+cc 88052b1a0fe7a9a5fd5e650eac1c1d18ee41a502d30c2d3d010879ce1a65fade # shrinks to r1 = 5240220, r2 = 1000000, cur = 17113354, amt1 = 58344544, amt2 = 1000000, im = 2
