@@ -38,7 +38,7 @@ import {
 
 test("pinned payload sizes match the on-chain program", () => {
   assert.equal(PERP_MARKET_LEN, 197);
-  assert.equal(POSITION_LEN, 138);
+  assert.equal(POSITION_LEN, 170);
   assert.equal(USER_COLLATERAL_LEN, 17);
   assert.equal(YIELD_ORACLE_LEN, 97);
   assert.equal(ORDER_LEN, 64);
@@ -79,7 +79,7 @@ test("PerpMarket offsets sum to LEN 197", () => {
   assert.equal(o.fundingAccumulator, 180);
 });
 
-test("Position offsets sum to LEN 138", () => {
+test("Position offsets sum to LEN 170", () => {
   const o = Position;
   const order: [number, number][] = [
     [o.market, 32],
@@ -91,6 +91,8 @@ test("Position offsets sum to LEN 138", () => {
     [o.collateral, 8],
     [o.lastFundingEpoch, 8],
     [o.closedNotional, 8],
+    [o.closedEntryN, 16],
+    [o.closedEntryD, 16],
     [o.openSlot, 8],
     [o.bump, 1],
   ];
@@ -101,6 +103,9 @@ test("Position offsets sum to LEN 138", () => {
   }
   assert.equal(cursor, POSITION_LEN);
   assert.equal(o.closedNotional, 121);
+  assert.equal(o.closedEntryN, 129);
+  assert.equal(o.closedEntryD, 145);
+  assert.equal(o.openSlot, 161);
 });
 
 test("UserCollateral and YieldOracle offsets", () => {
@@ -206,6 +211,10 @@ test("decodePosition reads the closed_notional + entry sums", () => {
   buf.writeBigUInt64LE(1_000_000n, D + Position.collateral);
   buf.writeBigUInt64LE(42n, D + Position.lastFundingEpoch);
   buf.writeBigUInt64LE(900_000n, D + Position.closedNotional);
+  // closed-entry basis (u128 LE).
+  const m = 0xcafebabe12345678n;
+  for (let i = 0; i < 16; i++) buf[D + Position.closedEntryN + i] = Number((m >> BigInt(8 * i)) & 0xffn);
+  for (let i = 0; i < 16; i++) buf[D + Position.closedEntryD + i] = Number((m >> BigInt(8 * i)) & 0xffn);
   buf.writeBigUInt64LE(7n, D + Position.openSlot);
   buf[D + Position.bump] = 200;
 
@@ -217,6 +226,8 @@ test("decodePosition reads the closed_notional + entry sums", () => {
   assert.equal(p.collateral, 1_000_000n);
   assert.equal(p.lastFundingEpoch, 42n);
   assert.equal(p.closedNotional, 900_000n);
+  assert.equal(p.closedEntryN, m);
+  assert.equal(p.closedEntryD, m);
   assert.equal(p.openSlot, 7n);
   assert.equal(p.bump, 200);
 });

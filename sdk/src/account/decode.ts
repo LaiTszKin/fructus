@@ -94,6 +94,10 @@ export interface PositionState {
   collateral: bigint;
   lastFundingEpoch: bigint;
   closedNotional: bigint;
+  /** Entry basis (numerator) carried by `closedNotional`, captured at close time. */
+  closedEntryN: bigint;
+  /** Entry basis (denominator) carried by `closedNotional`, captured at close time. */
+  closedEntryD: bigint;
   openSlot: bigint;
   bump: number;
 }
@@ -113,6 +117,8 @@ export function decodePosition(data: Buffer | null): PositionState | null {
     collateral: data.readBigUInt64LE(d + Position.collateral),
     lastFundingEpoch: data.readBigUInt64LE(d + Position.lastFundingEpoch),
     closedNotional: data.readBigUInt64LE(d + Position.closedNotional),
+    closedEntryN: readU128LE(data, d + Position.closedEntryN),
+    closedEntryD: readU128LE(data, d + Position.closedEntryD),
     openSlot: data.readBigUInt64LE(d + Position.openSlot),
     bump: data[d + Position.bump],
   };

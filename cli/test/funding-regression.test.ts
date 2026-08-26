@@ -49,6 +49,8 @@ function longPosition(): PositionState {
     collateral: 0n,
     lastFundingEpoch: 0n,
     closedNotional: 0n,
+    closedEntryN: 0n,
+    closedEntryD: 0n,
     openSlot: 0n,
     bump: 0,
   };

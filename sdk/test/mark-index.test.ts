@@ -59,6 +59,8 @@ test("expectedFundingPayment mirrors the settle_funding pipeline", () => {
     collateral: 1_000_000n,
     lastFundingEpoch: 0n,
     closedNotional: 0n,
+    closedEntryN: 0n,
+    closedEntryD: 0n,
     openSlot: 0n,
     bump: 1,
   };

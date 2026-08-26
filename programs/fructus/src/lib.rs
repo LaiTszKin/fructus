@@ -543,9 +543,11 @@ fn drain_events(
 /// * Entry running sums accumulate the **fill-time snapshot**
 ///   (`entry_total_lamports` / `entry_pool_token_supply`) weighted by each
 ///   fill's size (D6). A closed position (`notional == 0`, retained account)
-///   **re-opens**: the sums are reset to the first fill's weighted snapshot and
-///   `open_slot` becomes the current slot (FR-2/FR-5); a live position keeps
-///   its `open_slot` and accumulates.
+///   **re-opens**: the sums are reset to the first fill's weighted snapshot,
+///   `open_slot` becomes the current slot (FR-2/FR-5), and `last_funding_epoch`
+///   is re-based to the re-open epoch (R-F5: funding must not accrue over the
+///   closed interval, where notional was 0); a live position keeps its
+///   `open_slot` and accumulates.
 /// * Margin is reserved incrementally: `UserCollateral.reserved` grows by the
 ///   `margin_required` delta of the new notional (ceiling, D11), gated by the
 ///   free-collateral seam (`InsufficientFreeCollateral`, REQ-7).
@@ -560,6 +562,7 @@ fn apply_open_fills(
     entry_total_lamports: u64,
     entry_pool_token_supply: u64,
     now_slot: u64,
+    funding_epoch_slots: u64,
 ) -> Result<()> {
     if fills.is_empty() {
         return Ok(());
@@ -608,6 +611,10 @@ fn apply_open_fills(
     position.collateral = new_collateral;
     if reopening {
         position.open_slot = now_slot;
+        // Re-base `last_funding_epoch` to the re-open epoch so a reopened
+        // position only accrues funding over epochs it actually held notional —
+        // never the closed interval in which `notional == 0` (R-F5).
+        position.last_funding_epoch = funding::funding_epoch(now_slot, funding_epoch_slots);
     }
     user_collateral.reserved = new_reserved;
     Ok(())
@@ -661,10 +668,20 @@ fn apply_close_fills(
         .closed_notional
         .checked_add(notional_delta)
         .ok_or(FructusError::ArithmeticOverflow)?;
+    // Capture the entry basis the closed notional is priced at (the position's
+    // avg-cost basis `entry_n_sum / entry_d_sum` at close time). Closing never
+    // changes the entry sums (D6), so this is exact — and a re-open (which
+    // RESETS the live entry sums for the new notional) leaves this pair intact,
+    // so `settle_close` prices the closed amount at its own close-time basis and
+    // the re-open never reframes it (R-S1/R-S2).
+    let new_closed_entry_n = position.entry_n_sum;
+    let new_closed_entry_d = position.entry_d_sum;
 
     position.notional = new_notional;
     position.collateral = new_collateral;
     position.closed_notional = new_closed_notional;
+    position.closed_entry_n_sum = new_closed_entry_n;
+    position.closed_entry_d_sum = new_closed_entry_d;
     user_collateral.reserved = new_reserved;
     Ok(())
 }
@@ -1436,6 +1453,7 @@ pub mod fructus {
                 rate.total_lamports,
                 rate.pool_token_supply,
                 now_slot,
+                ctx.accounts.market.funding_epoch_slots,
             )?;
             position.exit(&crate::ID)?;
             user_collateral.exit(&crate::ID)?;
@@ -1634,6 +1652,7 @@ pub mod fructus {
             event.entry_total_lamports,
             event.entry_pool_token_supply,
             now_slot,
+            market.funding_epoch_slots,
         )?;
 
         position.exit(&crate::ID)?;
@@ -1688,6 +1707,8 @@ pub mod fructus {
         position.collateral = 0;
         position.last_funding_epoch = 0;
         position.closed_notional = 0;
+        position.closed_entry_n_sum = 0;
+        position.closed_entry_d_sum = 0;
         position.open_slot = 0;
         position.exit(&crate::ID)?;
         Ok(())
@@ -1697,12 +1718,16 @@ pub mod fructus {
     /// a position has closed (issue #7, R-S2/R-S3).
     ///
     /// `close_position` is lifecycle-only (D4): it reduces `notional`, releases
-    /// margin, and records the closed amount in `Position.closed_notional` but
-    /// settles nothing. `settle_close` settles that notional against the market's
-    /// live stake-pool index (`positions::pnl`, trustless via the entry running
-    /// sums) into the user's `UserCollateral.deposited` and resets
-    /// `closed_notional` to `0`. It depends **only** on `exchange.rs` data (the
-    /// entry sums + the current pool read) — never the mark oracle (R-S2).
+    /// margin, and records the closed amount in `Position.closed_notional` (and
+    /// its entry basis in `closed_entry_n_sum`/`closed_entry_d_sum`) but settles
+    /// nothing. `settle_close` settles that notional against its **close-time**
+    /// entry basis (`positions::pnl`, trustless via the recorded closed-entry
+    /// running sums) against the market's live stake-pool index into the user's
+    /// `UserCollateral.deposited`, then resets `closed_notional` and the
+    /// closed-entry sums to `0`. It depends **only** on `exchange.rs` data — the
+    /// recorded closed-entry sums + the current pool read — never the mark
+    /// oracle (R-S2). A re-open (which resets the live entry sums) therefore
+    /// never reframes the pending closed-notional PnL (R-S1).
     ///
     /// * `closed_notional == 0` is an idempotent no-op (R-S3).
     /// * A positive PnL credits the ledger; a negative PnL debits it via
@@ -1733,8 +1758,8 @@ pub mod fructus {
 
         let rate = read_stake_pool(&ctx.accounts.index_source)?;
         let pnl = positions::pnl(
-            position.entry_n_sum,
-            position.entry_d_sum,
+            position.closed_entry_n_sum,
+            position.closed_entry_d_sum,
             rate.total_lamports,
             rate.pool_token_supply,
             closed,
@@ -1745,6 +1770,8 @@ pub mod fructus {
             .ok_or(FructusError::ArithmeticOverflow)?;
         ctx.accounts.user_collateral.deposited = new_deposited;
         position.closed_notional = 0;
+        position.closed_entry_n_sum = 0;
+        position.closed_entry_d_sum = 0;
         Ok(())
     }
 
@@ -1950,14 +1977,27 @@ pub mod fructus {
             .ok_or(FructusError::ArithmeticOverflow)?;
         ctx.accounts.user_collateral.reserved = new_reserved;
 
-        // Credit the liquidator reward to their collateral ledger (R-L3).
+        // Credit the liquidator reward to their collateral ledger (R-L3). The
+        // reward is a transfer OUT OF the victim's released margin (`consumed`,
+        // which is `>= reward` by apply_liquidation's `remaining + reward <=
+        // position_collateral` bound), so the victim's `deposited` is debited by
+        // exactly `reward`. Σ `deposited` across victim + liquidator is therefore
+        // conserved and the vault is never over-issued (a liquidation must NOT
+        // mint collateral).
         let new_liquidator_deposited = ctx
             .accounts
             .liquidator_collateral
             .deposited
             .checked_add(reward)
             .ok_or(FructusError::ArithmeticOverflow)?;
+        let new_victim_deposited = ctx
+            .accounts
+            .user_collateral
+            .deposited
+            .checked_sub(reward)
+            .ok_or(FructusError::ArithmeticOverflow)?;
         ctx.accounts.liquidator_collateral.deposited = new_liquidator_deposited;
+        ctx.accounts.user_collateral.deposited = new_victim_deposited;
         Ok(())
     }
 }
@@ -2889,6 +2929,8 @@ mod handlers_tests {
             collateral,
             last_funding_epoch: 0,
             closed_notional: 0,
+            closed_entry_n_sum: 0,
+            closed_entry_d_sum: 0,
             open_slot,
             bump: 0,
         }
@@ -2927,6 +2969,7 @@ mod handlers_tests {
             1_000_000_000,
             1_000_000,
             7,
+            100,
         )
         .unwrap();
         assert_eq!(pos.notional, 3_000_000);
@@ -2950,7 +2993,7 @@ mod handlers_tests {
         // prior life; a re-open resets them (FR-2/FR-5).
         let mut pos = position(0, 999, 888, 0, 1);
         let mut uc = user_collateral(1_000_000, 0);
-        apply_open_fills(&mut pos, &mut uc, 1_000, &[fill(5)], 100, 10, 42).unwrap();
+        apply_open_fills(&mut pos, &mut uc, 1_000, &[fill(5)], 100, 10, 42, 100).unwrap();
         assert_eq!(pos.notional, 5);
         assert_eq!(pos.entry_n_sum, 500, "entry := event snapshot × size");
         assert_eq!(pos.entry_d_sum, 50);
@@ -2966,7 +3009,7 @@ mod handlers_tests {
         let collateral = positions::margin_required(100, 1_000).unwrap();
         let mut pos = position(100, 1_000, 100, collateral, 1);
         let mut uc = user_collateral(1_000_000, collateral);
-        apply_open_fills(&mut pos, &mut uc, 1_000, &[fill(50)], 100, 10, 99).unwrap();
+        apply_open_fills(&mut pos, &mut uc, 1_000, &[fill(50)], 100, 10, 99, 100).unwrap();
         assert_eq!(pos.notional, 150);
         assert_eq!(pos.entry_n_sum, 1_000 + 100 * 50);
         assert_eq!(pos.entry_d_sum, 100 + 10 * 50);
@@ -2994,6 +3037,7 @@ mod handlers_tests {
             1_000_000_000,
             1_000_000,
             5,
+            100,
         )
         .expect_err("reserving beyond free collateral must fail");
         assert_eq!(err, FructusError::InsufficientFreeCollateral.into());
@@ -3009,7 +3053,7 @@ mod handlers_tests {
     fn open_fills_noop_when_no_fills() {
         let mut pos = position(0, 0, 0, 0, 0);
         let mut uc = user_collateral(0, 0);
-        apply_open_fills(&mut pos, &mut uc, 1_000, &[], 0, 0, 5).unwrap();
+        apply_open_fills(&mut pos, &mut uc, 1_000, &[], 0, 0, 5, 100).unwrap();
         assert_eq!(pos.notional, 0);
         assert_eq!(pos.entry_n_sum, 0);
         assert_eq!(uc.reserved, 0);
@@ -3089,7 +3133,7 @@ mod handlers_tests {
 
         let mut pos = position(0, 0, 0, 0, 0);
         let mut uc = user_collateral(1_000_000, 0);
-        apply_open_fills(&mut pos, &mut uc, 10_000, &fills, 100, 200, 5).unwrap();
+        apply_open_fills(&mut pos, &mut uc, 10_000, &fills, 100, 200, 5, 100).unwrap();
         assert_eq!(pos.notional, 3);
         assert_eq!(pos.entry_n_sum, 300);
         assert_eq!(pos.entry_d_sum, 600);
@@ -3402,6 +3446,7 @@ mod handlers_tests {
             event.entry_total_lamports,
             event.entry_pool_token_supply,
             77,
+            100,
         )
         .unwrap();
         assert_eq!(pos.notional, 1_000_000);
@@ -3458,6 +3503,7 @@ mod handlers_tests {
                     entry_total_lamports,
                     entry_pool_token_supply,
                     now_slot,
+                    100,
                 )
                 .unwrap();
                 prop_assert_eq!(position.notional, total, "notional accumulates the fills");
@@ -3494,6 +3540,7 @@ mod handlers_tests {
                     entry_total_lamports,
                     entry_pool_token_supply,
                     now_slot,
+                    100,
                 )
                 .expect_err("a margin shortfall must fail the open");
                 prop_assert_eq!(err, FructusError::InsufficientFreeCollateral.into());
@@ -3670,9 +3717,9 @@ mod handlers_tests {
             let mut uc = user_collateral(deposited, 0);
 
             if c_sum <= deposited {
-                apply_open_fills(&mut long_pos, &mut uc, initial_margin_bps, &long_fill, 100, 100, 1)
+                apply_open_fills(&mut long_pos, &mut uc, initial_margin_bps, &long_fill, 100, 100, 1, 100)
                     .unwrap();
-                apply_open_fills(&mut short_pos, &mut uc, initial_margin_bps, &short_fill, 200, 100, 1)
+                apply_open_fills(&mut short_pos, &mut uc, initial_margin_bps, &short_fill, 200, 100, 1, 100)
                     .unwrap();
                 prop_assert_eq!(long_pos.collateral, c_long);
                 prop_assert_eq!(short_pos.collateral, c_short);
@@ -3698,6 +3745,7 @@ mod handlers_tests {
                         100,
                         100,
                         1,
+                        100,
                     );
                     prop_assert_eq!(r, Err(FructusError::InsufficientFreeCollateral.into()));
                 } else {
@@ -3709,6 +3757,7 @@ mod handlers_tests {
                         100,
                         100,
                         1,
+                        100,
                     )
                     .unwrap();
                     let r = apply_open_fills(
@@ -3719,6 +3768,7 @@ mod handlers_tests {
                         200,
                         100,
                         1,
+                        100,
                     );
                     prop_assert_eq!(
                         r,

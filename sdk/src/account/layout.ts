@@ -33,8 +33,8 @@ export const PerpMarket = {
   bump: 196,
 } as const;
 
-// --- Position (borsh `#[account]`), payload LEN = 138 -----------------------
-export const POSITION_LEN = 138;
+// --- Position (borsh `#[account]`), payload LEN = 170 -----------------------
+export const POSITION_LEN = 170;
 export const Position = {
   market: 0,
   owner: 32,
@@ -45,8 +45,10 @@ export const Position = {
   collateral: 105,
   lastFundingEpoch: 113,
   closedNotional: 121,
-  openSlot: 129,
-  bump: 137,
+  closedEntryN: 129,
+  closedEntryD: 145,
+  openSlot: 161,
+  bump: 169,
 } as const;
 
 // --- UserCollateral (borsh `#[account]`), payload LEN = 17 ------------------

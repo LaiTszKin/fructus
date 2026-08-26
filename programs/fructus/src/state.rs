@@ -347,7 +347,21 @@ pub struct Position {
     /// size here (it does NOT settle PnL); a permissionless `settle_close`
     /// realizes the **signed** PnL over this notional into
     /// `UserCollateral.deposited` and resets it to `0` (R-S1, R-S2/S3).
+    ///
+    /// `closed_entry_n_sum` / `closed_entry_d_sum` capture the entry basis the
+    /// closed notional was priced at when it was closed (see below).
     pub closed_notional: u64,
+    /// `Σ` entry numerator carried by `closed_notional` (issue #7).
+    ///
+    /// `settle_close` realizes the closed notional's PnL against the entry basis
+    /// in effect **when it was closed**, recorded here by `apply_close_fills`.
+    /// A re-open resets the live `entry_n_sum`/`entry_d_sum` (fresh basis for the
+    /// new notional) but must NEVER reframe the pending closed-notional basis:
+    /// this pair is what keeps the closed amount priced at its own (close-time)
+    /// entry rate across a re-open (R-S2).
+    pub closed_entry_n_sum: u128,
+    /// `Σ` entry denominator carried by `closed_notional` (see above).
+    pub closed_entry_d_sum: u128,
     /// Slot at which the position was (re)created: the fill slot for inline
     /// taker opens, or the settlement slot for maker re-opens via `settle_fill`.
     pub open_slot: u64,
@@ -359,8 +373,8 @@ impl Position {
     /// Serialized size of the account payload (excluding the 8-byte discriminator).
     ///
     /// Packed borsh layout:
-    /// `32 + 32 + 1 + 8 + 16 + 16 + 8 + 8 + 8 + 8 + 1 = 138`.
-    pub const LEN: usize = 32 + 32 + 1 + 8 + 16 + 16 + 8 + 8 + 8 + 8 + 1;
+    /// `32 + 32 + 1 + 8 + 16 + 16 + 8 + 8 + 8 + 16 + 16 + 8 + 1 = 170`.
+    pub const LEN: usize = 32 + 32 + 1 + 8 + 16 + 16 + 8 + 8 + 8 + 16 + 16 + 8 + 1;
 }
 
 /// Pure staleness predicate (saturating, overflow-safe for any `u64` inputs).
@@ -471,12 +485,14 @@ mod tests {
             collateral: 100_000,
             last_funding_epoch: 42,
             closed_notional: 900_000,
+            closed_entry_n_sum: 555_555_555_555,
+            closed_entry_d_sum: 444_444_444_444,
             open_slot: 7,
             bump: 255,
         };
         assert_eq!(borsh::to_vec(&pos).unwrap().len(), Position::LEN);
         // Pin the documented size so a field/constant edit cannot drift it.
-        assert_eq!(Position::LEN, 138);
+        assert_eq!(Position::LEN, 170);
     }
 
     /// `PerpMarket` is a borsh `#[account]`; its `LEN` must equal the packed

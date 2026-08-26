@@ -1460,6 +1460,8 @@ proptest! {
             collateral: 0,
             last_funding_epoch: 0,
             closed_notional: 0,
+            closed_entry_n_sum: 0,
+            closed_entry_d_sum: 0,
             open_slot: 0,
             bump: 255,
         };
@@ -1483,6 +1485,7 @@ proptest! {
             lamports,
             supply,
             now_slot,
+            100,
         );
         match result {
             Err(e) => {
