@@ -4,7 +4,7 @@
 
 | Layer | Tool | Location |
 | --- | --- | --- |
-| Property-based (pure logic) | `proptest` | `programs/fructus/src/tests.rs` |
+| Property-based (pure logic) | `proptest` | `programs/fructus/src/tests.rs` + per-module `#[cfg(test)]` |
 | Signature verification (e2e) | mock instruction sysvar | `programs/fructus/src/tests.rs` |
 | Cross-language vector | `node:test` | `publisher/test/message.test.ts` |
 | On-chain stateful fuzz | Trident | `trident-tests/fuzz_0/test_fuzz.rs` |
@@ -12,7 +12,8 @@
 ## Commands
 
 ```bash
-cargo test --workspace                    # full Rust suite (31 tests)
+cargo test --workspace                    # full Rust suite (lib invariants + CPI tests)
+cargo test --workspace --lib              # lib-only invariants (215 tests)
 cargo test --workspace <test_name>        # single test
 cd publisher && npm test                  # TS suite (8 tests)
 cd trident-tests && cargo run --bin fuzz_0   # fuzz (1000 iters × 100 flows)

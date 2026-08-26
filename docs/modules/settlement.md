@@ -44,7 +44,11 @@ margin, and records the closed amount in `Position.closed_notional` (plus its
 settles nothing. `settle_close` settles that notional against the market's live
 stake-pool index — **never the mark oracle** (R-S2) — into
 `UserCollateral.deposited` and resets `closed_notional` (and `closed_entry_*`)
-to `0`:
+to `0`. `apply_close_fills` **accumulates** (not overwrites) the closed-entry
+running sums as a **notional-weighted harmonic mean** of each closed
+generation's close-time basis, so a sequence of closes interleaved with re-opens
+(before any `settle_close`) prices **each** closed amount at **its own**
+close-time basis — never the newest generation's (R-S1/R-S2):
 
 ```
 pnl        = positions::pnl(closed_entry_n_sum, closed_entry_d_sum, cur_n, cur_d, closed_notional, side)   (signed i128)
@@ -60,8 +64,9 @@ deposited' = positions::apply_pnl(deposited, pnl)                               
   settlement (R-S3). `apply_pnl` is total on a loss (never `None`).
 - **Trustless & dependency-minimal** — settlement depends only on `exchange.rs`
   data: the position's **close-time** entry basis (`closed_entry_n_sum` /
-  `closed_entry_d_sum`, captured by `apply_close_fills`) plus the **current**
-  `read_stake_pool` read, never the live entry sums (a re-open resets those).
+  `closed_entry_d_sum`, accumulated by `apply_close_fills` via
+  `positions::accumulate_closed_entry`) plus the **current** `read_stake_pool`
+  read, never the live entry sums (a re-open resets those).
   The handler binds the supplied
   `position`/`user_collateral` to the user's PDAs byte-for-byte
   (`InvalidAccountData` on mismatch) and requires `position.market == market`.

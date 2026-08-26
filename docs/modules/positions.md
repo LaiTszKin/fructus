@@ -182,10 +182,13 @@ rate_entry`, `pnl(Short)` the exact opposite).
 `Position.closed_notional` (`closed_notional += size`, in `apply_close_fills`)
 and settles nothing. Since entry running sums are left unchanged on close, the
 closed notional's PnL is still determinable from the entry index + the current
-rate; `apply_close_fills` additionally captures the **close-time** entry basis
-into `closed_entry_n_sum` / `closed_entry_d_sum`, so a re-open (which resets the
-live `entry_*`) never reframes the closed amount. `settle_close` reads
-`closed_notional` and, if `> 0`, applies:
+rate; `apply_close_fills` additionally **accumulates** the **close-time** entry
+basis into `closed_entry_n_sum` / `closed_entry_d_sum` (via
+`positions::accumulate_closed_entry`, a **notional-weighted harmonic mean** of
+each closed generation's basis), so a re-open (which resets the live `entry_*`)
+never reframes a prior closed amount, and a sequence of closes interleaved with
+re-opens prices **each** closed generation at **its own** close-time basis.
+`settle_close` reads `closed_notional` and, if `> 0`, applies:
 
 ```
 pnl        = pnl(closed_entry_n_sum, closed_entry_d_sum, cur_n, cur_d, closed_notional, side)  (signed i128)
@@ -272,8 +275,9 @@ practice: `settle_fill` promptly (or crank first to drain), and retry on
   `settle_close` owns settlement (see [settlement.md](settlement.md)).
 - **`closed_notional` is the settlement seam** — entry sums are left unchanged on
   close, so the closed notional's signed PnL is re-derivable from the entry
-  index + the current rate; `apply_close_fills` snapshots the **close-time**
-  basis into `closed_entry_*` (a re-open never reframes it); `apply_pnl` clamps
+  index + the current rate; `apply_close_fills` **accumulates** the **close-time**
+  basis into `closed_entry_*` as a notional-weighted harmonic mean (each closed
+  generation at its own basis; a re-open never reframes it); `apply_pnl` clamps
   a loss at the deposited balance.
 - **Entry sums reset on re-open** — from `notional == 0`, the new fill's
   snapshot replaces the sums, `open_slot` is reset to the settlement slot

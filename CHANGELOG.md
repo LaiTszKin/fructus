@@ -104,6 +104,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   property-based proof over the funding/liquidation/settlement logic; one
   confirmed CLI mark-fallback bug found and fixed (`cli/src/commands/funding.ts`).
 
+### Changed
+
+- Relocated the adversarial-review invariants out of a monolithic
+  `programs/fructus/src/review_tests.rs` into the standard per-module
+  `#[cfg(test)]` blocks (`funding.rs`/`liquidation.rs`/`positions.rs`/
+  `collateral.rs`) and `src/tests.rs` (lib-adapter level), following the repo's
+  per-module test convention. `review_tests.rs` is removed; `AGENTS.md` updated.
+
+### Fixed
+
+- `settle_close` no longer re-prices a prior closed amount at the newest
+  generation's basis: `apply_close_fills` **accumulates** each closed
+  generation's close-time entry basis into `closed_entry_*` as a
+  notional-weighted harmonic mean (`positions::accumulate_closed_entry`), so a
+  re-open between closes (before any `settle_close`) leaves each pending closed
+  notional priced at its own close-time entry basis (R-S1/R-S2).
+
 ## [0.1.0] - 2026-08-19
 
 ### Added

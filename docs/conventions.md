@@ -51,7 +51,10 @@ to build for accounts above it.
 
 ## Testing
 
-- Pure logic → `proptest` invariants in `programs/fructus/src/tests.rs`.
+- Pure logic → `proptest` invariants in `programs/fructus/src/tests.rs` and the
+  per-module `#[cfg(test)]` blocks (funding/liquidation/positions/collateral);
+  adapter-level invariants that drive the lib.rs `apply_open_fills`/
+  `apply_close_fills` helpers live in `tests.rs`.
 - Signature verification → mock instruction sysvar (`construct_instructions_data`).
 - Cross-language consistency → shared hex vector asserted in Rust + TypeScript.
 - On-chain stateful fuzzing → Trident (`trident-tests/`).

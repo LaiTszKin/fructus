@@ -27,7 +27,7 @@
 | `liquidation.rs` | Pure liquidation: equity, maintenance margin, `liquidatable`, penalty, `apply_liquidation` |
 | `ed25519.rs` | Publisher signature verification via instruction introspection |
 | `error.rs` | `FructusError` error codes |
-| `tests.rs` | Property-based + mock-sysvar integration tests |
+| `tests.rs` | Property-based + mock-sysvar integration tests, plus the lib-adapter adversarial invariants (that drive `apply_open_fills`/`apply_close_fills`); per-module `#[cfg(test)]` blocks hold each module's own invariants |
 | `tests/` | `collateral_cpi.rs` bank-style CPI tests (solana-program-test) |
 
 ## Publisher (`publisher/`)

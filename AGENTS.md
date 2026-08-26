@@ -37,7 +37,7 @@
   settlement (`exchange`), CLOB order book + mark/twap (`orderbook`), collateral vault
   (`collateral`), position lifecycle (`positions`), **funding engine (`funding`)**,
   **liquidation engine (`liquidation`)**, top-level instructions (`lib`), pure-logic
-  invariants (`tests`) + adversarial review invariants (`review_tests`)
+  invariants + adversarial review invariants (`tests`, per-module `#[cfg(test)]`)
 - `programs/fructus/tests/` — bank-style CPI integration tests (`collateral_cpi.rs`, `positions_cpi.rs`)
 - `publisher/` — off-chain TypeScript APY keeper (fetch → sign → submit)
 - `sdk/` — trader TypeScript SDK (instruction builders, typed account decoders, funding/PnL mirrors)
@@ -110,7 +110,8 @@
 ## Testing
 
 - Pure logic → `proptest` invariants in `programs/fructus/src/tests.rs` and the per-module
-  `#[cfg(test)]` (funding/liquidation/positions), plus `review_tests.rs` (adversarial).
+  `#[cfg(test)]` (funding/liquidation/positions/collateral); the adversarial-review probes live
+  in those same per-module `#[cfg(test)]` blocks and in `tests.rs`.
 - Signature verification → mock instruction sysvar (`construct_instructions_data`).
 - Cross-language consistency → shared hex vector (Rust + TS) + SDK/cli vector tests.
 - Stateful on-chain → Trident `trident-tests/`.
