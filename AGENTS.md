@@ -68,6 +68,19 @@
   collateral equal to `margin_required(notional − amount, initial_margin_bps)` and
   never create value (`remaining + reward ≤ position_collateral`). A fully
   liquidated (`notional == 0`) position holds **zero** collateral.
+- **Liquidation reward is zero-sum**: the `liquidate` handler **debits** the
+  victim's `UserCollateral.deposited` by the reward and credits the liquidator's
+  by the same amount (the reward is drawn out of the victim's released margin,
+  `reward ≤ position_collateral − remaining`), so Σ `deposited` across victim +
+  liquidator is conserved — a liquidation never mints collateral.
+- **Close is priced at its own (close-time) entry basis**: `apply_close_fills`
+  captures `closed_notional`'s basis into `closed_entry_n_sum` /
+  `closed_entry_d_sum`; `settle_close` prices it against those (never the live
+  `entry_*`, which a re-open resets). A re-open also **re-bases
+  `last_funding_epoch`** to the re-open epoch so funding never accrues over a
+  closed interval. `Position::LEN = 170`; any layout change must be mirrored in
+  `sdk/src/account/{layout,decode}.ts` + `docs/{data-models,modules/positions,
+  modules/settlement}.md`.
 - **Canonical signed message** = `sha256("fructus::update_apy" ‖ oracle ‖ apy_le ‖ version_le)`.
   Rust `update_message` and TS `updateMessage` must stay byte-identical; any change
   updates the cross-language vector test on both sides.

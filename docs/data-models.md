@@ -159,13 +159,19 @@ One PDA per `(market, user, side)`, seed
 | `collateral` | u64 | 105 | reserved margin = `margin_required(notional, initial_margin_bps)` (ceiling division) |
 | `last_funding_epoch` | u64 | 113 | last funding epoch this position was settled for (written by `settle_funding`) |
 | `closed_notional` | u64 | 121 | notional closed but not yet realized (written by `close_position`; reset by `settle_close` — R-S1) |
-| `open_slot` | u64 | 129 | (re)creation slot: fill slot (inline taker opens) or settlement slot (maker re-opens via `settle_fill`) |
-| `bump` | u8 | 137 | PDA bump |
+| `closed_entry_n_sum` | u128 | 129 | `Σ` entry numerator carried by `closed_notional` — the entry basis in effect **when it was closed**, recorded by `apply_close_fills` and reset by `settle_close`; a re-open resets the live `entry_*` but never reframes this (R-S2) |
+| `closed_entry_d_sum` | u128 | 145 | `Σ` entry denominator carried by `closed_notional` (see above) |
+| `open_slot` | u64 | 161 | (re)creation slot: fill slot (inline taker opens) or settlement slot (maker re-opens via `settle_fill`) |
+| `bump` | u8 | 169 | PDA bump |
 
-- `LEN = 138`.
+- `LEN = 170`.
 - Lazily created on first fill/settlement (payer = user/cranker) and **retained**
   after a full close; `notional == 0` means closed. A re-open resets
-  `entry_n_sum` / `entry_d_sum` / `open_slot`.
+  `entry_n_sum` / `entry_d_sum` / `open_slot` and **re-bases
+  `last_funding_epoch`** to the re-open epoch (so the reopened notional never
+  accrues funding over the closed interval), but leaves
+  `closed_entry_n_sum` / `closed_entry_d_sum` **intact** — the close-time entry
+  basis of the pending `closed_notional` (never reframed by a re-open).
 - The entry index is stored as notional-weighted running sums (exact
   average-cost accounting, no intermediate rounding); the snapshot rate
   `entry_n_sum / entry_d_sum` is computed at PnL time after a shared
@@ -177,9 +183,10 @@ One PDA per `(market, user, side)`, seed
   `UserCollateral.reserved`; no token movement on open or close.
 - `closed_notional` is the settlement seam (issue #7): a lifecycle-only
   `close_position` records closed fills here, and the permissionless
-  `settle_close` realizes their signed PnL into `UserCollateral.deposited`
-  (clamped so the vault is never insolvent) before resetting it to `0`. See
-  [modules/settlement.md](modules/settlement.md).
+  `settle_close` realizes their signed PnL (priced at the **close-time** entry
+  basis captured in `closed_entry_*`) into `UserCollateral.deposited`
+  (clamped so the vault is never insolvent) before resetting all three to `0`.
+  See [modules/settlement.md](modules/settlement.md).
 
 ## `ExchangeRate` (derived, not stored)
 
@@ -250,6 +257,8 @@ erDiagram
         u64 collateral
         u64 last_funding_epoch
         u64 closed_notional
+        u128 closed_entry_n_sum
+        u128 closed_entry_d_sum
         u64 open_slot
     }
     ExchangeRate {

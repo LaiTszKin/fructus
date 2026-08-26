@@ -39,14 +39,16 @@ that credits a profit or debits — clamped — a loss). Both are owned by
 ## `settle_close` (R-S2/R-S3)
 
 `close_position` is **lifecycle-only** (D4): it reduces `notional`, releases
-margin, and records the closed amount in `Position.closed_notional` but settles
-nothing. `settle_close` settles that notional against the market's live
+margin, and records the closed amount in `Position.closed_notional` (plus its
+**close-time** entry basis in `closed_entry_n_sum` / `closed_entry_d_sum`) but
+settles nothing. `settle_close` settles that notional against the market's live
 stake-pool index — **never the mark oracle** (R-S2) — into
-`UserCollateral.deposited` and resets `closed_notional` to `0`:
+`UserCollateral.deposited` and resets `closed_notional` (and `closed_entry_*`)
+to `0`:
 
 ```
-pnl        = positions::pnl(entry_n_sum, entry_d_sum, cur_n, cur_d, closed_notional, side)   (signed i128)
-deposited' = positions::apply_pnl(deposited, pnl)                                           (clamped)
+pnl        = positions::pnl(closed_entry_n_sum, closed_entry_d_sum, cur_n, cur_d, closed_notional, side)   (signed i128)
+deposited' = positions::apply_pnl(deposited, pnl)                                                          (clamped)
 ```
 
 - **No-op on `closed_notional == 0`** — `settle_close` returns immediately
@@ -57,8 +59,10 @@ deposited' = positions::apply_pnl(deposited, pnl)                               
   clamped so it never goes below `0`; the vault is never left insolvent by a
   settlement (R-S3). `apply_pnl` is total on a loss (never `None`).
 - **Trustless & dependency-minimal** — settlement depends only on `exchange.rs`
-  data: the position's entry running sums (recorded at fill time) plus the
-  **current** `read_stake_pool` read. The handler binds the supplied
+  data: the position's **close-time** entry basis (`closed_entry_n_sum` /
+  `closed_entry_d_sum`, captured by `apply_close_fills`) plus the **current**
+  `read_stake_pool` read, never the live entry sums (a re-open resets those).
+  The handler binds the supplied
   `position`/`user_collateral` to the user's PDAs byte-for-byte
   (`InvalidAccountData` on mismatch) and requires `position.market == market`.
 

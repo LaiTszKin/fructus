@@ -84,9 +84,13 @@ note below.
 5. Reduce `position.notional -= amount` (full `amount == notional` zeroes the
    exposure), set `position.collateral = remaining` (`== margin_required(notional
    − amount, initial_margin_bps)`), release the consumed collateral from the
-   victim's `UserCollateral.reserved`, and credit the liquidator's
-   `UserCollateral.deposited` (`liquidator_collateral`) with the reward
-   (ledger-only margin — no token movement).
+   victim's `UserCollateral.reserved`, **debit the victim's
+   `UserCollateral.deposited` by the reward** and credit the liquidator's
+   `UserCollateral.deposited` (`liquidator_collateral`) with the same amount
+   (ledger-only margin — no token movement). The reward is a **zero-sum
+   transfer out of the victim's released margin** (`consumed ≥ reward`), so
+   Σ `deposited` across victim + liquidator is conserved and the vault is never
+   over-issued — a liquidation never mints collateral.
 
 ## Partial vs full (R-L3)
 
@@ -103,7 +107,11 @@ reward   = liquidation_penalty(released, penalty_bps)               (≤ release
   `remaining == margin_required(0, _) == 0` — a closed (zero-notional) position
   holds **zero** collateral and the whole backing is released.
 - **No value created**: `remaining + reward ≤ position_collateral` always; a
-  full liquidation never leaves negative remaining collateral.
+  full liquidation never leaves negative remaining collateral. Because the
+  reward is drawn **out of** the released backing (`reward ≤ released`), the
+  `liquidate` handler debits the victim's `deposited` by the reward while
+  crediting the liquidator's — a zero-sum transfer, so the vault (Σ deposited)
+  is never over-issued.
 - `amount == 0` or `amount > notional ⇒ InvalidAmount`.
 - `maintenance_bps` is the **health** threshold (`liquidatable`), not a release
   parameter; the surviving collateral is always backed at the initial margin

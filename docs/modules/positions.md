@@ -43,15 +43,19 @@ One PDA per `(market, user, side)`, seed
 simultaneously and `close_position(side)` names its target. Payload (borsh,
 after the 8-byte discriminator): `market` (32) · `owner` (32) · `side` (1) ·
 `notional` (8) · `entry_n_sum` (16) · `entry_d_sum` (16) · `collateral` (8) ·
-`last_funding_epoch` (8) · `closed_notional` (8) · `open_slot` (8) · `bump` (1),
-`LEN = 138`. Full field-level offsets in [data-models.md](../data-models.md).
+`last_funding_epoch` (8) · `closed_notional` (8) · `closed_entry_n_sum` (16) ·
+`closed_entry_d_sum` (16) · `open_slot` (8) · `bump` (1),
+`LEN = 170`. Full field-level offsets in [data-models.md](../data-models.md).
 
 - Lazily created on first fill/settlement (payer = the user for inline taker
   fills, the settler for `settle_fill`) and **retained** after a full close;
   `notional == 0` means closed.
 - A re-open (from `notional == 0`) **resets** `entry_n_sum` / `entry_d_sum` /
-  `open_slot` — the new fill becomes the fresh entry. Same-side adds on a live
-  position accumulate the entry sums.
+  `open_slot` and **re-bases `last_funding_epoch`** to the re-open epoch — the
+  new fill becomes the fresh entry and funding never accrues over the closed
+  interval — but **leaves `closed_entry_n_sum` / `closed_entry_d_sum` intact**
+  so the pending `closed_notional` keeps its own (close-time) entry basis.
+  Same-side adds on a live position accumulate the entry sums.
 - The account is a plain borsh `#[account]` (well under the 4 KiB zero-copy
   threshold), so it declares native `u128` fields — no per-access byte
   conversion.
@@ -178,11 +182,14 @@ rate_entry`, `pnl(Short)` the exact opposite).
 `Position.closed_notional` (`closed_notional += size`, in `apply_close_fills`)
 and settles nothing. Since entry running sums are left unchanged on close, the
 closed notional's PnL is still determinable from the entry index + the current
-rate. `settle_close` reads `closed_notional` and, if `> 0`, applies:
+rate; `apply_close_fills` additionally captures the **close-time** entry basis
+into `closed_entry_n_sum` / `closed_entry_d_sum`, so a re-open (which resets the
+live `entry_*`) never reframes the closed amount. `settle_close` reads
+`closed_notional` and, if `> 0`, applies:
 
 ```
-pnl        = pnl(entry_n_sum, entry_d_sum, cur_n, cur_d, closed_notional, side)  (signed i128)
-deposited' = apply_pnl(deposited, pnl)                                           (clamped at 0)
+pnl        = pnl(closed_entry_n_sum, closed_entry_d_sum, cur_n, cur_d, closed_notional, side)  (signed i128)
+deposited' = apply_pnl(deposited, pnl)                                                         (clamped at 0)
 ```
 
 `apply_pnl` is the pure ledger transition that both `settle_close` and
@@ -265,10 +272,13 @@ practice: `settle_fill` promptly (or crank first to drain), and retry on
   `settle_close` owns settlement (see [settlement.md](settlement.md)).
 - **`closed_notional` is the settlement seam** — entry sums are left unchanged on
   close, so the closed notional's signed PnL is re-derivable from the entry
-  index + the current rate; `apply_pnl` clamps a loss at the deposited balance.
+  index + the current rate; `apply_close_fills` snapshots the **close-time**
+  basis into `closed_entry_*` (a re-open never reframes it); `apply_pnl` clamps
+  a loss at the deposited balance.
 - **Entry sums reset on re-open** — from `notional == 0`, the new fill's
-  snapshot replaces the sums, and `open_slot` is reset to the settlement slot
-  (maker re-opens) or the fill slot (inline taker opens).
+  snapshot replaces the sums, `open_slot` is reset to the settlement slot
+  (maker re-opens) or the fill slot (inline taker opens), and
+  `last_funding_epoch` is re-based to the re-open epoch.
 - **`price == 0` is the market signal** for `open_position`, so it has no
   `InvalidPrice` path (unlike `place_limit_order`).
 - **Fill events carry the fill-time snapshot, not the settlement-time rate** —
