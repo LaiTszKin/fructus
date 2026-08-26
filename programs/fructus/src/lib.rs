@@ -2454,9 +2454,6 @@ pub struct Liquidate<'info> {
 mod tests;
 
 #[cfg(test)]
-mod review_tests;
-
-#[cfg(test)]
 mod handlers_tests {
     use super::*;
     use proptest::prelude::*;

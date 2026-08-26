@@ -371,4 +371,304 @@ mod tests {
             assert!(remaining + reward <= position_collateral);
         }
     }
+
+    // ==== Adversarial-review invariants for liquidation.rs (moved from review_tests.rs) ====
+    // These independently pin the liquidation contract (liquidatable, penalty,
+    // apply_liquidation) across the FULL domain, so the implementation's own
+    // in-file tests (which share its assumptions) cannot mask a counterexample.
+
+    // Domain band constant (from the design doc): notional is a USDC amount
+    // (microunits) far below u64::MAX.
+    const NOTIONAL_MAX: u64 = 1_000_000_000_000; // 1e12 (design band)
+
+    proptest! {
+        // R-L2: strict '<' — equity == maintenance is healthy, just below is
+        // liquidatable; for a wide notional/bps band (NOT only the small band the
+        // implementation chose).
+        #[test]
+        fn liquidatable_strict_inequality_boundary(
+            notional in 1u64..NOTIONAL_MAX,
+            bps in 1u16..=10_000,
+        ) {
+            let maintenance = maintenance_margin(notional, bps).unwrap();
+            // equity == maintenance => NOT liquidatable.
+            prop_assert_eq!(liquidatable(maintenance, 0, notional, bps), Some(false),
+                "equity==maintenance is healthy (strict <)");
+            // equity == maintenance - 1 => liquidatable.
+            let below = maintenance - 1;
+            prop_assert_eq!(liquidatable(below, 0, notional, bps), Some(true),
+                "equity just below maintenance is liquidatable");
+            // equity == maintenance + 1 => not liquidatable.
+            let above = maintenance + 1;
+            prop_assert_eq!(liquidatable(above, 0, notional, bps), Some(false),
+                "equity just above maintenance is healthy");
+        }
+
+        #[test]
+        fn liquidatable_zero_notional_never_liquidatable(
+            collateral in any::<u64>(),
+            pnl_value in any::<i128>(),
+            bps in any::<u16>(),
+        ) {
+            prop_assert_eq!(liquidatable(collateral, pnl_value, 0, bps), Some(false),
+                "zero-notional position is never liquidatable");
+        }
+
+        #[test]
+        fn liquidatable_health_equals_collateral_plus_pnl(
+            collateral in any::<u64>(),
+            pnl_value in any::<i128>(),
+            notional in 1u64..NOTIONAL_MAX,
+            bps in 0u16..=10_000,
+        ) {
+            let e = equity(collateral, pnl_value);
+            let m = maintenance_margin(notional, bps);
+            // `liquidatable` MUST be exactly `equity < maintenance` (with the
+            // zero-notional short-circuit ahead of it). Compare the branch precisely.
+            match m {
+                Some(mm) => {
+                    let expected = (e as i128) < (mm as i128);
+                    prop_assert_eq!(liquidatable(collateral, pnl_value, notional, bps), Some(expected),
+                        "liquidatable must be exactly equity < maintenance");
+                }
+                None => {
+                    // maintenance overflow (never on the u64 x u16 domain).
+                    prop_assert_eq!(liquidatable(collateral, pnl_value, notional, bps), None);
+                }
+            }
+        }
+
+        #[test]
+        fn liquidatable_never_panics_or_none_on_total_domain(
+            collateral in any::<u64>(),
+            pnl_value in any::<i128>(),
+            notional in any::<u64>(),
+            bps in 0u16..=10_000,
+        ) {
+            // `maintenance_margin` is total on u64 x u16 (no u128 overflow), so
+            // `liquidatable` must return `Some(..)` for EVERY input, never `None`
+            // and never panic.
+            prop_assert!(liquidatable(collateral, pnl_value, notional, bps).is_some());
+        }
+    }
+
+    proptest! {
+        // R-L3 penalty exactness: `ceil(collateral*bps/10000)` for a wide band.
+        #[test]
+        fn liquidation_penalty_exact_ceiling_formula(
+            collateral in any::<u64>(),
+            penalty_bps in 0u16..=10_000,
+        ) {
+            let exact = (collateral as u128)
+                .checked_mul(penalty_bps as u128)
+                .unwrap()
+                .checked_add(9_999)
+                .unwrap();
+            let expected = (exact / 10_000) as u64;
+            prop_assert_eq!(liquidation_penalty(collateral, penalty_bps), Some(expected),
+                "penalty must be ceil(collateral*bps/10000)");
+        }
+
+        #[test]
+        fn liquidation_penalty_bounds_and_extremes(
+            collateral in any::<u64>(),
+            penalty_bps in 0u16..=10_000,
+        ) {
+            let p = liquidation_penalty(collateral, penalty_bps).unwrap();
+            prop_assert!(p <= collateral, "penalty bounded by collateral");
+            if penalty_bps == 0 { prop_assert_eq!(p, 0, "0 bps => 0 penalty"); }
+            if penalty_bps == 10_000 { prop_assert_eq!(p, collateral, "10_000 bps => full collateral"); }
+        }
+
+        #[test]
+        fn liquidation_penalty_monotonic_full_collateral(
+            collateral in any::<u64>(),
+            bps_low in 0u16..10_000,
+        ) {
+            let bps_high = bps_low + 1;
+            let lo = liquidation_penalty(collateral, bps_low).unwrap();
+            let hi = liquidation_penalty(collateral, bps_high).unwrap();
+            prop_assert!(hi >= lo, "penalty non-decreasing in bps");
+        }
+    }
+
+    proptest! {
+        // R-L3/R-L4 apply_liquidation: never negative remaining, no value created,
+        // invalid amounts rejected, and a FULL liquidation empties the notional.
+        #[test]
+        fn apply_liquidation_preserves_collateral(
+            position_collateral in any::<u64>(),
+            notional in 1u64..NOTIONAL_MAX,
+            amount in 1u64..NOTIONAL_MAX,
+            initial_margin_bps in 1u16..=10_000,
+            maintenance_bps in 1u16..=10_000,
+            penalty_bps in 0u16..=10_000,
+        ) {
+            let amount = if amount > notional { notional } else { amount };
+            let (remaining, reward) =
+                apply_liquidation(position_collateral, notional, amount, initial_margin_bps, maintenance_bps, penalty_bps).unwrap();
+            prop_assert!(remaining >= 0, "remaining collateral never negative");
+            prop_assert!(reward >= 0, "reward never negative");
+            prop_assert!(remaining <= position_collateral, "remaining <= position collateral");
+            prop_assert!(reward <= position_collateral, "reward <= position collateral");
+            prop_assert!(remaining + reward <= position_collateral,
+                "no value created: remaining + reward <= position collateral");
+        }
+
+        #[test]
+        fn apply_liquidation_invalid_amount_rejected(
+            position_collateral in any::<u64>(),
+            notional in any::<u64>(),
+            initial_margin_bps in any::<u16>(),
+            maintenance_bps in any::<u16>(),
+            penalty_bps in any::<u16>(),
+        ) {
+            // amount == 0 => InvalidAmount regardless of everything else.
+            prop_assert_eq!(
+                apply_liquidation(position_collateral, notional, 0, initial_margin_bps, maintenance_bps, penalty_bps),
+                Err(LiquidateError::InvalidAmount)
+            );
+            // amount > notional => InvalidAmount.
+            let too_big = notional.saturating_add(1).max(1);
+            prop_assert_eq!(
+                apply_liquidation(position_collateral, notional, too_big, initial_margin_bps, maintenance_bps, penalty_bps),
+                Err(LiquidateError::InvalidAmount)
+            );
+        }
+
+        #[test]
+        fn apply_liquidation_full_releases_all_collateral(
+            notional in 1u64..NOTIONAL_MAX,
+            initial_margin_bps in 1u16..=10_000,
+            maintenance_bps in 1u16..=10_000,
+            penalty_bps in 0u16..=10_000,
+        ) {
+            // A real position is backed at the INITIAL margin ratio (state.rs
+            // invariant). A FULL liquidation (`amount == notional`) closes the
+            // position (notional -> 0), so its surviving collateral must be
+            // margin_required(0, _) == 0 — all collateral released, never leaving a
+            // negative remaining.
+            prop_assume!(maintenance_bps < initial_margin_bps);
+            let position_collateral = margin_required(notional, initial_margin_bps).unwrap();
+            let (remaining, reward) = apply_liquidation(
+                position_collateral,
+                notional,
+                notional,
+                initial_margin_bps,
+                maintenance_bps,
+                penalty_bps,
+            )
+            .unwrap();
+            prop_assert_eq!(remaining, margin_required(0, initial_margin_bps).unwrap());
+            prop_assert_eq!(remaining, 0, "full liquidation never leaves negative remaining");
+            prop_assert!(reward >= 0, "reward never negative");
+            prop_assert!(remaining + reward <= position_collateral, "no value created");
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(10_000))]
+
+        // The `liquidate` handler's zero-sum transition: releases `consumed` from
+        // the victim's `reserved`, debits the victim's `deposited` by `reward`,
+        // credits the liquidator's `deposited` by the same `reward`. For every
+        // reachable (notional, amount, im, mm, penalty) with the position backed
+        // at the INITIAL margin ratio, the reward is drawn strictly out of the
+        // victim's released margin, so Σ(victim + liquidator) deposited is
+        // conserved and the victim's ledger never underflows.
+        #[test]
+        fn liquidation_transition_conserves_and_never_underflows(
+            notional in 1u64..NOTIONAL_MAX,
+            amount in 1u64..NOTIONAL_MAX,
+            im in 1u16..=10_000,
+            mm in 1u16..=10_000,
+            penalty in 0u16..=10_000,
+            free_balance in 0u64..1_000_000_000_000u64,
+            liquidator_deposited in any::<u64>(),
+        ) {
+            let amount = if amount > notional { notional } else { amount };
+            // A real position is backed at the INITIAL margin ratio (state.rs).
+            let position_collateral = margin_required(notional, im).unwrap();
+            let (remaining, reward) =
+                apply_liquidation(position_collateral, notional, amount, im, mm, penalty).unwrap();
+
+            let consumed = position_collateral - remaining; // released collateral
+            let reserved_before = position_collateral; // single-position victim ledger
+
+            // A valid ledger: deposited = reserved + free (free >= 0), so reserved
+            // never exceeds deposited. Both operands are bounded (<= ~2e12 < u64::MAX).
+            let victim_deposited = reserved_before.checked_add(free_balance).unwrap();
+            let victim_after = victim_deposited - reward; // handler uses checked_sub
+            let reserved_after = reserved_before - consumed;
+            // The handler credits the liquidator via `checked_add`; a reward that
+            // overflows `u64` reverts the transaction (safe: no value is created),
+            // so model exactly the handler's accepted path.
+            let Some(liquidator_after) = liquidator_deposited.checked_add(reward) else {
+                return Ok(());
+            };
+
+            prop_assert!(reward <= consumed, "reward drawn from the victim's released margin");
+            prop_assert!(victim_after >= reserved_after, "free seam holds after liquidation");
+            // Zero-sum: nothing minted, nothing burned (in u128 so the sum cannot
+            // overflow the ledger-position invariant).
+            prop_assert_eq!(
+                (victim_deposited as u128) + (liquidator_deposited as u128),
+                (victim_after as u128) + (liquidator_after as u128),
+                "a liquidation is a zero-sum transfer across victim + liquidator"
+            );
+            // The surviving position keeps exactly margin_required(notional-amount, im).
+            prop_assert_eq!(remaining, margin_required(notional - amount, im).unwrap());
+        }
+    }
+
+    /// Regression (critical): a liquidation must be a ZERO-SUM transfer. The
+    /// handler credits `liquidator_collateral.deposited += reward` and debits
+    /// `user_collateral.deposited -= reward`; that debit is payable only because
+    /// `apply_liquidation` guarantees `reward <= released == position_collateral -
+    /// remaining` (the reward is drawn out of the victim's released margin, so
+    /// Σ deposited across victim + liquidator is conserved; the vault is never
+    /// over-issued). Pin the EXACT minimal counterexample the review shrank:
+    /// `(notional=2, amount=2 [full], im=2, mm=1, penalty_bps=500)`.
+    #[test]
+    fn liquidation_is_zero_sum_deterministic() {
+        // position_collateral = margin_required(2, initial_margin_bps=2) = ceil(4/1e4) = 1
+        let position_collateral = margin_required(2, 2).unwrap();
+        assert_eq!(position_collateral, 1);
+        // Full liquidation: remaining = margin_required(0, 2) = 0; released = 1;
+        // reward = ceil(1 * 500 / 1e4) = 1.
+        let (remaining, reward) = apply_liquidation(position_collateral, 2, 2, 2, 1, 500).unwrap();
+        assert_eq!((remaining, reward), (0, 1), "shrank minimal counterexample");
+        // The zero-sum guarantee the handler relies on (the operands are `u64`, so
+        // non-negativity is type-guaranteed):
+        assert!(
+            remaining + reward <= position_collateral,
+            "no value created: remaining + reward <= position_collateral"
+        );
+        let released = position_collateral.saturating_sub(remaining);
+        assert!(
+            reward <= released,
+            "reward payable out of the victim's released margin (so victim.deposited -= reward is safe)"
+        );
+        // Model the handler's ledger transition; Σ deposited must be conserved.
+        let (victim_before, liquidator_before) = (10_000u64, 0u64);
+        let (victim_after, liquidator_after) = (
+            victim_before.checked_sub(reward).unwrap(),
+            liquidator_before.checked_add(reward).unwrap(),
+        );
+        assert_eq!(
+            victim_after + liquidator_after,
+            victim_before + liquidator_before,
+            "liquidation mints nothing: Σ deposited is conserved"
+        );
+        // Deterministic sweep — fixed seeds, all must conserve.
+        for (notional, amount, im, mm) in [(3u64, 2u64, 1_000u16, 500u16), (7, 5, 2_000, 1_000)] {
+            let pc = margin_required(notional, im).unwrap();
+            let (rem, rew) = apply_liquidation(pc, notional, amount, im, mm, 500).unwrap();
+            assert!(rem + rew <= pc, "no value created");
+            assert!(
+                rew <= pc.saturating_sub(rem),
+                "reward payable from released margin"
+            );
+        }
+    }
 }

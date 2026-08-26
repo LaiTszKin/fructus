@@ -14,7 +14,7 @@ use crate::exchange::{
     annualize, ExchangeRate, ACCOUNT_TYPE_OFFSET, ACCOUNT_TYPE_STAKE_POOL,
     POOL_TOKEN_SUPPLY_OFFSET, TOTAL_LAMPORTS_OFFSET,
 };
-use crate::positions::margin_required;
+use crate::positions::{margin_required, pnl, PositionSide};
 use crate::state::{
     apy_in_bounds, funding_k_in_bounds, initial_margin_in_bounds, is_stale,
     maintenance_margin_in_bounds, max_funding_in_bounds, update_message, validate_version,
@@ -29,6 +29,12 @@ use crate::orderbook::{
     best_ask, best_bid, cancel, is_crossable, match_order, mid, post_limit, price_better, twap,
     Book, Observation, Order, OrderKind, Side,
 };
+
+// Adversarial-review adapters (private crate-root helpers that drive the REAL
+// `apply_open_fills` / `apply_close_fills`, plus the pure `funding_epoch` used by
+// the re-open rebase invariants).
+use crate::funding::funding_epoch;
+use crate::{apply_close_fills, apply_open_fills};
 
 /// Size of an ed25519 signature in bytes.
 const ED25519_SIGNATURE_LEN: usize = 64;
@@ -1744,5 +1750,482 @@ fn position_lazy_create_gate_checks_account_owner() {
          system-owned account (owner == system program, lamports == 0).",
         bad_gates.len(),
         bad_gates.join(" | "),
+    );
+}
+
+// ==== Adversarial-review invariants for the lib.rs position adapters (moved from review_tests.rs) ====
+// These drive the REAL `apply_open_fills` / `apply_close_fills` (private
+// crate-root helpers) rather than a reproduction, and pin the invariants the
+// settlement / funding handlers promise across MULTIPLE position lifetimes.
+
+/// Tolerance (in USDC microunits) for `closed_pnl_is_priced_at_each_generations_own_basis`.
+///
+/// The aggregate closed-entry basis is the **notional-weighted harmonic mean** of
+/// the per-generations' entry rates, so in the exact-real sense it prices each
+/// generation at its own basis and the aggregate PnL equals the per-generation
+/// PnL sum exactly. `positions::pnl` truncates toward zero in two places (the
+/// yield change and the final `notional × change / APY_SCALE` division), so the
+/// integer aggregate differs from the sum of the independently-rounded
+/// per-generation PnLs by at most a handful of micro-units (≤ ~4 across the full
+/// proptest domain). An accumulation bug (overwriting `closed_entry_*` with the
+/// newest generation's basis, or an average instead of the harmonic basis) errs
+/// by far more than this bound — the pinned deterministic witness is off by 667
+/// for the overwrite and 133 for an arithmetic mean — so this small tolerance is
+/// not a relaxation: it only admits the documented truncation rounding while
+/// still rejecting the real defect.
+const CLOSED_PNL_QUANT_TOL: i128 = 8;
+
+/// Build a zeroed, inert `Position` (no side assumptions in the pure adapters).
+fn life_pos() -> Position {
+    Position {
+        market: Pubkey::default(),
+        owner: Pubkey::default(),
+        side: 0,
+        notional: 0,
+        entry_n_sum: 0,
+        entry_d_sum: 0,
+        collateral: 0,
+        last_funding_epoch: 0,
+        closed_notional: 0,
+        closed_entry_n_sum: 0,
+        closed_entry_d_sum: 0,
+        open_slot: 0,
+        bump: 0,
+    }
+}
+
+fn life_uc(deposited: u64) -> UserCollateral {
+    UserCollateral {
+        deposited,
+        reserved: 0,
+        bump: 0,
+    }
+}
+
+fn life_fill(size: u64) -> crate::orderbook::Fill {
+    crate::orderbook::Fill {
+        maker_seq: 0,
+        maker_owner: Pubkey::from([2u8; 32]),
+        taker_owner: Pubkey::from([1u8; 32]),
+        size,
+        price: 10,
+    }
+}
+
+proptest! {
+    // R-S1/R-S2 invariant: the PnL of the closed notional must be determinable
+    // from the entry basis that was in effect when it was closed. A re-open
+    // (which resets the entry sums) must NOT reframe it. Here the SAME
+    // `closed_notional` (generation-1 amount, closed at entry rate r1) is
+    // settled both before and after a generation-2 re-open at a DIFFERENT rate
+    // r2; the two must agree.
+    #[test]
+    fn reopen_does_not_reframe_closed_pnl_basis(
+        r1 in 1_000_000u64..10_000_000u64,
+        r2 in 1_000_000u64..10_000_000u64,
+        cur in 1_000_000u64..20_000_000u64,
+        amt1 in 1_000_000u64..100_000_000u64,
+        amt2 in 1_000_000u64..100_000_000u64,
+        im in 2u16..=10_000u16,
+    ) {
+        prop_assume!(r1 != r2, "need two distinct generations");
+        let mut position = life_pos();
+        let mut uc = life_uc(1_000_000_000_000_000u64);
+
+        // Generation 1: open at rate r1, then fully close.
+        apply_open_fills(&mut position, &mut uc, im, &[life_fill(amt1)], r1, 1, 1, 100).unwrap();
+        apply_close_fills(&mut position, &mut uc, im, &[life_fill(amt1)]).unwrap();
+        prop_assert_eq!(position.notional, 0, "generation 1 fully closed");
+        let gen1_closed = position.closed_notional;
+        let (gen1_n, gen1_d) = (position.entry_n_sum, position.entry_d_sum);
+
+        // Reference: settle the generation-1 closed notional at its own entry basis.
+        let pnl_at_gen1_basis =
+            pnl(gen1_n, gen1_d, cur, 1, gen1_closed, PositionSide::Long);
+
+        // Generation 2 re-open: resets the entry sums to rate r2.
+        apply_open_fills(&mut position, &mut uc, im, &[life_fill(amt2)], r2, 1, 2, 100).unwrap();
+        prop_assert_eq!(position.closed_notional, gen1_closed, "close storage unchanged by re-open");
+
+        // The handler settles the SAME gen-1 closed notional at the entry basis
+        // recorded when it was closed (`closed_entry_*`), which a re-open must
+        // leave intact — so the re-open cannot reframe it.
+        let pnl_at_gen2_basis = pnl(
+            position.closed_entry_n_sum,
+            position.closed_entry_d_sum,
+            cur,
+            1,
+            position.closed_notional,
+            PositionSide::Long,
+        );
+
+        if let (Some(expected), Some(actual)) = (pnl_at_gen1_basis, pnl_at_gen2_basis) {
+            prop_assert_eq!(
+                expected,
+                actual,
+                "a re-open must not reframe the prior closed_notional's PnL (it was settled at the new entry rate)"
+            );
+        }
+    }
+
+    // R-F5 invariant: a position re-open must re-base `last_funding_epoch` so the
+    // reopened notional only accrues funding over epochs it actually held
+    // notional, never over the interval it was closed (notional == 0). Here the
+    // position's `last_funding_epoch` is stale (from before the closed period)
+    // and is NOT advanced by `apply_open_fills` on re-open.
+    #[test]
+    fn reopen_does_not_rebase_funding_epoch(
+        stale_last_epoch in 0u64..5_000u64,
+        reopen_slot in 5_000_000u64..20_000_000u64,
+        epoch_slots in 100u64..1_000u64,
+        im in 2u16..=10_000u16,
+    ) {
+        let reopen_epoch = funding_epoch(reopen_slot, epoch_slots);
+        prop_assume!(reopen_epoch > stale_last_epoch, "the closed interval is non-empty");
+
+        let mut position = life_pos();
+        let mut uc = life_uc(1_000_000_000_000_000u64);
+        position.last_funding_epoch = stale_last_epoch;
+
+        // Generation 1 was closed (notional == 0) and then re-opened.
+        let amt = 1_000_000u64;
+        apply_open_fills(&mut position, &mut uc, im, &[life_fill(amt)], 2_000_000, 1, reopen_slot, epoch_slots)
+            .unwrap();
+
+        // The handler's settle_funding charges `cur_epoch - position.last_funding_epoch`
+        // epochs against the CURRENT notional. The correct basis after a re-open
+        // is the re-open epoch, so those epoch deltas must be re-based there.
+        prop_assert_eq!(
+            position.last_funding_epoch,
+            reopen_epoch,
+            "a re-open must re-base last_funding_epoch to the re-open epoch; \
+             otherwise the reopened notional pays funding for the closed interval"
+        );
+    }
+}
+
+/// Deterministic minimal witness for the re-open PnL-basis bug.
+#[test]
+fn reopen_reframes_closed_pnl_witness() {
+    // Generation 1: enter long at rate 2.0 (n=2,d=1,w=1e6), close fully.
+    // Generation 2: re-open at rate 3.0. Index currently 4.0.
+    // The gen-1 closed 1000 notional's TRUE PnL (entry 2.0 -> 4.0) is +1000;
+    // the handler settles it at the gen-2 entry 3.0 -> 4.0, giving ~333.
+    let mut position = life_pos();
+    let mut uc = life_uc(1_000_000_000_000_000u64);
+    let im = 1_000u16;
+    let amt = 1_000u64;
+
+    apply_open_fills(&mut position, &mut uc, im, &[life_fill(amt)], 2, 1, 1, 100).unwrap();
+    apply_close_fills(&mut position, &mut uc, im, &[life_fill(amt)]).unwrap();
+    let gen1_closed = position.closed_notional;
+    assert_eq!(gen1_closed, amt, "fully closed generation 1");
+    assert_eq!(
+        position.entry_n_sum,
+        (2u128) * (amt as u128),
+        "gen1 entry rate 2.0"
+    );
+    assert_eq!(position.entry_d_sum, (1u128) * (amt as u128));
+
+    let reference = pnl(
+        position.entry_n_sum,
+        position.entry_d_sum,
+        4,
+        1,
+        gen1_closed,
+        PositionSide::Long,
+    )
+    .expect("pnl in band");
+    assert_eq!(
+        reference, amt as i128,
+        "gen1 closed at entry 2.0 -> 4.0 is +{amt}"
+    );
+
+    // Re-open generation 2 at rate 3.0 (fresh entry sums, closed_notional stale).
+    apply_open_fills(&mut position, &mut uc, im, &[life_fill(amt)], 3, 1, 2, 100).unwrap();
+    assert_eq!(
+        position.closed_notional, gen1_closed,
+        "closed_notional NOT reset on re-open"
+    );
+    // The handler settles at the NEW entry rate: wrong result.
+    let wrong = pnl(
+        position.entry_n_sum,
+        position.entry_d_sum,
+        4,
+        1,
+        position.closed_notional,
+        PositionSide::Long,
+    )
+    .expect("pnl in band");
+    assert_ne!(
+        wrong, reference,
+        "re-open reframed the gen-1 closed {}, settling it at the gen-2 entry rate \
+         ({wrong}) instead of the gen-1 entry rate ({reference})",
+        gen1_closed
+    );
+}
+
+/// Regression B2 (critical): a re-open must NOT reframe the entry basis of the
+/// prior `closed_notional`. `apply_close_fills` records the close-time entry
+/// basis into `closed_entry_*`; a re-open resets the LIVE `entry_*` (fresh
+/// basis for the new generation) but leaves `closed_entry_*` intact, so
+/// `settle_close` prices the closed amount at its own (close-time) rate.
+#[test]
+fn reopen_preserves_closed_entry_basis_deterministic() {
+    let mut position = life_pos();
+    let mut uc = life_uc(1_000_000_000_000_000u64);
+    let im = 1_000u16; // 10% initial margin
+    let amt = 1_000u64;
+
+    // Generation 1: open long at entry rate 2.0 (n=2, d=1), then fully close.
+    apply_open_fills(&mut position, &mut uc, im, &[life_fill(amt)], 2, 1, 1, 100).unwrap();
+    apply_close_fills(&mut position, &mut uc, im, &[life_fill(amt)]).unwrap();
+    assert_eq!(position.notional, 0, "generation 1 fully closed");
+    assert_eq!(position.closed_notional, amt, "closed notional recorded");
+    assert_eq!(
+        position.closed_entry_n_sum,
+        2 * (amt as u128),
+        "gen-1 entry basis numerator"
+    );
+    assert_eq!(
+        position.closed_entry_d_sum, amt as u128,
+        "gen-1 entry basis denominator"
+    );
+
+    // Reference: settle the gen-1 closed notional at its own (close-time) basis.
+    let reference = pnl(
+        position.closed_entry_n_sum,
+        position.closed_entry_d_sum,
+        4,
+        1,
+        position.closed_notional,
+        PositionSide::Long,
+    )
+    .expect("pnl in band");
+    assert_eq!(reference, amt as i128, "(4/2 − 1) × {amt} == +{amt}");
+
+    // Generation 2: re-open at a DIFFERENT rate 3.0 — live entry sums reset.
+    apply_open_fills(&mut position, &mut uc, im, &[life_fill(amt)], 3, 1, 2, 100).unwrap();
+    assert_eq!(
+        position.entry_n_sum,
+        3 * (amt as u128),
+        "live entry basis reset to gen-2"
+    );
+    assert_eq!(
+        position.entry_d_sum, amt as u128,
+        "live entry basis reset to gen-2"
+    );
+    assert_eq!(
+        position.closed_entry_n_sum,
+        2 * (amt as u128),
+        "re-open must NOT reframe closed basis"
+    );
+    assert_eq!(
+        position.closed_entry_d_sum, amt as u128,
+        "re-open must NOT reframe closed basis"
+    );
+    assert_eq!(
+        position.closed_notional, amt,
+        "closed notional unchanged by re-open"
+    );
+
+    // The handler settles at `closed_entry_*` (the close-time basis): correct.
+    let actual = pnl(
+        position.closed_entry_n_sum,
+        position.closed_entry_d_sum,
+        4,
+        1,
+        position.closed_notional,
+        PositionSide::Long,
+    )
+    .expect("pnl in band");
+    assert_eq!(
+        actual, reference,
+        "closed PnL prices at the close-time basis, never the new basis"
+    );
+    // The buggy (pre-fix) behaviour priced it at the LIVE (gen-2) entry: wrong.
+    let buggy = pnl(
+        position.entry_n_sum,
+        position.entry_d_sum,
+        4,
+        1,
+        position.closed_notional,
+        PositionSide::Long,
+    )
+    .expect("pnl in band");
+    assert_ne!(
+        buggy, reference,
+        "(4/3 − 1) × {amt} != (4/2 − 1) × {amt}: a re-open reframed it"
+    );
+}
+
+/// Regression B1 (medium): a re-open must re-base `last_funding_epoch` to the
+/// re-open epoch so the reopened notional only accrues funding over epochs it
+/// actually held notional (never the closed interval, where notional == 0).
+#[test]
+fn reopen_rebases_funding_epoch_deterministic() {
+    let mut position = life_pos();
+    let mut uc = life_uc(1_000_000_000_000_000u64);
+    let im = 2u16;
+    // A position whose `last_funding_epoch` is stale from before the closed
+    // interval; it is then re-opened at slot 5,000,000 with epoch length 100.
+    position.last_funding_epoch = 0; // stale
+    let reopen_slot = 5_000_000u64;
+    let epoch_slots = 100u64;
+    let amt = 1_000_000u64;
+    apply_open_fills(
+        &mut position,
+        &mut uc,
+        im,
+        &[life_fill(amt)],
+        2_000_000,
+        1,
+        reopen_slot,
+        epoch_slots,
+    )
+    .unwrap();
+    assert_eq!(
+        position.last_funding_epoch,
+        funding_epoch(reopen_slot, epoch_slots),
+        "re-open must re-base last_funding_epoch to the re-open epoch"
+    );
+    assert_eq!(funding_epoch(reopen_slot, epoch_slots), 50_000);
+    assert_ne!(
+        position.last_funding_epoch, 0,
+        "otherwise the reopened notional pays funding for the closed interval"
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10_000))]
+
+    // R-S1/R-S2: the aggregate closed-entry basis must realize each closed
+    // generation at ITS OWN close-time entry basis, across MULTIPLE lifetimes
+    // (a re-open in the middle, before any settle_close).
+    #[test]
+    fn closed_pnl_is_priced_at_each_generations_own_basis(
+        r1 in 2u64..10_000_000u64,
+        r2 in 2u64..10_000_000u64,
+        cur in 1u64..20_000_000u64,
+        amt1 in 1u64..1_000_000u64,
+        amt2 in 1u64..1_000_000u64,
+        im in 2u16..=10_000u16,
+    ) {
+        prop_assume!(r1 != r2, "two generations with distinct entry bases");
+        let mut position = life_pos();
+        let mut uc = life_uc(1_000_000_000_000_000u64);
+
+        // Generation 1: open long at rate r1, then fully close.
+        apply_open_fills(&mut position, &mut uc, im, &[life_fill(amt1)], r1, 1, 1, 100).unwrap();
+        apply_close_fills(&mut position, &mut uc, im, &[life_fill(amt1)]).unwrap();
+        prop_assert_eq!(position.notional, 0, "generation 1 fully closed");
+        let gen1_n = position.closed_entry_n_sum;
+        let gen1_d = position.closed_entry_d_sum;
+        let gen1_closed = position.closed_notional;
+
+        // Generation 2: re-open at rate r2, then fully close (NO settle_close
+        // between the generations — the cranker may lag arbitrarily).
+        apply_open_fills(&mut position, &mut uc, im, &[life_fill(amt2)], r2, 1, 2, 100).unwrap();
+        apply_close_fills(&mut position, &mut uc, im, &[life_fill(amt2)]).unwrap();
+        prop_assert_eq!(
+            position.closed_notional,
+            gen1_closed + amt2,
+            "closed notional accumulates across generations"
+        );
+
+        // The invariant: each closed generation is realized at ITS OWN
+        // close-time basis. Gen1 must stay at (r1), gen2 at (r2).
+        let pnl_gen1 = pnl(gen1_n, gen1_d, cur, 1, gen1_closed, PositionSide::Long).unwrap();
+        let pnl_gen2 =
+            pnl((r2 as u128) * (amt2 as u128), amt2 as u128, cur, 1, amt2, PositionSide::Long)
+                .unwrap();
+        let expected = pnl_gen1 + pnl_gen2;
+        let actual = pnl(
+            position.closed_entry_n_sum,
+            position.closed_entry_d_sum,
+            cur,
+            1,
+            position.closed_notional,
+            PositionSide::Long,
+        )
+        .unwrap();
+
+        prop_assert!(
+            (actual as i128 - expected as i128).abs() <= CLOSED_PNL_QUANT_TOL,
+            "a re-open then re-close must price each closed generation at its own entry basis; \
+             the aggregate closed-entry basis must track the per-generation PnL sum (within the \
+             documented `pnl` truncation/quantization bound), never reframe the prior life to the \
+             newest generation's basis"
+        );
+    }
+}
+
+/// Deterministic minimal witness for the multi-lifetime closed-PnL-basis bug:
+/// generation 1 closes at entry rate 2.0, the position re-opens at rate 3.0 and
+/// closes again — BOTH pending closed amounts are then priced at the gen-2 basis
+/// (3.0), so the gen-1 closed amount is realized at the WRONG rate and the user
+/// gains/loses value that a correct settlement would not.
+#[test]
+fn closed_pnl_multi_lifetime_prices_earlier_close_at_new_basis() {
+    let mut position = life_pos();
+    let mut uc = life_uc(1_000_000_000_000_000u64);
+    let im = 1_000u16; // 10% initial margin
+    let amt = 1_000u64;
+
+    // Generation 1: long at entry rate 2.0, fully close.
+    apply_open_fills(&mut position, &mut uc, im, &[life_fill(amt)], 2, 1, 1, 100).unwrap();
+    apply_close_fills(&mut position, &mut uc, im, &[life_fill(amt)]).unwrap();
+    assert_eq!(position.notional, 0, "generation 1 fully closed");
+    let gen1_n = position.closed_entry_n_sum;
+    let gen1_d = position.closed_entry_d_sum;
+    let gen1_closed = position.closed_notional;
+    let pnl_gen1 = pnl(gen1_n, gen1_d, 4, 1, gen1_closed, PositionSide::Long).unwrap();
+    assert_eq!(
+        pnl_gen1, amt as i128,
+        "(4/2 - 1) x amt == amt (gen1 basis 2.0)"
+    );
+
+    // Generation 2: re-open at rate 3.0, fully close (no settle in between).
+    apply_open_fills(&mut position, &mut uc, im, &[life_fill(amt)], 3, 1, 2, 100).unwrap();
+    apply_close_fills(&mut position, &mut uc, im, &[life_fill(amt)]).unwrap();
+    assert_eq!(
+        position.closed_notional,
+        gen1_closed + amt,
+        "closed notional accumulated"
+    );
+    // The closed-entry running sums ACCUMULATE each generation's own entry basis
+    // (notional-weighted harmonic-mean representation), so the gen-1 basis (2.0)
+    // is never reframed by the gen-2 (3.0) re-open.
+    assert_eq!(
+        position.closed_entry_n_sum,
+        (2u128) * (gen1_closed as u128 + amt as u128) * (3u128),
+        "closed entry basis accumulates the harmonic numerator, not the gen-2 basis"
+    );
+
+    // True PnL (each generation at its own basis) vs the handler's actual
+    // (the whole pending closed notional priced at the overwritten gen-2 basis).
+    let expected = pnl_gen1
+        + pnl(
+            (3u128) * (amt as u128),
+            amt as u128,
+            4,
+            1,
+            amt,
+            PositionSide::Long,
+        )
+        .unwrap();
+    let actual = pnl(
+        position.closed_entry_n_sum,
+        position.closed_entry_d_sum,
+        4,
+        1,
+        position.closed_notional,
+        PositionSide::Long,
+    )
+    .unwrap();
+    assert_eq!(
+        actual, expected,
+        "the gen-1 closed amount was re-priced at the gen-2 (re-open) entry basis; \
+         settle_close realizes the wrong PnL and leaks user value"
     );
 }

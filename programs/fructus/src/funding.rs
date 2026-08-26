@@ -302,4 +302,209 @@ mod tests {
             "settling each epoch once == settling both once"
         );
     }
+
+    // ==== Adversarial-review invariants for funding.rs (moved from review_tests.rs) ====
+    // These independently pin the funding engine's contract (premium, funding
+    // rate, payment, epoch) across the FULL domain, so the implementation's own
+    // in-file tests (which share its assumptions) cannot mask a counterexample.
+
+    // Domain band constants (from the design doc / init validation): notional is a
+    // USDC amount (microunits) far below u64::MAX; funding_k/max_funding are
+    // validated to [1, APY_SCALE] / [0, APY_SCALE].
+    const NOTIONAL_MAX: u64 = 1_000_000_000_000; // 1e12 (design band)
+    const RATE_MAX: i128 = APY_SCALE as i128 * 10; // ±10x APY_SCALE (generous)
+    const EPOCHS_MAX: u64 = 10_000;
+
+    proptest! {
+        // R-F1: premium is the exact signed difference, antisymmetric, and 0 iff
+        // equal — for the FULL u64 domain, not just the `APY_SCALE * 10` band.
+        #[test]
+        fn premium_is_exact_signed_difference_full_domain(
+            mark in any::<u64>(),
+            index in any::<u64>(),
+        ) {
+            let p = premium(mark, index);
+            prop_assert_eq!(p, mark as i128 - index as i128,
+                "premium must equal mark-index exactly");
+            prop_assert_eq!(p, -premium(index, mark), "premium is antisymmetric");
+            prop_assert_eq!(p == 0, mark == index, "premium==0 iff mark==index");
+            if mark > index { prop_assert!(p > 0, "mark>index => positive premium"); }
+            if mark < index { prop_assert!(p < 0, "mark<index => negative premium"); }
+        }
+
+        // R-F2: clamp is exact and the rate is symmetric/odd across a WIDE premium
+        // range (full i128), so a premium at the extremes still clamps to ±max_funding
+        // rather than spilling past it.
+        #[test]
+        fn funding_rate_never_exceeds_cap_full_premium(
+            premium_value in any::<i128>(),
+            funding_k in 1u64..=APY_SCALE,
+            max_funding in 0u64..=APY_SCALE,
+        ) {
+            let cap = max_funding as i128;
+            let r = funding_rate(premium_value, funding_k, max_funding);
+            prop_assert!(r >= -cap && r <= cap, "rate clamped to ±max_funding");
+            if premium_value == 0 { prop_assert_eq!(r, 0, "zero premium => zero rate"); }
+        }
+
+        #[test]
+        fn funding_rate_is_odd_full_premium(
+            premium_value in any::<i128>(),
+            funding_k in 1u64..=APY_SCALE,
+            max_funding in 0u64..=APY_SCALE,
+        ) {
+            prop_assert_eq!(
+                funding_rate(premium_value, funding_k, max_funding),
+                -funding_rate(-premium_value, funding_k, max_funding),
+                "funding_rate must be odd in its premium argument"
+            );
+        }
+
+        #[test]
+        fn funding_rate_monotonic_in_premium_full_range(
+            low in any::<i128>(),
+            high in any::<i128>(),
+            funding_k in 1u64..=APY_SCALE,
+            max_funding in 0u64..=APY_SCALE,
+        ) {
+            let (lo, hi) = if low <= high { (low, high) } else { (high, low) };
+            let rl = funding_rate(lo, funding_k, max_funding);
+            let rh = funding_rate(hi, funding_k, max_funding);
+            prop_assert!(rl <= rh, "funding_rate is non-decreasing in premium");
+        }
+
+        // R-F2: the documented formula `clamp(k*premium/APY_SCALE, ±max_funding)`
+        // must hold exactly (independent reference, not the implementation's clamp).
+        #[test]
+        fn funding_rate_matches_reference_formula(
+            premium_value in -RATE_MAX..RATE_MAX,
+            funding_k in 1u64..=APY_SCALE,
+            max_funding in 0u64..=APY_SCALE,
+        ) {
+            // Reference: saturating_i128_mul then truncate-divide, then clamp.
+            let raw = (funding_k as i128).saturating_mul(premium_value);
+            let unscaled = raw / (APY_SCALE as i128);
+            let cap = max_funding as i128;
+            let expected = if unscaled > cap { cap }
+                else if unscaled < -cap { -cap }
+                else { unscaled };
+            prop_assert_eq!(funding_rate(premium_value, funding_k, max_funding), expected);
+        }
+
+        // R-F3: on positive rate, LONG pays / SHORT receives; on negative rate the
+        // sign flips; and the two are always exact opposites for identical inputs.
+        // This is the core sign convention — asserted over a WIDE notional band.
+        #[test]
+        fn funding_sign_convention_long_short_exact_opposites(
+            notional in 1u64..NOTIONAL_MAX,
+            rate in -RATE_MAX..RATE_MAX,
+            epochs in 1u64..EPOCHS_MAX,
+        ) {
+            let p_long = funding_payment(notional, rate, epochs, SideFlow::Long);
+            let p_short = funding_payment(notional, rate, epochs, SideFlow::Short);
+            prop_assert_eq!(p_long, -p_short, "long and short are exact opposites");
+
+            // Sign convention with the documented quantization floor: the flow is 0
+            // (never the wrong sign) whenever |notional*rate| < APY_SCALE.
+            if rate > 0 {
+                prop_assert!(p_long <= 0, "positive rate => long never gains");
+                prop_assert!(p_short >= 0, "positive rate => short never loses");
+                // Strictly negative when the scaled amount is nonzero.
+                let scaled = (notional as i128).saturating_mul(rate) / (APY_SCALE as i128);
+                if scaled > 0 {
+                    prop_assert!(p_long < 0, "positive funding => long pays (strict)");
+                    prop_assert!(p_short > 0, "positive funding => short receives (strict)");
+                }
+            } else if rate < 0 {
+                prop_assert!(p_long >= 0, "negative rate => long never loses");
+                prop_assert!(p_short <= 0, "negative rate => short never gains");
+                let scaled = (notional as i128).saturating_mul(rate) / (APY_SCALE as i128);
+                if scaled < 0 {
+                    prop_assert!(p_long > 0, "negative funding => long receives (strict)");
+                    prop_assert!(p_short < 0, "negative funding => short pays (strict)");
+                }
+            }
+        }
+
+        // R-F3 formula exactness: `funding_payment = notional*rate/APY_SCALE*epochs*flow`.
+        #[test]
+        fn funding_payment_matches_reference_formula(
+            notional in 0u64..NOTIONAL_MAX,
+            rate in -RATE_MAX..RATE_MAX,
+            epochs in 0u64..EPOCHS_MAX,
+        ) {
+            let scaled = (notional as i128).saturating_mul(rate) / (APY_SCALE as i128);
+            let expected = scaled.saturating_mul(epochs as i128);
+            prop_assert_eq!(funding_payment(notional, rate, epochs, SideFlow::Long), -expected);
+            prop_assert_eq!(funding_payment(notional, rate, epochs, SideFlow::Short), expected);
+        }
+
+        // R-F5: epochs == 0 is a no-op for ANY rate/notional; rate == 0 is a no-op.
+        #[test]
+        fn funding_zero_epochs_and_zero_rate_pay_nothing_full_domain(
+            notional in any::<u64>(),
+            rate in any::<i128>(),
+            epochs in any::<u64>(),
+        ) {
+            prop_assert_eq!(funding_payment(notional, rate, 0, SideFlow::Long), 0,
+                "epochs==0 => zero payment");
+            prop_assert_eq!(funding_payment(notional, rate, 0, SideFlow::Short), 0);
+            prop_assert_eq!(funding_payment(notional, 0, epochs, SideFlow::Long), 0,
+                "rate==0 => zero payment");
+            prop_assert_eq!(funding_payment(notional, 0, epochs, SideFlow::Short), 0);
+        }
+
+        // R-F5: accrual is LINEAR in epochs (idempotent per-epoch): n two-epoch
+        // accruals == one (e1+e2) accrual, and re-settling an epoch adds nothing.
+        #[test]
+        fn funding_epoch_additivity(
+            notional in 1u64..NOTIONAL_MAX,
+            rate in -RATE_MAX..RATE_MAX,
+            e1 in 0u64..EPOCHS_MAX,
+            e2 in 0u64..EPOCHS_MAX,
+        ) {
+            let p1 = funding_payment(notional, rate, e1, SideFlow::Long);
+            let p2 = funding_payment(notional, rate, e2, SideFlow::Long);
+            let total = funding_payment(notional, rate, e1 + e2, SideFlow::Long);
+            // saturating add of the two epoch payments equals the combined payment
+            // (additivity of the two-epoch accrual; exact in the production band).
+            prop_assert_eq!(p1.saturating_add(p2), total,
+                "accrual is additive in epochs");
+        }
+
+        // R-F5: epoch derivation is integer floor division, monotonic in slot, and
+        // degenerate zero epoch length collapses to epoch 0.
+        #[test]
+        fn funding_epoch_is_floor_division_monotonic(
+            slot in any::<u64>(),
+            epoch_slots in 1u64..,
+        ) {
+            prop_assert_eq!(funding_epoch(slot, epoch_slots), slot / epoch_slots);
+            let next = slot.saturating_add(1);
+            prop_assert!(funding_epoch(next, epoch_slots) >= funding_epoch(slot, epoch_slots),
+                "epoch is monotonic in slot");
+            prop_assert_eq!(funding_epoch(0, 0), 0, "zero epoch_slots collapses");
+            prop_assert_eq!(funding_epoch(1_000_000, 0), 0, "zero epoch_slots collapses large slot");
+        }
+    }
+
+    // R-F5 idempotency across the settlement adapter: re-settling the same epoch
+    // delta (points already accrued) adds nothing.
+    proptest! {
+        #[test]
+        fn settlement_idempotent_same_epoch(
+            notional in 1u64..NOTIONAL_MAX,
+            rate in -RATE_MAX..RATE_MAX,
+            epochs in 0u64..EPOCHS_MAX,
+        ) {
+            // First settle accrues the epoch delta; a second settle on the same
+            // (now-updated) last_funding_epoch yields epochs == 0 => 0, so the
+            // accumulator advances by exactly the first payment.
+            let first = funding_payment(notional, rate, epochs, SideFlow::Long);
+            let second = funding_payment(notional, rate, 0, SideFlow::Long);
+            prop_assert_eq!(second, 0, "re-settling an accrued epoch adds nothing");
+            let accumulated = first.saturating_add(second);
+            prop_assert_eq!(accumulated, first, "idempotent accrual is net-additive");
+        }
+    }
 }

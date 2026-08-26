@@ -698,6 +698,111 @@ mod tests {
             }
         }
     }
+
+    // ==== Adversarial-review invariants for positions.rs (moved from review_tests.rs) ====
+    // These independently pin the position-lifecycle contract (apply_pnl, pnl,
+    // margin_required) across the FULL domain, so the implementation's own
+    // in-file tests (which share its assumptions) cannot mask a counterexample.
+
+    proptest! {
+        // R-S3: apply_pnl never returns None on a loss, never returns negative, and
+        // clamps at exactly `deposited - |loss|` while a profit credits exactly.
+        #[test]
+        fn apply_pnl_loss_clamps_at_zero_full_domain(
+            deposited in any::<u64>(),
+            loss in 1i128..=i128::MAX,
+        ) {
+            let out = apply_pnl(deposited, -loss).expect("apply_pnl is total on a loss");
+            let want = deposited.saturating_sub(loss.min(u64::MAX as i128) as u64);
+            prop_assert_eq!(out, want, "loss debits but clamps at the deposited floor");
+            prop_assert!(out <= deposited, "a loss never increases deposited");
+            prop_assert!(out >= 0, "a loss never makes deposited negative");
+        }
+
+        #[test]
+        fn apply_pnl_profit_credits_or_none_on_overflow(
+            deposited in any::<u64>(),
+            gain in 0i128..=i128::MAX,
+        ) {
+            let out = apply_pnl(deposited, gain);
+            let want = (deposited as i128) + gain;
+            if want <= u64::MAX as i128 {
+                prop_assert_eq!(out, Some(want as u64), "profit credits exactly");
+            } else {
+                prop_assert_eq!(out, None, "profit past u64::MAX is None (checked), never a wrap");
+            }
+        }
+
+        #[test]
+        fn apply_pnl_zero_is_identity(deposited in any::<u64>()) {
+            prop_assert_eq!(apply_pnl(deposited, 0), Some(deposited));
+        }
+    }
+
+    proptest! {
+        // pnl: exact antisymmetry (long == -short), sign correctness, and the
+        // quantization floor — across a WIDE notional/rate band.
+        #[test]
+        fn pnl_long_short_exact_antisymmetry(
+            n in 100_000_000_000_000u64..100_000_000_000_000_000u64,
+            d in 100_000_000_000_000u64..100_000_000_000_000_000u64,
+            cur_n in 100_000_000_000_000u64..100_000_000_000_000_000u64,
+            cur_d in 100_000_000_000_000u64..100_000_000_000_000_000u64,
+            w in 1_000_000u64..1_000_000_000_000u64,
+            notional in 1u64..1_000_000_000_000_000_000u64,
+        ) {
+            let (ns, ds) = crate::positions::accumulate_entry(0, 0, n, d, w)
+                .expect("accumulate_entry should not overflow in band");
+            let p_long = pnl(ns, ds, cur_n, cur_d, notional, PositionSide::Long)
+                .expect("pnl in band");
+            let p_short = pnl(ns, ds, cur_n, cur_d, notional, PositionSide::Short)
+                .expect("pnl in band");
+            // Both Some in the production band; assert exact antisymmetry + sign.
+            prop_assert_eq!(p_long, -p_short, "long and short pnl are exact opposites");
+            let change = signed_yield_change(ns, ds, cur_n, cur_d).expect("change in band");
+            if change > 0 {
+                prop_assert!(p_long >= 0, "index up => long non-negative");
+            } else if change < 0 {
+                prop_assert!(p_long <= 0, "index down => long non-positive");
+            } else {
+                prop_assert_eq!(p_long, 0, "no change => zero pnl");
+            }
+        }
+
+        #[test]
+        fn margin_required_ceiling_and_monotonic_full_domain(
+            notional in any::<u64>(),
+            bps in 1u16..=10_000,
+        ) {
+            let m = margin_required(notional, bps).expect("margin_required is total on the validated bps domain");
+            let exact = (notional as u128) * (bps as u128);
+            let expected = ((exact + 9_999) / 10_000) as u64;
+            prop_assert_eq!(m, expected, "margin_required must be ceil(notional*bps/10000)");
+            // Monotonic in notional.
+            let m_next = margin_required(notional + 1, bps).unwrap();
+            prop_assert!(m_next >= m, "margin_required is monotonic in notional");
+            if bps == 10_000 { prop_assert_eq!(m, notional, "10_000 bps => 1x"); }
+        }
+    }
+
+    // settle_funding / settle_close adapter invariant: `apply_pnl` applied to the
+    // signed payment / realized PnL preserves the "always a valid deposited
+    // amount" postcondition for EVERY valid (deposited, signed_amount) pair.
+    proptest! {
+        #[test]
+        fn settle_transition_deposited_never_invalid(
+            deposited in any::<u64>(),
+            signed_amount in any::<i128>(),
+        ) {
+            let out = apply_pnl(deposited, signed_amount);
+            if let Some(v) = out {
+                prop_assert!(v <= u64::MAX, "deposited stays a valid u64");
+                if signed_amount < 0 {
+                    prop_assert!(v <= deposited, "a debit never increases deposited");
+                }
+            }
+        }
+    }
 }
 
 // --- Issue #7: realized-yield settlement (R-S2, R-S3) -----------------------

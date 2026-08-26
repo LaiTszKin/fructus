@@ -48,3 +48,127 @@ pub fn withdraw(deposited: u64, reserved: u64, amount: u64) -> Option<u64> {
     }
     deposited.checked_sub(amount)
 }
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    // ==== Adversarial-review invariants for collateral.rs (moved from review_tests.rs) ====
+    // These pin the vault ledger transitions (free seam / deposit / withdraw)
+    // across the FULL `u64` domain, so the vault can never let a user draw more
+    // than the free seam nor mint/annihilate the ledger on a round trip.
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(10_000))]
+
+        // V-1: free_collateral is exactly `deposited - reserved`, and is `None`
+        // (never a negative free) exactly when `reserved > deposited`.
+        #[test]
+        fn collateral_free_seam_is_exact_full_domain(
+            deposited in any::<u64>(),
+            reserved in any::<u64>(),
+        ) {
+            prop_assert_eq!(
+                crate::collateral::free_collateral(deposited, reserved),
+                deposited.checked_sub(reserved),
+                "free == deposited - reserved (None iff reserved > deposited)"
+            );
+        }
+
+        // V-2: deposit is exactly `deposited + amount` (None on u64 overflow) and is
+        // monotonic — a strict increase for any nonzero amount.
+        #[test]
+        fn collateral_deposit_is_checked_add_full_domain(
+            deposited in any::<u64>(),
+            amount in any::<u64>(),
+        ) {
+            prop_assert_eq!(
+                crate::collateral::deposit(deposited, amount),
+                deposited.checked_add(amount),
+                "deposit must be deposited + amount (checked)"
+            );
+            if amount > 0 && deposited.checked_add(amount).is_some() {
+                prop_assert!(
+                    crate::collateral::deposit(deposited, amount).unwrap() > deposited,
+                    "a nonzero deposit strictly increases deposited"
+                );
+            }
+        }
+
+        // V-3: withdraw succeeds iff `amount <= free`, and the post-withdraw
+        // `deposited` is exactly `deposited - amount`.
+        #[test]
+        fn collateral_withdraw_respects_free_seam_full_domain(
+            deposited in any::<u64>(),
+            reserved in any::<u64>(),
+            amount in any::<u64>(),
+        ) {
+            let free = deposited.checked_sub(reserved);
+            let w = crate::collateral::withdraw(deposited, reserved, amount);
+            match free {
+                Some(f) if amount <= f => {
+                    prop_assert_eq!(
+                        w,
+                        Some(deposited - amount),
+                        "withdraw inside free succeeds and returns deposited - amount"
+                    );
+                }
+                _ => {
+                    prop_assert_eq!(
+                        w,
+                        None,
+                        "withdraw at/beyond the free seam (or reserved > deposited) must fail"
+                    );
+                }
+            }
+        }
+
+        // V-4 (non-conservation guard): a successful withdraw leaves the ledger
+        // still respecting the free seam and never increases `deposited`.
+        #[test]
+        fn collateral_withdraw_never_breaches_free_or_increases(
+            deposited in any::<u64>(),
+            reserved in any::<u64>(),
+            amount in any::<u64>(),
+        ) {
+            if let Some(new_deposited) = crate::collateral::withdraw(deposited, reserved, amount) {
+                prop_assert!(new_deposited >= reserved, "post-withdraw deposited >= reserved");
+                prop_assert!(new_deposited <= deposited, "withdraw never increases deposited");
+            }
+        }
+
+        // V-5 (conservation): deposit(x) then withdraw the same x (reserved == 0)
+        // returns exactly to the original — the vault neither mints nor burns.
+        #[test]
+        fn collateral_deposit_withdraw_round_trip_conserves(
+            deposited in any::<u64>(),
+            amount in any::<u64>(),
+        ) {
+            if let Some(up) = crate::collateral::deposit(deposited, amount) {
+                if let Some(down) = crate::collateral::withdraw(up, 0, amount) {
+                    prop_assert_eq!(
+                        down,
+                        deposited,
+                        "deposit then withdraw the same amount is the identity"
+                    );
+                }
+            }
+        }
+
+        // V-6: the free seam is monotonic in the reserved amount — reserving more
+        // can never free up collateral.
+        #[test]
+        fn collateral_free_seam_monotonic_in_reserved(
+            deposited in any::<u64>(),
+            r_lo in any::<u64>(),
+            r_hi in any::<u64>(),
+        ) {
+            let (lo, hi) = if r_lo <= r_hi { (r_lo, r_hi) } else { (r_hi, r_lo) };
+            let f_lo = crate::collateral::free_collateral(deposited, lo);
+            let f_hi = crate::collateral::free_collateral(deposited, hi);
+            if let (Some(a), Some(b)) = (f_lo, f_hi) {
+                prop_assert!(a >= b, "free is non-increasing in reserved");
+            }
+        }
+    }
+}
