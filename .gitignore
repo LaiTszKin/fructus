@@ -28,3 +28,6 @@ credentials.json
 .idea/
 .vscode/
 *.swp
+
+# dsh
+.dsh/
