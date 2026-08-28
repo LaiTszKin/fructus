@@ -1474,6 +1474,7 @@ proptest! {
         let mut user_collateral = UserCollateral {
             deposited,
             reserved: 0,
+            claimable: 0,
             bump: 255,
         };
         let fill = [crate::orderbook::Fill {
@@ -1798,6 +1799,7 @@ fn life_uc(deposited: u64) -> UserCollateral {
     UserCollateral {
         deposited,
         reserved: 0,
+        claimable: 0,
         bump: 0,
     }
 }
@@ -2228,4 +2230,198 @@ fn closed_pnl_multi_lifetime_prices_earlier_close_at_new_basis() {
         "the gen-1 closed amount was re-priced at the gen-2 (re-open) entry basis; \
          settle_close realizes the wrong PnL and leaks user value"
     );
+}
+
+// ===========================================================================
+// REVIEW AGENT — fund-conservation adversarial invariants (REPOINTED to the
+// Design A fix).
+//
+// These pin the protocol-wide no-theft invariant: Σ `UserCollateral.deposited`
+// across every user must never exceed the vault's actual USDC balance. A
+// matched long+short pair (identical entry basis + notional) carries EXACTLY
+// opposite PnL (positions::pnl is antisymmetric), so settling both sides must
+// conserve Σ deposited. The pure `positions::apply_pnl` (loss clamped at 0,
+// profit unbounded) alone canNOT satisfy this — that is the exact layer that
+// mathematically cannot hold. The fix is the Design A PnL pool
+// (`crate::settlement`): the loser's debit is COLLECTED into the pool and the
+// winner's credit is paid only up to that pool, the remainder becoming a
+// pending claim. These tests now drive that fixed routing end-to-end.
+// ===========================================================================
+#[cfg(test)]
+mod conservation_adversarial_tests {
+    use proptest::prelude::*;
+
+    use crate::funding::{funding_payment, SideFlow};
+    use crate::positions::{accumulate_entry, pnl, PositionSide};
+    use crate::settlement::{apply_credit, apply_debit};
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100_000))]
+
+        // INVARIANT (settle_close no-mint): a matched long+short pair carries
+        // exactly opposite PnL, so settling BOTH sides through the PnL pool must
+        // never increase Σ deposited. The winner's credit is bounded by the pool
+        // the loser's debit actually collected (nothing minted — the vault's
+        // USDC is never over-issued); the unfunded remainder is a claim, never
+        // `deposited`.
+        #[test]
+        fn settle_close_conserves_deposited_sum(
+            d_long in 0u64..1_000_000_000_000u64,
+            d_short in 0u64..1_000_000_000_000u64,
+            notional in 1u64..1_000_000_000_000u64,
+            entry_n in 1u64..1_000u64,
+            entry_d in 1u64..1_000u64,
+            cur_n in 1_000u64..100_000u64,
+            cur_d in 1u64..1_000u64,
+        ) {
+            let (n_sum, d_sum) =
+                accumulate_entry(0, 0, entry_n, entry_d, notional).unwrap();
+            let p_long = pnl(n_sum, d_sum, cur_n, cur_d, notional, PositionSide::Long).unwrap();
+            let p_short = pnl(n_sum, d_sum, cur_n, cur_d, notional, PositionSide::Short).unwrap();
+            prop_assert_eq!(p_long, -p_short, "matched pair has exact opposite PnL");
+            if p_long <= 0 {
+                return Ok(());
+            }
+            let credit = p_long as u64;
+            let debit = p_short.unsigned_abs().min(u64::MAX as u128) as u64;
+            // Loser (short) settles first: collect its loss into the pool.
+            let (d_short_after, pool) = apply_debit(d_short, 0, debit).unwrap();
+            // Winner (long) settles second: paid only up to the pool; the
+            // remainder is a pending claim (never `deposited`).
+            let (d_long_after, _claimable, _pool) = apply_credit(d_long, 0, pool, credit).unwrap();
+            let sum_before = d_long as u128 + d_short as u128;
+            let sum_after = d_long_after as u128 + d_short_after as u128;
+            prop_assert!(
+                sum_after <= sum_before,
+                "settle_close must conserve Σ deposited (no mint); got +{}",
+                sum_after.saturating_sub(sum_before)
+            );
+        }
+
+        // INVARIANT (settle_funding zero-sum): for identical notional/rate/epochs,
+        // the long and short funding flows are exact opposites, so accruing both
+        // through the pool must never increase Σ deposited (the payer's debit
+        // fully funds the payee's credit; the rest is a pending claim).
+        #[test]
+        fn funding_settlement_conserves_deposited_sum(
+            d_long in 0u64..1_000_000_000_000u64,
+            d_short in 0u64..1_000_000_000_000u64,
+            notional in 1u64..1_000_000_000_000u64,
+            rate in 1i128..=1_000_000i128,
+            epochs in 1u64..1_000u64,
+        ) {
+            let p_long = funding_payment(notional, rate, epochs, SideFlow::Long);
+            let p_short = funding_payment(notional, rate, epochs, SideFlow::Short);
+            prop_assert_eq!(p_long, -p_short, "long/short funding flows are exact opposites");
+            prop_assert!(p_long <= 0, "positive rate => long pays");
+            let credit = p_short as u64;
+            let debit = p_long.unsigned_abs().min(u64::MAX as u128) as u64;
+            // Payer (long) settles first: collect its payment into the pool.
+            let (d_long_after, pool) = apply_debit(d_long, 0, debit).unwrap();
+            // Payee (short) settles second: paid only up to the pool.
+            let (d_short_after, _claimable, _pool) = apply_credit(d_short, 0, pool, credit).unwrap();
+            let sum_before = d_long as u128 + d_short as u128;
+            let sum_after = d_long_after as u128 + d_short_after as u128;
+            prop_assert!(
+                sum_after <= sum_before,
+                "settle_funding must be zero-sum (no mint); got +{}",
+                sum_after.saturating_sub(sum_before)
+            );
+        }
+    }
+
+    /// Minimal reachable witness (REWRITTEN for [fix A]): a long and short are
+    /// filled at the same entry basis (rate 1.0) for 100 USDC notional; the
+    /// index doubles. The long's +100 USDC credit is bounded by the pool the
+    /// short's -100 USDC debit actually collected (the short only posted its 10
+    /// USDC initial margin, so only 10 USDC is collected): the winner is paid
+    /// 10 USDC on top of their own 10 USDC margin, the other 90 USDC becomes a
+    /// pending claim, and Σ deposited stays at 20 USDC — nothing minted.
+    #[test]
+    fn settle_close_mints_value_when_loser_undercollateralized() {
+        let notional = 100_000_000u64; // 100 USDC
+        let (n_sum, d_sum) = accumulate_entry(0, 0, 1, 1, notional).unwrap();
+        let p_long = pnl(n_sum, d_sum, 2, 1, notional, PositionSide::Long).unwrap();
+        let p_short = pnl(n_sum, d_sum, 2, 1, notional, PositionSide::Short).unwrap();
+        assert_eq!(p_long, 100_000_000, "long profits 100 USDC on a 2x index");
+        assert_eq!(p_short, -100_000_000, "short loses 100 USDC");
+
+        let d_long = 10_000_000u64; // 10 USDC initial margin
+        let d_short = 10_000_000u64;
+        let (d_short_after, pool) = apply_debit(d_short, 0, p_short.unsigned_abs() as u64).unwrap();
+        let (d_long_after, claimable, pool) = apply_credit(d_long, 0, pool, p_long as u64).unwrap();
+
+        // [fix A] the loser is clamped at zero (only its 10 USDC is collected)…
+        assert_eq!(
+            d_short_after, 0,
+            "loser debit collected (10 USDC) into the pool"
+        );
+        // …so the winner is paid only the collected 10 USDC (20 USDC total), not
+        // the full 100 USDC profit.
+        assert_eq!(
+            d_long_after, 20_000_000,
+            "winner paid only the funded 10 USDC"
+        );
+        assert_eq!(
+            claimable, 90_000_000,
+            "the unfunded 90 USDC is a pending claim"
+        );
+        assert_eq!(pool, 0, "pool drained");
+
+        let sum_before = d_long as u128 + d_short as u128;
+        let sum_after = d_long_after as u128 + d_short_after as u128;
+        assert_eq!(
+            sum_after,
+            sum_before,
+            "Σ deposited conserved at 20 USDC ({} before == {} after) — no mint",
+            sum_before / 1_000_000,
+            sum_after / 1_000_000
+        );
+    }
+
+    /// Minimal reachable witness for funding (REWRITTEN for [fix A]): a long pays
+    /// a short the same funding amount on positive premium. The long only holds
+    /// its 100 USDC margin but owes 1000 USDC, so its debit collects only 100
+    /// USDC; the short's +1000 USDC credit is paid only that 100 USDC, the other
+    /// 900 USDC becomes a pending claim — nothing minted.
+    #[test]
+    fn funding_mints_value_when_payer_undercollateralized() {
+        let notional = 1_000_000_000u64; // 1000 USDC
+        let rate = 100_000i128; // +10% per epoch
+        let epochs = 10u64;
+        let p_long = funding_payment(notional, rate, epochs, SideFlow::Long);
+        let p_short = funding_payment(notional, rate, epochs, SideFlow::Short);
+        assert_eq!(p_long, -1_000_000_000, "long owes 1000 USDC");
+        assert_eq!(p_short, 1_000_000_000, "short receives 1000 USDC");
+
+        let d_long = 100_000_000u64; // 100 USDC (10% margin)
+        let d_short = 100_000_000u64;
+        let (d_long_after, pool) = apply_debit(d_long, 0, p_long.unsigned_abs() as u64).unwrap();
+        let (d_short_after, claimable, pool) =
+            apply_credit(d_short, 0, pool, p_short as u64).unwrap();
+
+        assert_eq!(
+            d_long_after, 0,
+            "payer debit collected (100 USDC) into the pool"
+        );
+        assert_eq!(
+            d_short_after, 200_000_000,
+            "payee paid only the funded 100 USDC"
+        );
+        assert_eq!(
+            claimable, 900_000_000,
+            "the unfunded 900 USDC is a pending claim"
+        );
+        assert_eq!(pool, 0, "pool drained");
+
+        let sum_before = d_long as u128 + d_short as u128;
+        let sum_after = d_long_after as u128 + d_short_after as u128;
+        assert_eq!(
+            sum_after,
+            sum_before,
+            "Σ deposited conserved at 200 USDC ({} before == {} after) — no mint",
+            sum_before / 1_000_000,
+            sum_after / 1_000_000
+        );
+    }
 }

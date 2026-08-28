@@ -34,6 +34,7 @@ function market(): PerpMarketState {
     indexN: 100_000_000_000_000n,
     indexD: 100_000_000_000_000n,
     fundingAccumulator: 0n,
+    pnlPool: 0n,
     bump: 0,
   };
 }

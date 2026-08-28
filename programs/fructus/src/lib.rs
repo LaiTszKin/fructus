@@ -17,6 +17,7 @@ pub mod funding;
 pub mod liquidation;
 pub mod orderbook;
 pub mod positions;
+pub mod settlement;
 pub mod state;
 
 use constants::{
@@ -959,6 +960,8 @@ pub mod fructus {
         market.index_n = 0;
         market.index_d = 0;
         market.funding_accumulator = 0;
+        // Zero-init the Design A PnL pool alongside the funding state.
+        market.pnl_pool = 0;
         Ok(())
     }
 
@@ -1264,7 +1267,8 @@ pub mod fructus {
         );
 
         // Lazily create the per-(market, user) ledger on first deposit.
-        if ctx.accounts.user_collateral.data_is_empty() {
+        let was_empty = ctx.accounts.user_collateral.data_is_empty();
+        if was_empty {
             let rent = Rent::get()?;
             let space = 8 + UserCollateral::LEN;
             let market_key = ctx.accounts.market.key();
@@ -1308,8 +1312,23 @@ pub mod fructus {
         let mut user_collateral =
             Account::<UserCollateral>::try_from_unchecked(ctx.accounts.user_collateral.as_ref())?;
         user_collateral.bump = ctx.bumps.user_collateral;
-        user_collateral.deposited = collateral::deposit(user_collateral.deposited, amount)
+        if was_empty {
+            // [fix A] a fresh ledger starts with no pending claim.
+            user_collateral.claimable = 0;
+        }
+        // [fix A] Convert any funded pending claim into deposited first (claims
+        // are only usable through claim payout), then credit the fresh deposit.
+        let (claimed_deposited, new_claimable, new_pool) = settlement::claim_payout(
+            user_collateral.deposited,
+            user_collateral.claimable,
+            ctx.accounts.market.pnl_pool,
+        )
+        .ok_or(FructusError::ArithmeticOverflow)?;
+        let deposited = collateral::deposit(claimed_deposited, amount)
             .ok_or(FructusError::ArithmeticOverflow)?;
+        user_collateral.deposited = deposited;
+        user_collateral.claimable = new_claimable;
+        ctx.accounts.market.pnl_pool = new_pool;
         user_collateral.exit(&crate::ID)?;
 
         Ok(())
@@ -1326,9 +1345,23 @@ pub mod fructus {
 
         let user_collateral = &mut ctx.accounts.user_collateral;
 
-        // Enforce the free-collateral seam (reserved is always 0 this iteration,
-        // so this reduces to `amount <= deposited`), computing the post-withdraw
-        // balance up front so the ledger is debited only after the transfer.
+        // [fix A] Convert any funded pending claim into deposited BEFORE the
+        // free-seam check, so claims become withdrawable collateral (a claim is
+        // never directly withdrawable — only through claim payout against the
+        // pool).
+        let (claimed_deposited, new_claimable, new_pool) = settlement::claim_payout(
+            user_collateral.deposited,
+            user_collateral.claimable,
+            ctx.accounts.market.pnl_pool,
+        )
+        .ok_or(FructusError::ArithmeticOverflow)?;
+        user_collateral.deposited = claimed_deposited;
+        user_collateral.claimable = new_claimable;
+        ctx.accounts.market.pnl_pool = new_pool;
+
+        // Enforce the free-collateral seam (`amount <= deposited - reserved`),
+        // computing the post-withdraw balance up front so the ledger is debited
+        // only after the transfer.
         let new_deposited =
             collateral::withdraw(user_collateral.deposited, user_collateral.reserved, amount)
                 .ok_or(FructusError::InsufficientFreeCollateral)?;
@@ -1744,11 +1777,14 @@ pub mod fructus {
     /// never reframes the pending closed-notional PnL (R-S1).
     ///
     /// * `closed_notional == 0` is an idempotent no-op (R-S3).
-    /// * A positive PnL credits the ledger; a negative PnL debits it via
-    ///   [`positions::apply_pnl`], which clamps so `deposited` never goes
-    ///   negative (the vault is never insolvent — R-S3).
+    /// * The signed PnL is routed through the Design A PnL pool
+    ///   ([`crate::settlement::settle_signed`]): a loss is collected into
+    ///   `PerpMarket.pnl_pool` (clamped at `deposited`, so it never goes
+    ///   negative — R-S3); a profit is paid only up to the pool, the unfunded
+    ///   remainder becoming a pending `claimable` (never minted into
+    ///   `deposited`).
     pub fn settle_close<'info>(ctx: Context<'info, SettleClose<'info>>) -> Result<()> {
-        let market = &ctx.accounts.market;
+        let market = &mut ctx.accounts.market;
         let position = &mut ctx.accounts.position;
 
         // Bind the supplied accounts to the market + the user's PDAs
@@ -1780,9 +1816,19 @@ pub mod fructus {
             side,
         )
         .ok_or(FructusError::ArithmeticOverflow)?;
-        let new_deposited = positions::apply_pnl(ctx.accounts.user_collateral.deposited, pnl)
-            .ok_or(FructusError::ArithmeticOverflow)?;
+        // [fix A] Route through the PnL pool: a loser's debit is collected into
+        // the pool, a winner's credit is paid only up to the pool (the remainder
+        // becomes a pending claim) — never minted into `deposited`.
+        let (new_deposited, new_claimable, new_pool) = settlement::settle_signed(
+            ctx.accounts.user_collateral.deposited,
+            ctx.accounts.user_collateral.claimable,
+            market.pnl_pool,
+            pnl,
+        )
+        .ok_or(FructusError::ArithmeticOverflow)?;
         ctx.accounts.user_collateral.deposited = new_deposited;
+        ctx.accounts.user_collateral.claimable = new_claimable;
+        market.pnl_pool = new_pool;
         position.closed_notional = 0;
         position.closed_entry_n_sum = 0;
         position.closed_entry_d_sum = 0;
@@ -1798,8 +1844,11 @@ pub mod fructus {
     /// rate), the `mark` (order-book `mid`, falling back to `index` so a
     /// one-sided/empty book yields `premium == 0`), the clamped
     /// [`funding::funding_rate`], and the signed
-    /// [`funding::funding_payment`] applied to the user's collateral via
-    /// [`positions::apply_pnl`] (long flow negative on positive premium — R-F3).
+    /// [`funding::funding_payment`] applied to the user's collateral via the
+    /// Design A PnL pool ([`crate::settlement::settle_signed`]) — a payer's
+    /// debit is collected into `PerpMarket.pnl_pool`, a payee's credit is paid
+    /// only up to the pool, the remainder becoming a pending claim (long flow
+    /// negative on positive premium — R-F3).
     ///
     /// * `epochs == 0` is an idempotent no-op (re-settling the same epoch adds
     ///   nothing — R-F5).
@@ -1870,9 +1919,19 @@ pub mod fructus {
             funding::SideFlow::from_position_side(side),
         );
 
-        let new_deposited = positions::apply_pnl(ctx.accounts.user_collateral.deposited, payment)
-            .ok_or(FructusError::ArithmeticOverflow)?;
+        // [fix A] Route the signed payment through the PnL pool: a payer's debit
+        // is collected into the pool, a payee's credit is paid only up to the
+        // pool (the remainder becomes a pending claim) — never minted.
+        let (new_deposited, new_claimable, new_pool) = settlement::settle_signed(
+            ctx.accounts.user_collateral.deposited,
+            ctx.accounts.user_collateral.claimable,
+            market.pnl_pool,
+            payment,
+        )
+        .ok_or(FructusError::ArithmeticOverflow)?;
         ctx.accounts.user_collateral.deposited = new_deposited;
+        ctx.accounts.user_collateral.claimable = new_claimable;
+        market.pnl_pool = new_pool;
         position.last_funding_epoch = cur_epoch;
         market.funding_epoch = cur_epoch;
         market.index_n = rate.total_lamports;
@@ -1905,7 +1964,7 @@ pub mod fructus {
     /// health metric; the order-book TWAP is the reserved reference price +
     /// staleness guard rather than the literal health input (confirm at review).
     pub fn liquidate<'info>(ctx: Context<'info, Liquidate<'info>>, amount: u64) -> Result<()> {
-        let market = &ctx.accounts.market;
+        let market = &mut ctx.accounts.market;
         let position = &mut ctx.accounts.position;
 
         require!(
@@ -1991,13 +2050,33 @@ pub mod fructus {
             .ok_or(FructusError::ArithmeticOverflow)?;
         ctx.accounts.user_collateral.reserved = new_reserved;
 
+        // [fix A] Book the victim's realized loss into the PnL pool so the loser
+        // is actually collected (never vanishes as a counterparty).
+        // `apply_liquidation_loss` caps `booked` at
+        // `deposited - reserved_after - reward`, so the reward is payable first
+        // and other positions' reserved backing is never touched (no underflow).
+        let loss = pnl.unsigned_abs().min(u64::MAX as u128) as u64;
+        let (victim_after_loss, booked) = settlement::apply_liquidation_loss(
+            ctx.accounts.user_collateral.deposited,
+            new_reserved,
+            loss,
+            reward,
+        )
+        .ok_or(FructusError::ArithmeticOverflow)?;
+        market.pnl_pool = market
+            .pnl_pool
+            .checked_add(booked)
+            .ok_or(FructusError::ArithmeticOverflow)?;
+        ctx.accounts.user_collateral.deposited = victim_after_loss;
+
         // Credit the liquidator reward to their collateral ledger (R-L3). The
         // reward is a transfer OUT OF the victim's released margin (`consumed`,
         // which is `>= reward` by apply_liquidation's `remaining + reward <=
         // position_collateral` bound), so the victim's `deposited` is debited by
-        // exactly `reward`. Σ `deposited` across victim + liquidator is therefore
-        // conserved and the vault is never over-issued (a liquidation must NOT
-        // mint collateral).
+        // exactly `reward` while the liquidator's is credited by the same amount
+        // — a zero-sum transfer. Combined with the loss booked into `pnl_pool`
+        // above, the FULL transition conserves Σ(deposited + pool): a liquidation
+        // must NOT mint collateral.
         let new_liquidator_deposited = ctx
             .accounts
             .liquidator_collateral
@@ -2188,7 +2267,7 @@ pub struct InitializeCollateralVault<'info> {
 pub struct DepositCollateral<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
-    #[account(seeds = [PERP_MARKET_SEED], bump = market.bump)]
+    #[account(mut, seeds = [PERP_MARKET_SEED], bump = market.bump)]
     pub market: Account<'info, PerpMarket>,
     /// CHECK: the per-(market, user) ledger, lazily created by the handler on
     /// first deposit.
@@ -2217,7 +2296,7 @@ pub struct DepositCollateral<'info> {
 #[derive(Accounts)]
 pub struct WithdrawCollateral<'info> {
     pub user: Signer<'info>,
-    #[account(seeds = [PERP_MARKET_SEED], bump = market.bump)]
+    #[account(mut, seeds = [PERP_MARKET_SEED], bump = market.bump)]
     pub market: Account<'info, PerpMarket>,
     #[account(
         mut,
@@ -2368,7 +2447,7 @@ pub struct ResetPosition<'info> {
 
 #[derive(Accounts)]
 pub struct SettleClose<'info> {
-    #[account(seeds = [PERP_MARKET_SEED], bump = market.bump)]
+    #[account(mut, seeds = [PERP_MARKET_SEED], bump = market.bump)]
     pub market: Account<'info, PerpMarket>,
     /// CHECK: the per-(market, user, side) `Position` PDA; the handler verifies
     /// `position.market == market` and the user's `UserCollateral` PDA from
@@ -2417,7 +2496,7 @@ pub struct SettleFunding<'info> {
 
 #[derive(Accounts)]
 pub struct Liquidate<'info> {
-    #[account(seeds = [PERP_MARKET_SEED], bump = market.bump)]
+    #[account(mut, seeds = [PERP_MARKET_SEED], bump = market.bump)]
     pub market: Account<'info, PerpMarket>,
     /// CHECK: the per-(market, user, side) `Position` PDA of the liquidated
     /// account; the handler verifies `position.market == market` and the
@@ -2951,6 +3030,7 @@ mod handlers_tests {
         UserCollateral {
             deposited,
             reserved,
+            claimable: 0,
             bump: 0,
         }
     }

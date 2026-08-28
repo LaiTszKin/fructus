@@ -486,7 +486,7 @@ async fn deposit(env: &mut Env, user: &User, amount: u64) -> Result<(), BanksCli
         program_id: fructus::ID,
         accounts: vec![
             AccountMeta::new(user.keypair.pubkey(), true), // user (signer, mut)
-            AccountMeta::new_readonly(env.market, false),  // market
+            AccountMeta::new(env.market, false),           // market (mut)
             AccountMeta::new(user.user_collateral, false), // user_collateral (mut)
             AccountMeta::new(env.vault, false),            // vault (mut)
             AccountMeta::new(user.ata, false),             // user_ata (mut)
@@ -505,7 +505,7 @@ async fn withdraw(env: &mut Env, user: &User, amount: u64) -> Result<(), BanksCl
         program_id: fructus::ID,
         accounts: vec![
             AccountMeta::new_readonly(user.keypair.pubkey(), true), // user (signer)
-            AccountMeta::new_readonly(env.market, false),           // market
+            AccountMeta::new(env.market, false),                    // market (mut)
             AccountMeta::new(user.user_collateral, false),          // user_collateral (mut)
             AccountMeta::new(env.vault, false),                     // vault (mut)
             AccountMeta::new(user.ata, false),                      // user_ata (mut)
@@ -2195,7 +2195,7 @@ proptest! {
             let liq_ix = Instruction {
                 program_id: fructus::ID,
                 accounts: vec![
-                    AccountMeta::new_readonly(env.market, false), // market
+                    AccountMeta::new(env.market, false), // market (mut)
                     AccountMeta::new(a.long, false), // position (mut)
                     AccountMeta::new(a.user_collateral, false), // user_collateral (mut)
                     AccountMeta::new(env.order_book, false), // order_book (mut)

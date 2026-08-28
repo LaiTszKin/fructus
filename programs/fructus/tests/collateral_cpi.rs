@@ -320,7 +320,7 @@ async fn deposit(env: &mut Env, amount: u64) -> Result<(), BanksClientError> {
         program_id: fructus::ID,
         accounts: vec![
             AccountMeta::new(env.user.pubkey(), true), // user (signer, mut)
-            AccountMeta::new_readonly(env.market, false), // market
+            AccountMeta::new(env.market, false),       // market (mut)
             AccountMeta::new(env.user_collateral, false), // user_collateral (mut)
             AccountMeta::new(env.vault, false),        // vault (mut)
             AccountMeta::new(env.user_ata, false),     // user_ata (mut)
@@ -339,7 +339,7 @@ async fn withdraw(env: &mut Env, amount: u64) -> Result<(), BanksClientError> {
         program_id: fructus::ID,
         accounts: vec![
             AccountMeta::new_readonly(env.user.pubkey(), true), // user (signer)
-            AccountMeta::new_readonly(env.market, false),       // market
+            AccountMeta::new(env.market, false),                // market (mut)
             AccountMeta::new(env.user_collateral, false),       // user_collateral (mut)
             AccountMeta::new(env.vault, false),                 // vault (mut)
             AccountMeta::new(env.user_ata, false),              // user_ata (mut)

@@ -31,15 +31,15 @@ import {
 
 // Cross-language layout lock (R-SDK3b): the account-layout offset/size
 // constants must be byte-identical with `programs/fructus/src/state.rs`, whose
-// unit tests pin `PerpMarket::LEN == 197`, `Position::LEN == 138`,
-// `UserCollateral::LEN == 17`, `Order::LEN == 64`, `OutEvent::LEN == 112`,
+// unit tests pin `PerpMarket::LEN == 205`, `Position::LEN == 170`,
+// `UserCollateral::LEN == 25`, `Order::LEN == 64`, `OutEvent::LEN == 112`,
 // `Observation::LEN == 32`, `OrderBook::LEN == 6_232`. Field offsets follow the
 // borsh / `#[repr(C)]` field order declared in `state.rs`.
 
 test("pinned payload sizes match the on-chain program", () => {
-  assert.equal(PERP_MARKET_LEN, 197);
+  assert.equal(PERP_MARKET_LEN, 205);
   assert.equal(POSITION_LEN, 170);
-  assert.equal(USER_COLLATERAL_LEN, 17);
+  assert.equal(USER_COLLATERAL_LEN, 25);
   assert.equal(YIELD_ORACLE_LEN, 97);
   assert.equal(ORDER_LEN, 64);
   assert.equal(OUT_EVENT_LEN, 112);
@@ -47,7 +47,7 @@ test("pinned payload sizes match the on-chain program", () => {
   assert.equal(ORDER_BOOK_LEN, 6_232);
 });
 
-test("PerpMarket offsets sum to LEN 197", () => {
+test("PerpMarket offsets sum to LEN 205", () => {
   const o = PerpMarket;
   // indices + sizes in field order.
   const order: [number, number][] = [
@@ -64,6 +64,7 @@ test("PerpMarket offsets sum to LEN 197", () => {
     [o.indexN, 8],
     [o.indexD, 8],
     [o.fundingAccumulator, 16],
+    [o.pnlPool, 8],
     [o.bump, 1],
   ];
   let cursor = 0;
@@ -72,11 +73,13 @@ test("PerpMarket offsets sum to LEN 197", () => {
     cursor += size;
   }
   assert.equal(cursor, PERP_MARKET_LEN);
-  // Spot-check the documented funding-field offsets (R-F4 fields).
+  // Spot-check the documented funding-field offsets (R-F4 fields) + the Design A
+  // PnL pool.
   assert.equal(o.fundingEpoch, 156);
   assert.equal(o.indexN, 164);
   assert.equal(o.indexD, 172);
   assert.equal(o.fundingAccumulator, 180);
+  assert.equal(o.pnlPool, 196);
 });
 
 test("Position offsets sum to LEN 170", () => {
@@ -113,6 +116,7 @@ test("UserCollateral and YieldOracle offsets", () => {
   for (const [off, size] of [
     [UserCollateralLayout.deposited, 8],
     [UserCollateralLayout.reserved, 8],
+    [UserCollateralLayout.claimable, 8],
     [UserCollateralLayout.bump, 1],
   ]) {
     assert.equal(off, cursor);
@@ -181,6 +185,7 @@ test("decodePerpMarket reads every field incl the funding state", () => {
   for (let i = 0; i < 16; i++) {
     buf[D + PerpMarket.fundingAccumulator + i] = Number((acc >> BigInt(8 * i)) & 0xffn);
   }
+  buf.writeBigUInt64LE(7_000n, D + PerpMarket.pnlPool);
   buf[D + PerpMarket.bump] = 255;
 
   const m = decodePerpMarket(buf)!;
@@ -195,6 +200,7 @@ test("decodePerpMarket reads every field incl the funding state", () => {
   assert.equal(m.indexN, 111n);
   assert.equal(m.indexD, 222n);
   assert.equal(m.fundingAccumulator, -42n);
+  assert.equal(m.pnlPool, 7_000n);
   assert.equal(m.bump, 255);
 });
 
@@ -232,14 +238,16 @@ test("decodePosition reads the closed_notional + entry sums", () => {
   assert.equal(p.bump, 200);
 });
 
-test("decodeUserCollateral reads deposited/reserved/bump", () => {
+test("decodeUserCollateral reads deposited/reserved/claimable/bump", () => {
   const buf = Buffer.alloc(D + USER_COLLATERAL_LEN);
   buf.writeBigUInt64LE(1_234_567n, D + UserCollateralLayout.deposited);
   buf.writeBigUInt64LE(0n, D + UserCollateralLayout.reserved);
+  buf.writeBigUInt64LE(42n, D + UserCollateralLayout.claimable);
   buf[D + UserCollateralLayout.bump] = 9;
   const uc = decodeUserCollateral(buf)!;
   assert.equal(uc.deposited, 1_234_567n);
   assert.equal(uc.reserved, 0n);
+  assert.equal(uc.claimable, 42n);
   assert.equal(uc.bump, 9);
 });
 

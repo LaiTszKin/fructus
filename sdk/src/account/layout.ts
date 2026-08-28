@@ -14,8 +14,8 @@
 /** Anchor account discriminator length prepended to every account payload. */
 export const DISCRIMINATOR = 8;
 
-// --- PerpMarket (borsh `#[account]`), payload LEN = 197 ---------------------
-export const PERP_MARKET_LEN = 197;
+// --- PerpMarket (borsh `#[account]`), payload LEN = 205 ---------------------
+export const PERP_MARKET_LEN = 205;
 export const PerpMarket = {
   indexSource: 0,
   collateralMint: 32,
@@ -30,7 +30,8 @@ export const PerpMarket = {
   indexN: 164,
   indexD: 172,
   fundingAccumulator: 180,
-  bump: 196,
+  pnlPool: 196,
+  bump: 204,
 } as const;
 
 // --- Position (borsh `#[account]`), payload LEN = 170 -----------------------
@@ -51,12 +52,13 @@ export const Position = {
   bump: 169,
 } as const;
 
-// --- UserCollateral (borsh `#[account]`), payload LEN = 17 ------------------
-export const USER_COLLATERAL_LEN = 17;
+// --- UserCollateral (borsh `#[account]`), payload LEN = 25 ------------------
+export const USER_COLLATERAL_LEN = 25;
 export const UserCollateralLayout = {
   deposited: 0,
   reserved: 8,
-  bump: 16,
+  claimable: 16,
+  bump: 24,
 } as const;
 
 // --- YieldOracle (borsh `#[account]`), payload LEN = 97 ---------------------

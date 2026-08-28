@@ -1,4 +1,5 @@
-//! Independent adversarial review of the liquidation **ledger** transition.
+//! Independent adversarial review of the liquidation **ledger** transition
+//! (updated for [fix A] — the Design A PnL pool).
 //!
 //! `apply_liquidation` (pure) returns the surviving position collateral and the
 //! liquidator reward, and it is correctly bounded (`remaining + reward <=
@@ -6,34 +7,41 @@
 //! the `UserCollateral` ledgers:
 //!
 //! ```text
-//! consumer  = position.collateral - remaining_collateral      // released
-//! victim.user_collateral.reserved  -= consumer                // margin released
-//! victim.user_collateral.deposited -= reward                  // penalty out
-//! liquidator_collateral.deposited  += reward                  // penalty in
+//! consumed  = position.collateral - remaining_collateral      // released
+//! victim.user_collateral.reserved  -= consumed                // margin released
+//! reserved_after = victim.user_collateral.reserved            // (after release)
+//!
+//! // [fix A] book the victim's realized loss into the PnL pool, capped at
+//! // deposited - reserved_after - reward (reward payable first):
+//! booked    = apply_liquidation_loss(deposited, reserved_after, loss, reward)
+//! market.pnl_pool                      += booked              // loss collected
+//! victim.user_collateral.deposited     -= booked              // loss realized
+//!
+//! // the reward stays a ZERO-SUM transfer out of the victim's released margin:
+//! victim.user_collateral.deposited      -= reward             // penalty out
+//! liquidator_collateral.deposited       += reward             // penalty in
 //! ```
 //!
-//! The reward is paid out of the victim's released margin (`consumer >= reward`),
+//! The reward is paid out of the victim's released margin (`consumed >= reward`),
 //! so the victim's `deposited` falls by `reward` and the liquidator's rises by
-//! the same amount: the sum of `deposited` across victim + liquidator is
-//! **conserved** — a liquidation transfers value, it never mints it.
-//!
-//! The invariant pinned here is the conservation/anti-inflation property: **a
-//! liquidation must not create collateral. The reward is paid out of the
-//! victim's released margin, so the victim's `deposited` falls by `reward` and
-//! the sum of `deposited` across the victim + liquidator is unchanged.**
+//! the same amount — that part alone is a zero-sum transfer. With [fix A] the
+//! victim's realized loss is **also** booked into the pool, so the FULL
+//! transition conserves Σ(deposited + pool): a liquidation transfers value, it
+//! never mints it.
 
 use fructus::liquidation::apply_liquidation;
 use fructus::positions::margin_required;
+use fructus::settlement::apply_liquidation_loss;
 use proptest::prelude::*;
 
 const PENALTY_BPS: u16 = 500; // LIQUIDATION_PENALTY_BPS
 
-/// Faithful reproduction of the `liquidate` handler's ledger transition (the
-/// exact corrected sequence in lib.rs: the reward is a transfer OUT of the
-/// victim's released margin, so victim `deposited` falls by the reward while
-/// the liquidator's rises by it — Σ deposited is conserved).
+/// Faithful reproduction of the `liquidate` handler's FULL ledger transition
+/// [fix A]: the reward is a transfer OUT of the victim's released margin, and
+/// the victim's realized loss is booked into the PnL pool.
 ///
-/// Returns `(victim_deposited_after, liquidator_deposited_after, reward)`.
+/// Returns `(victim_deposited_after, liquidator_deposited_after, pool_after,
+/// reward, booked)`.
 fn handler_transition(
     victim_deposited: u64,
     liquidator_deposited: u64,
@@ -42,7 +50,8 @@ fn handler_transition(
     amount: u64,
     initial_bps: u16,
     maintenance_bps: u16,
-) -> Option<(u64, u64, u64)> {
+    loss: u64, // magnitude of the (negative) index-based realized PnL
+) -> Option<(u64, u64, u64, u64, u64)> {
     let (remaining_collateral, reward) = apply_liquidation(
         position_collateral,
         notional,
@@ -52,27 +61,32 @@ fn handler_transition(
         PENALTY_BPS,
     )
     .ok()?;
-    let _consumed = position_collateral.saturating_sub(remaining_collateral);
-    // victim.user_collateral.reserved -= consumed  (margin released)
-    // victim.user_collateral.deposited -= reward   (penalty transferred out)
-    // liquidator_collateral.deposited += reward
-    let victim_after = victim_deposited.checked_sub(reward)?;
+    let consumed = position_collateral.saturating_sub(remaining_collateral);
+    let reserved_after = position_collateral.saturating_sub(consumed); // reserved - consumed
+                                                                       // [fix A] book the loss into the pool, capped at deposited - reserved_after - reward.
+    let (victim_after_loss, booked) =
+        apply_liquidation_loss(victim_deposited, reserved_after, loss, reward)?;
+    let pool_after = booked; // market.pnl_pool += booked (starting pool == 0)
+                             // The reward transfer is zero-sum across victim + liquidator.
+    let victim_after = victim_after_loss.checked_sub(reward)?;
     let liquidator_after = liquidator_deposited.checked_add(reward)?;
-    Some((victim_after, liquidator_after, reward))
+    Some((victim_after, liquidator_after, pool_after, reward, booked))
 }
 
 proptest! {
-    #![proptest_config(proptest::test_runner::Config::with_cases(10_000))]
+    #![proptest_config(ProptestConfig::with_cases(10_000))]
 
-    // The liquidation ledger must conserve `deposited`: the reward is a transfer
-    // out of the victim's margin (`apply_liquidation`'s `remaining + reward <=
-    // position_collateral` bound guarantees the victim's `deposited >= reward`),
-    // so Σ deposited is unchanged for any liquidation — reward 0 or not.
+    // [fix A] The FULL liquidation ledger conserves Σ(deposited + pool): the
+    // reward is a zero-sum transfer out of the victim's released margin AND the
+    // victim's realized loss is booked into the pool, so
+    // Σ(victim.deposited + liquidator.deposited + pool) is unchanged for any
+    // liquidation — reward 0 or not, loss 0 or not.
     #[test]
-    fn liquidation_conserves_total_deposited(
+    fn liquidation_conserves_total_deposited_plus_pool(
         (notional, amount, initial_bps, maintenance_bps) in
             (2u64..1_000_000_000u64, 1u64..1_000_000_000u64, 2u16..=10_000u16)
-                .prop_flat_map(|(n, a, ib)| (proptest::prelude::Just(n), proptest::prelude::Just(a), proptest::prelude::Just(ib), 1u16..ib))
+                .prop_flat_map(|(n, a, ib)| (proptest::prelude::Just(n), proptest::prelude::Just(a), proptest::prelude::Just(ib), 1u16..ib)),
+        loss in 0u64..1_000_000_000_000u64,
     ) {
         let amount = amount.min(notional);
         // An on-chain position is backed at the INITIAL margin ratio (state.rs).
@@ -80,21 +94,28 @@ proptest! {
         let victim_deposited = position_collateral.saturating_add(100_000_000);
         let liquidator_deposited = 500_000_000u64;
 
-        let (victim_after, liquidator_after, _reward) = handler_transition(
+        let (victim_after, liquidator_after, pool_after, _reward, _booked) = handler_transition(
             victim_deposited, liquidator_deposited, position_collateral,
-            notional, amount, initial_bps, maintenance_bps,
+            notional, amount, initial_bps, maintenance_bps, loss,
         ).expect("valid partial/full liquidation");
 
-        let sum_before = victim_deposited.saturating_add(liquidator_deposited);
-        let sum_after = victim_after.saturating_add(liquidator_after);
+        let before = (victim_deposited as u128) + (liquidator_deposited as u128);
+        let after = (victim_after as u128) + (liquidator_after as u128) + (pool_after as u128);
         prop_assert_eq!(
-            sum_after, sum_before,
-            "liquidation must not mint collateral: the reward is a transfer out of the victim's deposited, so Σ deposited is conserved (the vault is never over-issued)"
+            after, before,
+            "liquidation must not mint collateral: the reward is a zero-sum transfer and the loss is booked into the pool, so Σ(deposited + pool) is conserved"
+        );
+        // The surviving collateral still backs the surviving exposure, and the
+        // victim's free seam is never breached by the loss booking + reward.
+        let reserved_after = margin_required(notional - amount, initial_bps).unwrap();
+        prop_assert!(
+            victim_after >= reserved_after,
+            "victim's remaining deposited never breaches the surviving reserved backing"
         );
     }
 }
 
-/// Deterministic minimal witness.
+/// Deterministic minimal witness ([fix A]).
 #[test]
 fn liquidation_mints_collateral_witness() {
     // N=100, initial 10% (position_collateral = 10), maintenance 5%, amount 50.
@@ -106,8 +127,12 @@ fn liquidation_mints_collateral_witness() {
     let maintenance_bps = 500u16;
     let position_collateral = margin_required(notional, initial_bps).expect("total");
 
+    // A liquidatable victim: equity (collateral + pnl) is below maintenance.
+    // With collateral == 10 and maintenance == margin_required(100, 500) == 5, a
+    // loss of 6 makes equity == 4 < 5. The booked loss is capped by the seam.
+    let loss = 6u64;
     let (victim_deposited, liquidator_deposited) = (10_000u64, 0u64);
-    let (victim_after, liquidator_after, reward) = handler_transition(
+    let (victim_after, liquidator_after, pool_after, reward, booked) = handler_transition(
         victim_deposited,
         liquidator_deposited,
         position_collateral,
@@ -115,12 +140,10 @@ fn liquidation_mints_collateral_witness() {
         amount,
         initial_bps,
         maintenance_bps,
+        loss,
     )
     .expect("valid partial liquidation");
 
-    // The liquidator's deposited grows by the reward while the victim's falls by
-    // the same amount: Σ deposited IS conserved (a pure transfer; the vault is
-    // never over-issued).
     assert!(
         reward > 0,
         "witness needs a nonzero penalty to demonstrate the conservation"
@@ -132,12 +155,16 @@ fn liquidation_mints_collateral_witness() {
     );
     assert_eq!(
         victim_after,
-        victim_deposited - reward,
-        "victim deposited debited by the reward (paid out of the released margin)"
+        victim_deposited - booked - reward,
+        "victim deposited debited by the booked loss AND the reward"
     );
     assert_eq!(
-        victim_after.saturating_add(liquidator_after),
-        victim_deposited.saturating_add(liquidator_deposited),
-        "Σ deposited is conserved: the liquidation transfers, it never mints"
+        pool_after, booked,
+        "the booked loss is collected into the pool"
+    );
+    assert_eq!(
+        (victim_after as u128) + (liquidator_after as u128) + (pool_after as u128),
+        (victim_deposited as u128) + (liquidator_deposited as u128),
+        "Σ(deposited + pool) is conserved: the liquidation transfers, it never mints"
     );
 }

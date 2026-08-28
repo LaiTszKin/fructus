@@ -53,6 +53,8 @@ export interface PerpMarketState {
   indexD: bigint;
   /** Signed cumulative funding (i128). */
   fundingAccumulator: bigint;
+  /** Market-level PnL pool (Design A): USDC microunits collected from losers. */
+  pnlPool: bigint;
   bump: number;
 }
 
@@ -75,6 +77,7 @@ export function decodePerpMarket(data: Buffer | null): PerpMarketState | null {
     indexN: data.readBigUInt64LE(d + PerpMarket.indexN),
     indexD: data.readBigUInt64LE(d + PerpMarket.indexD),
     fundingAccumulator: readI128LE(data, d + PerpMarket.fundingAccumulator),
+    pnlPool: data.readBigUInt64LE(d + PerpMarket.pnlPool),
     bump: data[d + PerpMarket.bump],
   };
 }
@@ -131,6 +134,8 @@ export function decodePosition(data: Buffer | null): PositionState | null {
 export interface UserCollateralState {
   deposited: bigint;
   reserved: bigint;
+  /** Pending (unfunded) PnL/funding claim (Design A); not directly withdrawable. */
+  claimable: bigint;
   bump: number;
 }
 
@@ -142,6 +147,7 @@ export function decodeUserCollateral(data: Buffer | null): UserCollateralState |
   return {
     deposited: data.readBigUInt64LE(d + UserCollateralLayout.deposited),
     reserved: data.readBigUInt64LE(d + UserCollateralLayout.reserved),
+    claimable: data.readBigUInt64LE(d + UserCollateralLayout.claimable),
     bump: data[d + UserCollateralLayout.bump],
   };
 }

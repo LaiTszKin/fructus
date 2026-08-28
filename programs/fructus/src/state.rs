@@ -77,6 +77,12 @@ pub struct PerpMarket {
     /// sum of every `settle_funding` payment (R-F4). Net-additive; long flows are
     /// negative, short flows positive.
     pub funding_accumulator: i128,
+    /// Market-level PnL pool (Design A): USDC microunits collected from losers'
+    /// realized losses / funding debits, from which winners' credits are paid
+    /// (`min(credit, pool)`; the remainder is a per-user pending claim). Zero at
+    /// init; written by `settle_close` / `settle_funding` / `liquidate` /
+    /// deposit/withdraw claim payout.
+    pub pnl_pool: u64,
     /// Market PDA bump seed.
     pub bump: u8,
 }
@@ -85,8 +91,8 @@ impl PerpMarket {
     /// Serialized size of the account payload (excluding the 8-byte discriminator).
     ///
     /// Packed borsh layout:
-    /// `32 + 32 + 8 + 8 + 8 + 2 + 2 + 32 + 32 + 8 + 8 + 8 + 16 + 1 = 197`.
-    pub const LEN: usize = 32 + 32 + 8 + 8 + 8 + 2 + 2 + 32 + 32 + 8 + 8 + 8 + 16 + 1;
+    /// `32 + 32 + 8 + 8 + 8 + 2 + 2 + 32 + 32 + 8 + 8 + 8 + 16 + 8 + 1 = 205`.
+    pub const LEN: usize = 32 + 32 + 8 + 8 + 8 + 2 + 2 + 32 + 32 + 8 + 8 + 8 + 16 + 8 + 1;
 }
 
 // --- Order book + collateral vault (issues #3 & #4) ---
@@ -291,8 +297,14 @@ impl OrderBook {
 pub struct UserCollateral {
     /// USDC deposited by the user, in microunits (6 decimals).
     pub deposited: u64,
-    /// USDC reserved for open positions, in microunits (always `0` this iteration).
+    /// USDC reserved for open positions, in microunits.
     pub reserved: u64,
+    /// Pending (unfunded) PnL/funding claim, in microunits — the Design A PnL-pool
+    /// remainder. NOT withdrawable directly: it becomes `deposited` only through
+    /// `claim_payout` (run at the start of deposit/withdraw), funded by losses
+    /// actually collected into `PerpMarket.pnl_pool`. Orthogonal to the
+    /// `deposited = reserved + free` invariant.
+    pub claimable: u64,
     /// PDA bump seed.
     pub bump: u8,
 }
@@ -300,8 +312,8 @@ pub struct UserCollateral {
 impl UserCollateral {
     /// Serialized size of the account payload (excluding the 8-byte discriminator).
     ///
-    /// Packed borsh layout: `deposited(8) + reserved(8) + bump(1) = 17`.
-    pub const LEN: usize = 8 + 8 + 1;
+    /// Packed borsh layout: `deposited(8) + reserved(8) + claimable(8) + bump(1) = 25`.
+    pub const LEN: usize = 8 + 8 + 8 + 1;
 }
 
 // --- Position lifecycle (issue #5) ---
@@ -455,6 +467,7 @@ mod tests {
         let uc = UserCollateral {
             deposited: 0,
             reserved: 0,
+            claimable: 0,
             bump: 0,
         };
         assert_eq!(borsh::to_vec(&uc).unwrap().len(), UserCollateral::LEN);
@@ -467,7 +480,7 @@ mod tests {
         assert_eq!(Order::LEN, 64);
         assert_eq!(OutEvent::LEN, 112);
         assert_eq!(Observation::LEN, 32);
-        assert_eq!(UserCollateral::LEN, 17);
+        assert_eq!(UserCollateral::LEN, 25);
         assert_eq!(OrderBook::LEN, 6_232);
     }
 
@@ -513,11 +526,12 @@ mod tests {
             index_n: 0,
             index_d: 0,
             funding_accumulator: 0,
+            pnl_pool: 0,
             bump: 255,
         };
         assert_eq!(borsh::to_vec(&market).unwrap().len(), PerpMarket::LEN);
         // Pin the documented size so a field/constant edit cannot drift it.
-        assert_eq!(PerpMarket::LEN, 197);
+        assert_eq!(PerpMarket::LEN, 205);
     }
 
     /// The `Position` PDA seed `[POSITION_SEED, market, user, side]` must

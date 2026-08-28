@@ -216,7 +216,7 @@ export function buildDepositCollateral(p: CollateralParams): TransactionInstruct
   const programId = p.programId ?? PROGRAM_ID;
   return ix(programId, "deposit_collateral", [
     { pubkey: p.user, isSigner: true, isWritable: true },
-    { pubkey: p.market, isSigner: false, isWritable: false },
+    { pubkey: p.market, isSigner: false, isWritable: true },
     { pubkey: p.userCollateral ?? userCollateralPda(p.market, p.user, programId).address, isSigner: false, isWritable: true },
     { pubkey: p.vault ?? vaultPda(programId).address, isSigner: false, isWritable: true },
     { pubkey: p.userAta, isSigner: false, isWritable: true },
@@ -230,7 +230,7 @@ export function buildWithdrawCollateral(p: CollateralParams): TransactionInstruc
   const programId = p.programId ?? PROGRAM_ID;
   return ix(programId, "withdraw_collateral", [
     { pubkey: p.user, isSigner: true, isWritable: false },
-    { pubkey: p.market, isSigner: false, isWritable: false },
+    { pubkey: p.market, isSigner: false, isWritable: true },
     { pubkey: p.userCollateral ?? userCollateralPda(p.market, p.user, programId).address, isSigner: false, isWritable: true },
     { pubkey: p.vault ?? vaultPda(programId).address, isSigner: false, isWritable: true },
     { pubkey: p.userAta, isSigner: false, isWritable: true },
@@ -392,7 +392,7 @@ export function buildSettleClose(p: {
   programId?: PublicKey;
 }): TransactionInstruction {
   return ix(p.programId ?? PROGRAM_ID, "settle_close", [
-    { pubkey: p.market, isSigner: false, isWritable: false },
+    { pubkey: p.market, isSigner: false, isWritable: true },
     { pubkey: p.position, isSigner: false, isWritable: true },
     { pubkey: p.userCollateral, isSigner: false, isWritable: true },
     { pubkey: p.indexSource, isSigner: false, isWritable: false },
@@ -430,7 +430,7 @@ export function buildLiquidate(p: {
 }): TransactionInstruction {
   const programId = p.programId ?? PROGRAM_ID;
   return ix(programId, "liquidate", [
-    { pubkey: p.market, isSigner: false, isWritable: false },
+    { pubkey: p.market, isSigner: false, isWritable: true },
     { pubkey: p.position, isSigner: false, isWritable: true },
     { pubkey: p.userCollateral, isSigner: false, isWritable: true },
     { pubkey: p.orderBook ?? orderBookPda(p.market, programId).address, isSigner: false, isWritable: false },
