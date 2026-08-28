@@ -83,14 +83,21 @@ note below.
    insolvent).
 5. Reduce `position.notional -= amount` (full `amount == notional` zeroes the
    exposure), set `position.collateral = remaining` (`== margin_required(notional
-   − amount, initial_margin_bps)`), release the consumed collateral from the
-   victim's `UserCollateral.reserved`, **debit the victim's
-   `UserCollateral.deposited` by the reward** and credit the liquidator's
-   `UserCollateral.deposited` (`liquidator_collateral`) with the same amount
-   (ledger-only margin — no token movement). The reward is a **zero-sum
-   transfer out of the victim's released margin** (`consumed ≥ reward`), so
-   Σ `deposited` across victim + liquidator is conserved and the vault is never
-   over-issued — a liquidation never mints collateral.
+   − amount, initial_margin_bps)`), and release the consumed collateral from the
+   victim's `UserCollateral.reserved` (`reserved_after = reserved − consumed`).
+6. **[Design A]** Book the victim's realized loss into the PnL pool:
+   `apply_liquidation_loss(deposited, reserved_after, loss, reward)` where
+   `loss = |pnl|` (the index-based unrealized PnL, negative when liquidatable).
+   The booked amount is capped at `deposited − reserved_after − reward` (the
+   reward is payable first, and other positions' reserved backing is never
+   touched), then `market.pnl_pool += booked` and `deposited -= booked`.
+7. Debit the victim's `UserCollateral.deposited` by the `reward` and credit the
+   liquidator's `UserCollateral.deposited` (`liquidator_collateral`) with the
+   same amount (ledger-only margin — no token movement). The reward is a
+   **zero-sum transfer out of the victim's released margin** (`consumed ≥
+   reward`), so Σ `deposited` across victim + liquidator + pool is conserved —
+   a liquidation never mints collateral (the victim's loss is collected into the
+   pool, and the reward is a pure transfer).
 
 ## Partial vs full (R-L3)
 
@@ -110,8 +117,9 @@ reward   = liquidation_penalty(released, penalty_bps)               (≤ release
   full liquidation never leaves negative remaining collateral. Because the
   reward is drawn **out of** the released backing (`reward ≤ released`), the
   `liquidate` handler debits the victim's `deposited` by the reward while
-  crediting the liquidator's — a zero-sum transfer, so the vault (Σ deposited)
-  is never over-issued.
+  crediting the liquidator's — a zero-sum transfer. Combined with [Design A]
+  (the victim's realized loss is booked into `pnl_pool`), the FULL transition
+  conserves Σ(deposited + pool), so the vault is never over-issued.
 - `amount == 0` or `amount > notional ⇒ InvalidAmount`.
 - `maintenance_bps` is the **health** threshold (`liquidatable`), not a release
   parameter; the surviving collateral is always backed at the initial margin
@@ -121,7 +129,8 @@ reward   = liquidation_penalty(released, penalty_bps)               (≤ release
 
 - Inbound: `lib.rs::liquidate`.
 - Outbound: `constants` (`LIQUIDATION_PENALTY_BPS`, `LIQUIDATION_TWAP_WINDOW`),
-  `positions` (`margin_required`, `pnl`, `PositionSide`), `orderbook` (`twap`),
+  `positions` (`margin_required`, `pnl`, `PositionSide`), `settlement`
+  (`apply_liquidation_loss`), `orderbook` (`twap`),
   `exchange` (`ExchangeRate` via the stake-pool validation in `lib.rs`), `state`
   (`Position`, `UserCollateral`, `PerpMarket`, `OrderBook`), `error`
   (`NotLiquidatable`).

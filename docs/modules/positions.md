@@ -31,7 +31,7 @@ property-testable logic lives in the pure `crate::positions` module (mirroring
 | `normalize_sums` | `(entry_n_sum: u128, entry_d_sum: u128) -> (u64, u64)` | Shared power-of-two shift (`k = max(0, bitlen(max) − 45)`); the larger sum lands in `[2^44, 2^45)` |
 | `signed_yield_change` | `(entry_n_sum: u128, entry_d_sum: u128, cur_n: u64, cur_d: u64) -> Option<i128>` | `(rate_cur / rate_entry − 1) × APY_SCALE` **with sign**, cross-multiplied; `None` on degenerate inputs |
 | `pnl` | `(entry_n_sum, entry_d_sum, cur_n, cur_d, notional: u64, side) -> Option<i128>` | `notional × signed_yield_change / APY_SCALE × (+1 Long, −1 Short)`, signed USDC microunits, truncating toward zero |
-| `apply_pnl` | `(deposited: u64, pnl: i128) -> Option<u64>` | Add signed PnL to `deposited`: a profit credits (`None` only on a positive overflow); a loss debits **clamped at `0`** so `deposited` never goes negative (the vault is never insolvent — R-S3). This is the pure ledger transition for `settle_close` / `settle_funding` |
+| `apply_pnl` | `(deposited: u64, pnl: i128) -> Option<u64>` | Add signed PnL to `deposited`: a profit credits (`None` only on a positive overflow); a loss debits **clamped at `0`** so `deposited` never goes negative (the vault is never insolvent — R-S3). This is the **per-account** ledger primitive; settlement wiring (winner paid only up to the collected pool, remainder → `claimable`) goes through the Design A pool `settlement::settle_signed` — never call `apply_pnl` directly on a winner's ledger (the original minting bug) |
 | `validate_open_args` | `(side: u8, size: u64) -> Result<()>` | `side` must be `0`/`1` (`ProgramError::InvalidInstructionData` otherwise — the existing `side_from_u8` behavior, no `InvalidSide` variant), `size > 0` (`InvalidSize`) |
 
 ## The `Position` account
@@ -100,8 +100,10 @@ stateDiagram-v2
    position accounts** and never settles positions.
 5. **Position settlement** — `settle_close()` (R-S2/R-S3): if
    `closed_notional > 0`, realize the **signed** index-based PnL over that
-   notional into `UserCollateral.deposited` (via `positions::pnl` +
-   `apply_pnl`) and reset `closed_notional = 0`. See
+   notional through the Design A PnL pool (via `positions::pnl` +
+   `settlement::settle_signed`: a loss is collected into `PerpMarket.pnl_pool`,
+   a profit is paid only up to the pool, the remainder becomes `claimable`) and
+   reset `closed_notional = 0`. See
    [settlement.md](settlement.md) for the flow; `closed_notional == 0` is an
    idempotent no-op.
 6. **Funding & liquidation** — `settle_funding` accrues signed funding over the
@@ -188,19 +190,24 @@ basis into `closed_entry_n_sum` / `closed_entry_d_sum` (via
 each closed generation's basis), so a re-open (which resets the live `entry_*`)
 never reframes a prior closed amount, and a sequence of closes interleaved with
 re-opens prices **each** closed generation at **its own** close-time basis.
-`settle_close` reads `closed_notional` and, if `> 0`, applies:
+`settle_close` reads `closed_notional` and, if `> 0`, applies the Design A
+PnL-pool routing ([settlement.md](settlement.md)):
 
 ```
 pnl        = pnl(closed_entry_n_sum, closed_entry_d_sum, cur_n, cur_d, closed_notional, side)  (signed i128)
-deposited' = apply_pnl(deposited, pnl)                                                         (clamped at 0)
+(deposited', claimable', pool') = settlement::settle_signed(deposited, claimable, pnl_pool, pnl)
+// pnl <= 0: apply_debit(deposited, pool, |pnl|)  -> loss collected into the pool (clamped at 0)
+// pnl >  0: apply_credit(deposited, claimable, pool, pnl) -> paid = min(pnl, pool); remainder -> claimable
 ```
 
-`apply_pnl` is the pure ledger transition that both `settle_close` and
-`settle_funding` use:
+`positions::apply_pnl` remains the **pure single-ledger** transition (a profit
+credits unbounded, a loss is clamped at `0`); it is deliberately NOT the wiring
+`settle_close`/`settle_funding` use anymore — the counterparty-netted
+`settlement::settle_signed` is (the Design A fix). `apply_pnl`'s contract:
 - `pnl == 0` ⇒ `Some(deposited)` — settled but unchanged.
 - `pnl > 0` ⇒ `deposited + pnl`, `None` only on a positive `u64` overflow.
 - `pnl < 0` ⇒ `deposited − |pnl|`, **clamped at `0`** so `deposited` never goes
-  negative (the vault is never insolvent; R-S3). A loss never returns `None`.
+  negative (R-S3). A loss never returns `None`.
 
 `Position.closed_notional` is reset to `0` by `settle_close`; `Position
 .last_funding_epoch` is advanced by `settle_funding`.

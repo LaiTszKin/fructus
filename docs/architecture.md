@@ -69,6 +69,14 @@ graph TD
    reads `total_lamports` / `pool_token_supply`.
 2. `ExchangeRate::realized_yield` derives `(rate_t1 / rate_t0 − 1) · SCALE`
    between two snapshots.
+3. `settle_close` / `settle_funding` / `liquidate` route the signed PnL through
+   the Design A market PnL pool (`settlement.rs`): a loss is **collected** into
+   `PerpMarket.pnl_pool`, a winner is paid **only up to the pool** (the
+   remainder becomes a pending `UserCollateral.claimable`), so `Σ deposited`
+   never exceeds the vault's real balance — no minting (details:
+   [modules/settlement.md](modules/settlement.md),
+   [modules/funding.md](modules/funding.md),
+   [modules/liquidation.md](modules/liquidation.md)).
 
 ## Architectural Decisions
 

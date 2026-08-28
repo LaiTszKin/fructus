@@ -112,18 +112,22 @@ live pool rate on settlement.
 4. `premium = mark − index`, `rate = funding_rate(premium, funding_k,
    max_funding)`, `payment = funding_payment(position.notional, rate, epochs,
    SideFlow::from_position_side(side))`.
-5. Apply the signed `payment` to `UserCollateral.deposited` via
-   `positions::apply_pnl` (a loss is clamped so `deposited` never goes negative).
+5. Route the signed `payment` through the Design A PnL pool
+   (`settlement::settle_signed`): a payer's debit is collected into
+   `PerpMarket.pnl_pool` (clamped at `deposited`), a payee's credit is paid only
+   up to the pool, the remainder becoming a pending `claimable` (never minted
+   into `deposited`).
 6. Advance `position.last_funding_epoch = cur_epoch`, the market baseline to the
-   live pool rate, and `market.funding_accumulator += payment`.
+   live pool rate, and `market.funding_accumulator += payment` (nominal
+   bookkeeping — unchanged).
 
 ## Dependencies
 
 - Inbound: `lib.rs::settle_funding` (the thin adapter).
 - Outbound: `constants` (`APY_SCALE`, `SLOTS_PER_YEAR`), `positions`
-  (`PositionSide`, `apply_pnl`), `exchange` (`ExchangeRate`, `realized_yield`,
-  `annualize`), `orderbook` (`mid`), `state` (`PerpMarket`, `Position`,
-  `UserCollateral`), `error`.
+  (`PositionSide`), `settlement` (`settle_signed`), `exchange` (`ExchangeRate`,
+  `realized_yield`, `annualize`), `orderbook` (`mid`), `state` (`PerpMarket`,
+  `Position`, `UserCollateral`), `error`.
 
 ## Patterns & Gotchas
 

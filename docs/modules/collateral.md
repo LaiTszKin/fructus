@@ -50,9 +50,11 @@ One PDA per `(market, user)`, seed
 | --- | --- | --- |
 | `deposited` | u64 | USDC credited to the user, microunits |
 | `reserved` | u64 | USDC reserved for open positions; `= Σ` position collateral (issue #5) |
+| `claimable` | u64 | pending (unfunded) PnL/funding claim (Design A); not directly withdrawable — converted to `deposited` only via claim payout against `PerpMarket.pnl_pool` |
 | `bump` | u8 | PDA bump |
 
-- Lazily initialized on **first deposit** (payer = user), both fields zero.
+- Lazily initialized on **first deposit** (payer = user), all three amount fields
+  zero.
 - `reserved` is written by the position lifecycle — `open_position` /
   `settle_fill` add `margin_required(notional, im_bps)` per position,
   `close_position` releases it — atomically with the `Position` ledger, and the
@@ -64,19 +66,26 @@ One PDA per `(market, user)`, seed
 **Deposit** (`deposit_collateral(amount)`, user-signed):
 
 1. Reject `amount == 0` (`InvalidSize`).
-2. Lazily system-create the `UserCollateral` PDA on first deposit (payer = user).
+2. Lazily system-create the `UserCollateral` PDA on first deposit (payer = user),
+   with `claimable = 0`.
 3. `token::transfer` `amount` USDC from the user's ATA into the vault (authority
    = the user signer).
-4. `deposited += amount` via `checked_add` (`ArithmeticOverflow` on overflow).
+4. [Design A] Convert any funded pending claim into `deposited` first
+   (`claim_payout(deposited, claimable, pnl_pool)`: `pay = min(claimable, pool)`,
+   `deposited += pay`, `claimable -= pay`, `pool -= pay`), then
+   `deposited += amount` via `checked_add` (`ArithmeticOverflow` on overflow).
 
 **Withdraw** (`withdraw_collateral(amount)`, user-signed):
 
 1. Reject `amount == 0` (`InvalidSize`).
-2. Enforce `amount <= free_collateral(deposited, reserved)`
+2. [Design A] Convert any funded pending claim into `deposited` first
+   (`claim_payout(...)` as above) — a claim is never directly withdrawable, only
+   through this payout.
+3. Enforce `amount <= free_collateral(deposited, reserved)`
    (`InsufficientFreeCollateral` otherwise).
-3. `token::transfer` `amount` USDC from the vault to the user's ATA (authority =
+4. `token::transfer` `amount` USDC from the vault to the user's ATA (authority =
    the vault PDA, signing via `[VAULT_SEED, bump]`).
-4. `deposited -= amount` via `checked_sub` (`ArithmeticOverflow` on overflow).
+5. `deposited -= amount` via `checked_sub` (`ArithmeticOverflow` on overflow).
 
 Both are atomic — any error unwinds the transfer and the ledger write.
 

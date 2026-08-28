@@ -38,17 +38,20 @@ Singleton PDA, seed `"perp_market"`. Borsh layout (after the 8-byte discriminato
 | `index_n` | u64 | 164 | stake-pool rate snapshot **numerator** at the last `settle_funding` (the epoch baseline; R-F4) |
 | `index_d` | u64 | 172 | stake-pool rate snapshot **denominator**; `index_n/index_d == 0` marks an un-set baseline |
 | `funding_accumulator` | i128 | 180 | cumulative signed funding realized on the market (net-additive; long flows negative, short positive) |
-| `bump` | u8 | 196 | PDA bump |
+| `pnl_pool` | u64 | 196 | market-level PnL pool (Design A): USDC microunits collected from losers, funding winner credits (`min(credit, pool)`; remainder → per-user `claimable`) |
+| `bump` | u8 | 204 | PDA bump |
 
-- `LEN = 197` (packed borsh payload, excluding the 8-byte discriminator).
+- `LEN = 205` (packed borsh payload, excluding the 8-byte discriminator).
 - Singleton seed `"perp_market"`; `index_source` and `collateral_mint` are plain
   fields, not seed components.
 - `funding_k` / `max_funding` use the fixed-point scale `1_000_000`
   (`1.0 == 1_000_000`); the two margin fields use basis points (≤ `10_000`).
 - The funding state (`funding_epoch` / `index_n` / `index_d` /
-  `funding_accumulator`) is zero-initialized at init and written by
-  `settle_funding` (see [modules/funding.md](modules/funding.md)); `i128`
-  borsh-serializes to 16 LE bytes.
+  `funding_accumulator`) and the `pnl_pool` are zero-initialized at init and
+  written by `settle_funding` / `settle_close` / `liquidate` (see
+  [modules/funding.md](modules/funding.md), [modules/settlement.md](modules/settlement.md),
+  [modules/liquidation.md](modules/liquidation.md)); `i128` borsh-serializes to
+  16 LE bytes.
 
 ## `OrderBook` (zero-copy account)
 
@@ -135,12 +138,16 @@ user.key()]`. Borsh layout (after the 8-byte discriminator):
 | --- | --- | --- | --- |
 | `deposited` | u64 | 0 | USDC credited to the user, microunits |
 | `reserved` | u64 | 8 | USDC reserved for open positions; `= Σ` position collateral (issue #5) |
-| `bump` | u8 | 16 | PDA bump |
+| `claimable` | u64 | 16 | pending (unfunded) PnL/funding claim (Design A); not directly withdrawable — converted to `deposited` only via claim payout against `PerpMarket.pnl_pool` |
+| `bump` | u8 | 24 | PDA bump |
 
-- `LEN = 17`.
+- `LEN = 25`.
 - Lazily initialized on first deposit; `reserved` is written by the position
   lifecycle (`open_position` / `close_position` / `settle_fill` reserve and
   release margin atomically with the `Position` ledger).
+- `deposited = reserved + free` remains the core invariant; `claimable` is
+  **orthogonal** (a pending claim is not part of `deposited` and is not
+  withdrawable except through claim payout).
 
 ## `Position` (anchor account)
 
@@ -233,6 +240,7 @@ erDiagram
         u64 index_n
         u64 index_d
         i128 funding_accumulator
+        u64 pnl_pool
     }
     OrderBook {
         Pubkey market
@@ -246,6 +254,7 @@ erDiagram
     UserCollateral {
         u64 deposited
         u64 reserved
+        u64 claimable
     }
     Position {
         Pubkey market

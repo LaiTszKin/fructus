@@ -22,7 +22,8 @@
 | `orderbook.rs` | Pure CLOB matching engine + `mark()`/`twap()` (no Anchor accounts) |
 | `collateral.rs` | Pure `free_collateral` + deposit/withdraw accounting |
 | `exchange.rs` | Trustless settlement: stake-pool exchange rate + realized yield + annualize |
-| `positions.rs` | Pure position lifecycle: margin, entry running sums, signed PnL, `apply_pnl` |
+| `positions.rs` | Pure position lifecycle: margin, entry running sums, signed PnL, `apply_pnl` (per-account primitive) |
+| `settlement.rs` | Design A PnL pool: loser debits collected into `PerpMarket.pnl_pool`; winner credits paid only up to the pool (remainder → `UserCollateral.claimable`); claim payout; liquidation loss booking |
 | `funding.rs` | Pure funding engine: premium, funding rate, funding payment, `SideFlow` |
 | `liquidation.rs` | Pure liquidation: equity, maintenance margin, `liquidatable`, penalty, `apply_liquidation` |
 | `ed25519.rs` | Publisher signature verification via instruction introspection |

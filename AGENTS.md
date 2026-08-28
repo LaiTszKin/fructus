@@ -59,6 +59,17 @@
   clamp(funding_k·premium/APY_SCALE, ±max_funding)`; `premium > 0 ⇒ **longs pay shorts**`
   (long flow `−1`, short flow `+1`, exact opposites). Epoch = `slot / funding_epoch_slots`;
   settlement is idempotent (same epoch ⇒ no-op).
+- **Design A no-mint invariant** — all PnL/funding settlement goes through
+  `programs/fructus/src/settlement.rs`: a loser's debit is **collected** into
+  `PerpMarket.pnl_pool` (clamped at `deposited`), a winner is paid **only up to
+  the pool** (`min(credit, pool)`), and the unfunded remainder becomes a
+  **pending claim** (`UserCollateral.claimable`, never directly withdrawable —
+  only via `claim_payout` at deposit/withdraw). `pool ≥ 0` ⟺ `Σ deposited ≤
+  vault real balance` (no mint); `liquidate` also books the victim's realized
+  loss into the pool, capped at `deposited − reserved_after − reward` (never
+  touches other positions' reserved backing; reward payable first).
+  `positions::apply_pnl` stays a per-account pure transition — **never wire it
+  directly onto a winner's ledger** (that is the original minting bug).
 - **Position collateral invariant** = `position.collateral ==
   margin_required(notional, initial_margin_bps)`, maintained on open
   (`apply_open_fills`), close (`apply_close_fills`), **AND** liquidate

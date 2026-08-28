@@ -37,6 +37,7 @@ including the funding-accrual state written by `settle_funding` (see
 | `index_n` | u64 | stake-pool rate snapshot **numerator** at the last `settle_funding` (the epoch baseline; R-F4) |
 | `index_d` | u64 | stake-pool rate snapshot **denominator** at the last `settle_funding`; `index_n/index_d == 0` marks an un-set baseline |
 | `funding_accumulator` | i128 | cumulative signed funding realized on the market (net-additive; long flows negative, short positive) |
+| `pnl_pool` | u64 | market-level PnL pool (Design A): USDC collected from losers, funding winner credits (`min(credit, pool)`; remainder → per-user `claimable`) |
 | `bump` | u8 | market PDA bump |
 
 ## Dependencies

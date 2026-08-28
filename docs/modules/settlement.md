@@ -5,8 +5,9 @@ oracle, no staleness, no manipulation — and wire it into position settlement.
 The module reads the stake-pool **exchange rate** (`total_lamports /
 pool_token_supply`) as the trustless index and turns it into a signed PnL for the
 notional a position has closed. `settle_close` realizes that PnL into the user's
-collateral; the pure math lives in `positions` (see
-[positions.md](positions.md) for `pnl` / `apply_pnl`), and this module owns the
+collateral; the PnL math lives in `positions` (see
+[positions.md](positions.md) for `pnl`; its counterparty netting runs through the
+Design A `settlement` pool — see below), and this module owns the
 **rate + annualization** primitives and the `settle_close` wiring.
 
 ## Public API
@@ -21,10 +22,15 @@ collateral; the pure math lives in `positions` (see
 | `ExchangeRate::read` | `(&[u8]) -> Option<ExchangeRate>` | Read `total_lamports` + `pool_token_supply` after validating `account_type` |
 | `ExchangeRate::realized_yield` | `(&self, &Self) -> Option<u64>` | `(rate_t1/rate_t0 − 1) · APY_SCALE` |
 | `annualize` | `(yield: u64, period_slots, slots_per_year) -> Option<u64>` | annualize a scaled yield |
+| `settlement::apply_debit` | `(deposited, pool, debit) -> Option<(u64, u64)>` | collect a loser's debit into the pool (clamped at `deposited`) |
+| `settlement::apply_credit` | `(deposited, claimable, pool, credit) -> Option<(u64, u64, u64)>` | pay a winner `min(credit, pool)`; remainder → `claimable` |
+| `settlement::claim_payout` | `(deposited, claimable, pool) -> Option<(u64, u64, u64)>` | convert a claim into `deposited` up to the pool |
+| `settlement::apply_liquidation_loss` | `(deposited, reserved_after, loss, reward) -> Option<(u64, u64)>` | book a victim's realized loss into the pool (bounded by the free seam + released margin − reward) |
+| `settlement::settle_signed` | `(deposited, claimable, pool, signed_pnl) -> Option<(u64, u64, u64)>` | route a signed PnL through debit/credit (the handler wiring) |
 
 `settle_close` depends on the pure `positions::pnl` (the signed PnL over a
-notional at the current index) and `positions::apply_pnl` (the ledger transition
-that credits a profit or debits — clamped — a loss). Both are owned by
+notional at the current index) and the Design A `settlement` pool (the
+counterparty-netted ledger transition). `positions` is owned by
 [positions.md](positions.md); this module documents how settlement wires them.
 
 ## Data
@@ -52,16 +58,22 @@ close-time basis — never the newest generation's (R-S1/R-S2):
 
 ```
 pnl        = positions::pnl(closed_entry_n_sum, closed_entry_d_sum, cur_n, cur_d, closed_notional, side)   (signed i128)
-deposited' = positions::apply_pnl(deposited, pnl)                                                          (clamped)
+// Design A PnL pool + pending claims (settlement::settle_signed):
+//   pnl <= 0: apply_debit(deposited, pool, |pnl|)   -> collected into the pool (clamped at deposited)
+//   pnl >  0: apply_credit(deposited, claimable, pool, pnl)  -> paid = min(pnl, pool); remainder -> claimable
+(deposited', claimable', pool') = settlement::settle_signed(deposited, claimable, pool, pnl)
 ```
 
 - **No-op on `closed_notional == 0`** — `settle_close` returns immediately
   (idempotent; R-S3).
-- **Positive PnL credits** — `apply_pnl` adds the profit to `deposited`
-  (returning `None` only on a positive `u64` overflow).
-- **Negative PnL debits, clamped at `0`** — a loss reduces `deposited` but is
-  clamped so it never goes below `0`; the vault is never left insolvent by a
-  settlement (R-S3). `apply_pnl` is total on a loss (never `None`).
+- **A loss is collected into the pool** — the loser's debit is bounded by its
+  `deposited` (clamped at `0`, never negative), and the collected amount is added
+  to `PerpMarket.pnl_pool`.
+- **A profit is paid only up to the pool** — `paid = min(credit, pool)`; the
+  unfunded remainder becomes a **pending claim** (`claimable`), never
+  `deposited`, so a winner is never minted unbacked collateral (Design A — the
+  fix for the unbounded `apply_pnl` credit). The vault is never left insolvent
+  (R-S3).
 - **Trustless & dependency-minimal** — settlement depends only on `exchange.rs`
   data: the position's **close-time** entry basis (`closed_entry_n_sum` /
   `closed_entry_d_sum`, accumulated by `apply_close_fills` via
@@ -75,9 +87,10 @@ deposited' = positions::apply_pnl(deposited, pnl)                               
 
 - Inbound: `lib.rs::read_exchange_rate`, `lib.rs::settle_close`.
 - Outbound: `constants` (`APY_SCALE`, `SLOTS_PER_YEAR`), `positions`
-  (`pnl`, `apply_pnl`, `PositionSide`), `exchange` (`ExchangeRate`,
-  `realized_yield`, `annualize`), `state` (`Position`, `UserCollateral`,
-  `PerpMarket`).
+  (`pnl`, `PositionSide`), `settlement` (`settle_signed`, `apply_debit`,
+  `apply_credit`, `claim_payout`, `apply_liquidation_loss`), `exchange`
+  (`ExchangeRate`, `realized_yield`, `annualize`), `state` (`Position`,
+  `UserCollateral`, `PerpMarket`).
 
 ## Patterns & Gotchas
 
@@ -90,6 +103,7 @@ deposited' = positions::apply_pnl(deposited, pnl)                               
   primitive; a position snapshots `ExchangeRate` at open (the entry running sums)
   and `settle_close` reads it again at settle.
 - **`settle_close` is permissionless and index-only** — no signer, no authority,
-  no mark oracle; the vault is never insolvent because `apply_pnl` clamps a loss
-  at the deposited balance.
+  no mark oracle; a loss is collected into the pool (clamped at `deposited`, so
+  the vault is never left insolvent) and a profit is paid only up to the pool
+  (the Design A anti-mint guarantee).
 

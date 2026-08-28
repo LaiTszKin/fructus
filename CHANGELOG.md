@@ -103,6 +103,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Adversarial review invariants (`review_tests.rs`, `sdk/test/review-invariants.test.ts`):
   property-based proof over the funding/liquidation/settlement logic; one
   confirmed CLI mark-fallback bug found and fixed (`cli/src/commands/funding.ts`).
+- Design A settlement PnL pool (`programs/fructus/src/settlement.rs`):
+  - `PerpMarket.pnl_pool` (`u64`, `PerpMarket::LEN` 197 → 205): market-level
+    pool of the losses actually collected from losers.
+  - `UserCollateral.claimable` (`u64`, `UserCollateral::LEN` 17 → 25): pending
+    (unfunded) winner claims; converted to `deposited` only via claim payout
+    against the pool (at deposit/withdraw).
+  - `liquidate` now books the victim's realized loss into the pool (capped at
+    `deposited − reserved_after − reward`; the reward stays a zero-sum
+    transfer), so a liquidated loser never vanishes as a counterparty.
+  - Mirrored in `sdk/src/account/{layout,decode}.ts` + `sdk/src/instructions.ts`
+    (market now `mut` on deposit/withdraw/settle/liquidate) + docs.
 
 ### Changed
 
@@ -120,6 +131,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   notional-weighted harmonic mean (`positions::accumulate_closed_entry`), so a
   re-open between closes (before any `settle_close`) leaves each pending closed
   notional priced at its own close-time entry basis (R-S1/R-S2).
+- **Critical** — `settle_close` / `settle_funding` no longer credit a winner's
+  PnL/funding payment in full while clamping the loser's debit at 0 (an
+  unbacked-collateral mint, refuted by the fund-conservation review): all
+  settlement is now netted through the market PnL pool — a loser's debit is
+  collected into `PerpMarket.pnl_pool`, a winner is paid only `min(credit, pool)`
+  and the remainder becomes a pending `UserCollateral.claimable` — so
+  `pool ≥ 0` ⟺ `Σ deposited ≤` the vault's real balance (never minted).
 
 ## [0.1.0] - 2026-08-19
 
