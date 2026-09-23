@@ -7,7 +7,7 @@
 | `sdk/` | Typed TypeScript SDK mirroring the program (instruction builders, account decoders, funding/PnL) | `package.json`, `src/` |
 | `cli/` | Command-line trader (open/close/deposit/withdraw/position/funding/mark/index) | — |
 | `scripts/` | Devnet deployment + e2e lifecycle walk | `e2e.mts`, `deploy.sh` |
-| `trident-tests/` | On-chain stateful fuzz harness (separate workspace) | `fuzz_0/test_fuzz.rs` |
+| `trident-tests/` | On-chain stateful fuzz harness (separate workspace; reads the SBPFv0 build at `target/deploy-v0`) | `fuzz_0/test_fuzz.rs` |
 | `docs/` | Documentation | `README.md` (hub) |
 | `.cargo/` | Cargo config for local runs — proptest shrink budget via `[env]`, build profile | `config.toml` |
 | `.config/` | nextest profile (the default local test runner) | `nextest.toml` |

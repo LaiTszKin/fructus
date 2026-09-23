@@ -117,10 +117,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions CI (`.github/workflows/ci.yml`): `fmt` + `clippy --all-targets
   -- -D warnings` gates, the Rust suites split per module (7 `fructus` jobs + review
   suites), the bank CPI suites / TS packages / validator e2e / Trident fuzz targets on
-  their own runners in parallel, all sharing one SBF `.so` build artifact. The `.so` is
-  built with `--tools-version v1.52` (the default v1.54 produces a binary the bank
-  traps on); the `market` fuzz target runs non-blocking, since it aborts at start-up
-  today. Node 24 in the TS jobs.
+  their own runners in parallel. One `.so` build feeds them all, staged at both paths
+  the suites read (`target/deploy` for bank/e2e, `target/deploy-v0` for Trident) and
+  pinned to `--arch v0 --tools-version v1.52` — the bare default (v1.54) emits a binary
+  the bank traps on. The `market` fuzz target runs non-blocking, since it aborts at
+  start-up today. Node 24 in the TS jobs.
 - Pre-commit hook (`.githooks/pre-commit`, enable with
   `git config core.hooksPath .githooks`): runs `cargo fmt --all` and re-stages the
   Rust files that are part of the commit.
@@ -153,6 +154,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `programs/fructus/Cargo.toml`, with the reason, so the gate stays meaningful.
 
 ### Fixed
+
+- Fuzz harness on trident 0.13.0-rc.4 and a dedicated SBPFv0 artifact: TridentSVM
+  (agave 2.3.x) executes SBPFv0 only, while current clusters accept SBPFv3 deployments
+  only (SIMD-0500), so the fuzzer reads `target/deploy-v0/fructus.so` instead of
+  sharing `target/deploy/fructus.so` with the bank suites.
 
 - `settle_close` no longer re-prices a prior closed amount at the newest
   generation's basis: `apply_close_fills` **accumulates** each closed

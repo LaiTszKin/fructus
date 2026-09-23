@@ -35,6 +35,8 @@
   real program (solana-test-validator + SDK builders) and asserts on-chain
   invariants (`--test-force-exit`)
 - `cd trident-tests && cargo run --bin fuzz_0` — on-chain stateful fuzz smoke run
+  (1000 iterations × 100 flows; needs its SBPFv0 artifact at `target/deploy-v0` —
+  `--bin market` still aborts at start-up; docs/testing.md has the build command)
 - `cargo fmt --check` — format check (the pre-commit hook runs `cargo fmt --all` for you)
 - `.github/workflows/ci.yml` — `cargo fmt --check` and `cargo clippy --workspace
   --all-targets -- -D warnings` gates, the lib suites split per module, and separate
