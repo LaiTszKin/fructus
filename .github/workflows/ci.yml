@@ -128,16 +128,34 @@ jobs:
             ~/.cache/solana
             ~/.rustup/toolchains/*sbpf*
           key: solana-tools-${{ runner.os }}-${{ env.SOLANA_VERSION }}-v1.52
-      # Platform-tools pinned: the default (v1.54 at the time of writing) produces
-      # a binary the solana-program-test bank traps on at run time ("Access
-      # violation in unknown section" out of `initialize_market`), which looks
-      # like a protocol bug but is a toolchain mismatch. Verified locally —
-      # v1.52 → 543,760 B, every bank suite green; v1.54 → 506,464 B, traps.
-      - run: cargo build-sbf --manifest-path programs/fructus/Cargo.toml --tools-version v1.52
+      # One build serves all three consumers, but two paths: the bank suites and
+      # the validator e2e load `target/deploy/fructus.so`, while the fuzz harness
+      # reads `target/deploy-v0/fructus.so` (Trident.toml) because its TridentSVM
+      # (agave 2.3.x) executes SBPFv0 only.
+      #
+      # `--tools-version` is pinned: the newer default (v1.54 at the time of
+      # writing) emits a binary that both the solana-program-test bank and
+      # TridentSVM fail on at run time ("Access violation in unknown section" out
+      # of `initialize_market`), which reads like a protocol bug. Verified locally:
+      # v1.52 + `--arch v0` → 543,760 B, bank green, fuzz_0 laps 1000 x 100 flows;
+      # v1.54 (same `--arch v0`) → 506,464 B, traps. `--arch v0` is explicit —
+      # devnet deployments need SBPFv3 (SIMD-0500), which `scripts/deploy.sh`
+      # builds separately.
+      - name: Build the program
+        run: |
+          cargo build-sbf --manifest-path programs/fructus/Cargo.toml \
+            --tools-version v1.52 --arch v0 --sbf-out-dir target/deploy-v0
+          cp target/deploy-v0/fructus.so target/deploy/fructus.so
       - uses: actions/upload-artifact@v4
         with:
           name: fructus-so
           path: target/deploy/fructus.so
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fructus-so-v0
+          path: target/deploy-v0/fructus.so
           if-no-files-found: error
           retention-days: 7
 
@@ -263,9 +281,10 @@ jobs:
           # single iteration (`thread '<unknown>' has overflowed its stack`, exit
           # 134). It is not a stack-size problem — a 1 GiB `RUST_MIN_STACK` does not
           # move it, and the harness's own 64 MiB wrapper thread is not the one that
-          # dies — it crashes inside the setup path. Kept in the matrix as a
-          # non-blocking job so the failure stays visible until it is fixed; drop
-          # `experimental` to make it a gate again.
+          # dies — nor an artifact problem: it still aborts on trident 0.13.0-rc.4
+          # with the SBPFv0 build (`fuzz_0` laps 1000 x 100 flows on the same file).
+          # Kept in the matrix as a non-blocking job so the failure stays visible
+          # until it is fixed; drop `experimental` to make it a gate again.
           - target: market
             bin: market
             experimental: true
@@ -278,10 +297,11 @@ jobs:
           # trident-tests is its own workspace, so it gets its own cache.
           shared-key: rust-1.97.1-trident
           workspaces: trident-tests
+      # Trident.toml points at target/deploy-v0 (TridentSVM executes SBPFv0 only).
       - uses: actions/download-artifact@v4
         with:
-          name: fructus-so
-          path: target/deploy
+          name: fructus-so-v0
+          path: target/deploy-v0
       - name: Fuzz ${{ matrix.target }}
         working-directory: trident-tests
         run: cargo run --bin ${{ matrix.bin }}
