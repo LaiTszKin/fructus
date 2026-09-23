@@ -151,8 +151,8 @@ that provide liquidity and raise the cost of a hostile capital attack.
 # Build the on-chain program
 anchor build
 
-# Run the on-chain test suite
-cargo test --workspace
+# Run the on-chain test suite (cargo-nextest; `cargo test` also works)
+cargo nextest run --workspace
 
 # Run the off-chain publisher tests
 cd publisher && npm test

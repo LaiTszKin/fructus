@@ -9,6 +9,10 @@
 | `scripts/` | Devnet deployment + e2e lifecycle walk | `e2e.mts`, `deploy.sh` |
 | `trident-tests/` | On-chain stateful fuzz harness (separate workspace) | `fuzz_0/test_fuzz.rs` |
 | `docs/` | Documentation | `README.md` (hub) |
+| `.cargo/` | Cargo config for local runs — proptest shrink budget via `[env]`, build profile | `config.toml` |
+| `.config/` | nextest profile (the default local test runner) | `nextest.toml` |
+| `.github/` | CI — parallel per-module/suite jobs + fmt/clippy gates | `workflows/ci.yml` |
+| `.githooks/` | git hooks (pre-commit formats staged Rust) | `pre-commit` |
 | `target/` | Cargo build artifacts (gitignored) | — |
 | `.review/` | Review/simplify verdict artifacts (gitignored) | — |
 

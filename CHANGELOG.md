@@ -114,6 +114,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     transfer), so a liquidated loser never vanishes as a counterparty.
   - Mirrored in `sdk/src/account/{layout,decode}.ts` + `sdk/src/instructions.ts`
     (market now `mut` on deposit/withdraw/settle/liquidate) + docs.
+- GitHub Actions CI (`.github/workflows/ci.yml`): `fmt` + `clippy --all-targets
+  -- -D warnings` gates, the Rust suites split per module (7 `fructus` jobs + review
+  suites), the bank CPI suites / TS packages / validator e2e / Trident fuzz targets on
+  their own runners in parallel, all sharing one SBF `.so` build artifact. The `.so` is
+  built with `--tools-version v1.52` (the default v1.54 produces a binary the bank
+  traps on); the `market` fuzz target runs non-blocking, since it aborts at start-up
+  today. Node 24 in the TS jobs.
+- Pre-commit hook (`.githooks/pre-commit`, enable with
+  `git config core.hooksPath .githooks`): runs `cargo fmt --all` and re-stages the
+  Rust files that are part of the commit.
 
 ### Changed
 
@@ -122,6 +132,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#[cfg(test)]` blocks (`funding.rs`/`liquidation.rs`/`positions.rs`/
   `collateral.rs`) and `src/tests.rs` (lib-adapter level), following the repo's
   per-module test convention. `review_tests.rs` is removed; `AGENTS.md` updated.
+- Local test loop: **`cargo-nextest` is the default runner** (`.config/nextest.toml`
+  pins `fail-fast = false`, `retries = 0`, `slow-timeout = 120s`, `leak-timeout =
+  "5s"`; `anchor test` runs it). One process per test, and the five test binaries run
+  in parallel instead of one after another; the two bank property tests dominate the
+  wall clock either way (measured on the 14-test bank binary in one load window: 48.6 s
+  nextest against 54.4 s `cargo test`). `cargo test` remains the fallback runner and the
+  doctest runner (there are none).
+- Local `dev`/`test` builds carry **no debug info** (`[profile.dev] debug = false`,
+  stated explicitly in the release profile too): backtraces keep symbol names and
+  lose line numbers; `CARGO_PROFILE_DEV_DEBUG=2` restores them for one run.
+- Property tests declare a small **local budget per block** (64 cases; the bank CPI
+  block keeps 20) instead of running 10 000/100 000 cases by default, and the
+  shrinker is bounded repo-wide (`PROPTEST_MAX_SHRINK_ITERS` / `PROPTEST_MAX_SHRINK_TIME`
+  in `.cargo/config.toml`). `PROPTEST_CASES=... cargo nextest run` still scales a run up.
+- `cargo clippy --workspace --all-targets -- -D warnings` is clean: tautological
+  unsigned comparisons removed, `div_ceil` / `derive(Default)` / `while let` /
+  `enumerate` adopted where clippy asked for them. Two style lints
+  (`field_reassign_with_default`, `too_many_arguments`) are allowed explicitly in
+  `programs/fructus/Cargo.toml`, with the reason, so the gate stays meaningful.
 
 ### Fixed
 

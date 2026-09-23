@@ -14,7 +14,7 @@
 2. Add error variants to `error.rs` if needed.
 3. Add property tests to `tests.rs` (red → green).
 4. Update `docs/api-reference.md` and the relevant `docs/modules/*.md`.
-5. Run `cargo test --workspace`.
+5. Run `cargo nextest run --workspace`.
 
 ## Rotate the publisher key
 

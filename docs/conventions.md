@@ -3,6 +3,16 @@
 Rules that differ from or extend language defaults — things an agent cannot
 reliably infer from config files alone.
 
+## Formatting
+
+`rustfmt` with default settings (no `rustfmt.toml`) is enforced twice: the pre-commit
+hook formats on commit, CI runs `cargo fmt --check`. Keep formatting out of substantive
+diffs — run `cargo fmt --all` before opening a PR rather than mixing the two.
+
+`cargo clippy --workspace --all-targets -- -D warnings` is clean on `main` and gates CI.
+Fix a new warning rather than silencing it; if a lint genuinely fights the repo's style,
+allow it in `programs/fructus/Cargo.toml`'s `[lints.clippy]` with the reason.
+
 ## Solana "Address" migration
 
 - **Never** depend on the `solana-program` umbrella crate in the program. Use the
@@ -51,10 +61,17 @@ to build for accounts above it.
 
 ## Testing
 
+- Runner: `cargo nextest run` (profile pinned in `.config/nextest.toml`); `cargo test` is
+  the fallback and the doctest runner — this workspace has no doctests.
 - Pure logic → `proptest` invariants in `programs/fructus/src/tests.rs` and the
   per-module `#[cfg(test)]` blocks (funding/liquidation/positions/collateral);
   adapter-level invariants that drive the lib.rs `apply_open_fills`/
   `apply_close_fills` helpers live in `tests.rs`.
+- Property-test cases are declared per block (`#![proptest_config(...)]`): 64 is the
+  local default, and a block whose cases are expensive (the bank CPI PBT) declares its
+  own smaller cap. The shrink limits are repo-wide in `.cargo/config.toml`. One run can
+  override everything with `PROPTEST_CASES` / `PROPTEST_MAX_SHRINK_*`
+  ([testing.md](testing.md#property-test-budget-local-speed)).
 - Signature verification → mock instruction sysvar (`construct_instructions_data`).
 - Cross-language consistency → shared hex vector asserted in Rust + TypeScript.
 - On-chain stateful fuzzing → Trident (`trident-tests/`).

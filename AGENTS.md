@@ -2,12 +2,28 @@
 
 ## Build & Test
 
-- `cargo test --workspace` — full Rust program suite (200 lib tests: oracle/CLOB/vault/
-  positions + funding/liquidation/settlement invariants, plus bank-style CPI tests)
-- `cargo test --workspace <name>` — single test (e.g. `funding`, `liquidatable`)
+- `cargo nextest run --workspace` — the Rust suite (lib invariants + bank-style CPI
+  tests). Default runner: one process per test, so the bank suites run in parallel —
+  roughly half the wall clock of `cargo test` here. Profile pinned in
+  `.config/nextest.toml` (no fail-fast, no retries, slow tests marked not killed)
+- `cargo nextest run -E '<filter>'` — subset (`-E 'binary(positions_cpi)'`,
+  `-E 'test(funding)'`); a bare positional arg matches test names (`cargo nextest run funding`)
+- `cargo test --workspace` — fallback runner (same assertions, slower); the only thing it
+  adds is doctests, and this workspace has none
+- `PROPTEST_CASES=100000 cargo nextest run --workspace` — property sweep; every block
+  declares its own local budget (`#![proptest_config(...)]`: **64 cases**, 20 for the bank
+  CPI block) and the shrink budget is bounded repo-wide in `.cargo/config.toml` (≤1024
+  iterations / 5 s) — an env var you export beats both
+- Local dev/test builds carry **no debug info** (`[profile.dev] debug = false` in
+  `Cargo.toml`): the link step and `target/` shrink a lot; backtraces keep symbol
+  names but lose line numbers
 - `anchor build` — compile program to `.so` (needs `cargo-build-sbf`); rebuild before
   running CPI tests — `tests/collateral_cpi.rs` loads the SBF binary and a stale
-  `.so` fails the `cpi_binary_is_present_and_fresh` guard
+  `.so` fails the `cpi_binary_is_present_and_fresh` guard. Build with **platform-tools
+  v1.52**: `anchor build` picks it, while a bare `cargo build-sbf` installs the newer
+  default (v1.54) — and rustup keeps only one SBF toolchain, so it *replaces* the good
+  one and the bank then traps (`Access violation in unknown section` out of
+  `initialize_market`). CI pins `--tools-version v1.52` (docs/testing.md)
 - `cd publisher && npm test` — publisher suite (8 tests, cross-language vector)
 - `cd sdk && npm test` — trader SDK suite (52 tests; funding/PnL/layout vector)
 - `cd cli && npm test` — trader CLI suite (16 smoke + R-1 regression)
@@ -19,7 +35,13 @@
   real program (solana-test-validator + SDK builders) and asserts on-chain
   invariants (`--test-force-exit`)
 - `cd trident-tests && cargo run --bin fuzz_0` — on-chain stateful fuzz smoke run
-- `cargo fmt --check` — format check
+- `cargo fmt --check` — format check (the pre-commit hook runs `cargo fmt --all` for you)
+- `.github/workflows/ci.yml` — `cargo fmt --check` and `cargo clippy --workspace
+  --all-targets -- -D warnings` gates, the lib suites split per module, and separate
+  jobs for the bank CPI suites / TS packages / validator e2e / Trident fuzz (all
+  sharing one SBF `.so` build artifact)
+- Git hooks: `git config core.hooksPath .githooks` (once per clone) enables the
+  pre-commit `cargo fmt --all` hook
 
 ## Tech Stack
 
@@ -120,9 +142,17 @@
 
 ## Testing
 
+- Local runs go through `cargo-nextest` (`.config/nextest.toml`); `cargo test` is the
+  fallback runner and the doctest runner (this workspace has no doctests). Both read the
+  per-block prop-test budgets and the shrink limits below.
 - Pure logic → `proptest` invariants in `programs/fructus/src/tests.rs` and the per-module
   `#[cfg(test)]` (funding/liquidation/positions/collateral); the adversarial-review probes live
   in those same per-module `#[cfg(test)]` blocks and in `tests.rs`.
+- Case budget is declared **per block** (`#![proptest_config(ProptestConfig::with_cases(64))]`
+  is the local default; the bank CPI block uses 20 because each case drives a bank for
+  ~2 s). Shrink limits are repo-wide in `.cargo/config.toml`
+  (`PROPTEST_MAX_SHRINK_ITERS` / `PROPTEST_MAX_SHRINK_TIME`). One run can override
+  everything through the `PROPTEST_*` env vars (`PROPTEST_CASES=100000 cargo test`).
 - Signature verification → mock instruction sysvar (`construct_instructions_data`).
 - Cross-language consistency → shared hex vector (Rust + TS) + SDK/cli vector tests.
 - Stateful on-chain → Trident `trident-tests/`.
@@ -145,8 +175,8 @@
 
 **Always:**
 
-- Run `cargo test --workspace` before committing program changes (and `anchor build` so
-  the CPI guard stays green).
+- Run `cargo nextest run --workspace` before committing program changes (and `anchor build`
+  so the CPI guard stays green).
 - Add/adjust property tests for any changed pure logic (`proptest`).
 - Keep the cross-language message vector (oracle) and the funding/PnL mirrors in sync
   across Rust + TypeScript.
