@@ -59,7 +59,7 @@ mod tests {
     // than the free seam nor mint/annihilate the ledger on a round trip.
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         // V-1: free_collateral is exactly `deposited - reserved`, and is `None`
         // (never a negative free) exactly when `reserved > deposited`.

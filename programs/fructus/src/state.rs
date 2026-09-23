@@ -109,7 +109,7 @@ impl PerpMarket {
 /// remains an *invalid price* (rejected with [`FructusError::InvalidPrice`])
 /// rather than an ambiguity with an empty slot.
 #[zero_copy]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Default)]
 pub struct Order {
     /// The signer who placed the order.
     pub owner: Pubkey,
@@ -127,19 +127,6 @@ pub struct Order {
     pub _pad: [u8; 7],
 }
 
-impl Default for Order {
-    fn default() -> Self {
-        Self {
-            owner: Pubkey::default(),
-            price: 0,
-            size: 0,
-            seq: 0,
-            active: 0,
-            _pad: [0u8; 7],
-        }
-    }
-}
-
 impl Order {
     /// In-memory `#[repr(C)]` size (`64` bytes, incl. the explicit padding).
     pub const LEN: usize = std::mem::size_of::<Self>();
@@ -147,7 +134,7 @@ impl Order {
 
 /// One outcome recorded on the bounded event-queue ring.
 #[zero_copy]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Default)]
 pub struct OutEvent {
     /// Monotonic event sequence number.
     pub seq: u64,
@@ -176,24 +163,6 @@ pub struct OutEvent {
     pub _pad: [u8; 5],
 }
 
-impl Default for OutEvent {
-    fn default() -> Self {
-        Self {
-            seq: 0,
-            price: 0,
-            size: 0,
-            owner: Pubkey::default(),
-            counterparty: Pubkey::default(),
-            entry_total_lamports: 0,
-            entry_pool_token_supply: 0,
-            settled: 0,
-            kind: 0,
-            side: 0,
-            _pad: [0u8; 5],
-        }
-    }
-}
-
 impl OutEvent {
     /// In-memory `#[repr(C)]` size (`112` bytes, incl. the explicit padding).
     pub const LEN: usize = std::mem::size_of::<Self>();
@@ -201,7 +170,7 @@ impl OutEvent {
 
 /// One time-weighted-mid accumulator sample on the TWAP ring.
 #[zero_copy]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Default)]
 pub struct Observation {
     /// Slot at which this sample was recorded.
     pub slot: u64,
@@ -210,16 +179,6 @@ pub struct Observation {
     /// Running `Σ mid × Δslot` accumulator, stored as 16 raw bytes (`u128` is
     /// avoided for cross-target alignment stability in a zero-copy layout).
     pub cumulative_mid: [u8; 16],
-}
-
-impl Default for Observation {
-    fn default() -> Self {
-        Self {
-            slot: 0,
-            mid: 0,
-            cumulative_mid: [0u8; 16],
-        }
-    }
 }
 
 impl Observation {
@@ -403,7 +362,7 @@ pub fn apy_in_bounds(apy: u64) -> bool {
 
 /// Whether a funding convergence-speed value lies within `[FUNDING_K_MIN, FUNDING_K_MAX]`.
 pub fn funding_k_in_bounds(k: u64) -> bool {
-    k >= FUNDING_K_MIN && k <= FUNDING_K_MAX
+    (FUNDING_K_MIN..=FUNDING_K_MAX).contains(&k)
 }
 
 /// Whether a per-epoch funding-rate cap lies within `[0, MAX_FUNDING_MAX]`.

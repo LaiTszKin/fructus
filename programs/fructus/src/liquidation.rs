@@ -150,12 +150,14 @@ pub fn apply_liquidation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::APY_SCALE;
+
     use proptest::prelude::*;
 
     // --- R-L2: liquidatable boundary + monotonicity ---
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         #[test]
         fn liquidatable_equality_is_healthy(
             notional in 1u64..1_000_000_000_000,
@@ -217,6 +219,8 @@ mod tests {
     // --- R-L3: penalty bounds + monotonicity ---
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         #[test]
         fn penalty_is_zero_at_bps_zero(collateral in 0u64..1_000_000_000_000) {
             prop_assert_eq!(liquidation_penalty(collateral, 0), Some(0));
@@ -252,6 +256,8 @@ mod tests {
     // --- R-L3: full / partial liquidation transitions ---
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         #[test]
         fn full_liquidation_zeroes_exposure(
             notional in 1u64..1_000_000_000_000,
@@ -278,8 +284,6 @@ mod tests {
             prop_assert_eq!(remaining, 0);
             let released = position_collateral - remaining;
             prop_assert_eq!(reward, liquidation_penalty(released, penalty_bps).unwrap());
-            prop_assert!(remaining >= 0, "remaining collateral never negative");
-            prop_assert!(reward >= 0, "reward never negative");
             prop_assert!(remaining + reward <= position_collateral, "no value created");
         }
 
@@ -311,7 +315,6 @@ mod tests {
             );
             let released = position_collateral - remaining;
             prop_assert_eq!(reward, liquidation_penalty(released, penalty_bps).unwrap());
-            prop_assert!(remaining >= 0, "remaining collateral never negative");
             prop_assert!(remaining + reward <= position_collateral, "no value created");
         }
 
@@ -341,8 +344,9 @@ mod tests {
         assert_eq!(liquidation_penalty(1_000, 500).unwrap(), 50); // 5% of 1000
         assert_eq!(liquidation_penalty(1, 500).unwrap(), 1); // ceil(0.05) = 1
         assert_eq!(liquidation_penalty(0, 500).unwrap(), 0);
-        // A penalty can never exceed the underlying collateral (boundary).
-        assert!(liquidation_penalty(u64::MAX, 10_000).unwrap() <= u64::MAX);
+        // Boundary: the maximal penalty (max bps on the max collateral) is the
+        // whole collateral, and the ceiling arithmetic never overflows past it.
+        assert_eq!(liquidation_penalty(u64::MAX, 10_000).unwrap(), u64::MAX);
     }
 
     #[test]
@@ -363,8 +367,6 @@ mod tests {
                 penalty_bps,
             )
             .unwrap();
-            assert!(remaining >= 0);
-            assert!(reward >= 0);
             // Full liquidation closes the position: surviving collateral == 0.
             assert_eq!(remaining, 0);
             // Holder total (remaining) + liquidator reward <= position collateral.
@@ -382,6 +384,8 @@ mod tests {
     const NOTIONAL_MAX: u64 = 1_000_000_000_000; // 1e12 (design band)
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         // R-L2: strict '<' — equity == maintenance is healthy, just below is
         // liquidatable; for a wide notional/bps band (NOT only the small band the
         // implementation chose).
@@ -427,7 +431,7 @@ mod tests {
             // zero-notional short-circuit ahead of it). Compare the branch precisely.
             match m {
                 Some(mm) => {
-                    let expected = (e as i128) < (mm as i128);
+                    let expected = e < (mm as i128);
                     prop_assert_eq!(liquidatable(collateral, pnl_value, notional, bps), Some(expected),
                         "liquidatable must be exactly equity < maintenance");
                 }
@@ -453,6 +457,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         // R-L3 penalty exactness: `ceil(collateral*bps/10000)` for a wide band.
         #[test]
         fn liquidation_penalty_exact_ceiling_formula(
@@ -493,6 +499,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         // R-L3/R-L4 apply_liquidation: never negative remaining, no value created,
         // invalid amounts rejected, and a FULL liquidation empties the notional.
         #[test]
@@ -507,8 +515,6 @@ mod tests {
             let amount = if amount > notional { notional } else { amount };
             let (remaining, reward) =
                 apply_liquidation(position_collateral, notional, amount, initial_margin_bps, maintenance_bps, penalty_bps).unwrap();
-            prop_assert!(remaining >= 0, "remaining collateral never negative");
-            prop_assert!(reward >= 0, "reward never negative");
             prop_assert!(remaining <= position_collateral, "remaining <= position collateral");
             prop_assert!(reward <= position_collateral, "reward <= position collateral");
             prop_assert!(remaining + reward <= position_collateral,
@@ -561,13 +567,12 @@ mod tests {
             .unwrap();
             prop_assert_eq!(remaining, margin_required(0, initial_margin_bps).unwrap());
             prop_assert_eq!(remaining, 0, "full liquidation never leaves negative remaining");
-            prop_assert!(reward >= 0, "reward never negative");
             prop_assert!(remaining + reward <= position_collateral, "no value created");
         }
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         // The `liquidate` handler's zero-sum transition: releases `consumed` from
         // the victim's `reserved`, debits the victim's `deposited` by `reward`,

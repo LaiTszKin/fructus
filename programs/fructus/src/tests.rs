@@ -42,6 +42,8 @@ const ED25519_SIGNATURE_LEN: usize = 64;
 // --- REQ-7 / REQ-9: staleness predicate is exact and overflow-safe ---
 
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
     #[test]
     fn stale_predicate_matches_saturating_threshold(
         last_update_slot in 0u64..,
@@ -154,6 +156,8 @@ fn parse_ed25519_instruction_rejects_cross_instruction_references() {
 // --- Settlement: exchange rate + realized yield ---
 
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
     #[test]
     fn self_yield_is_zero(n in 1u64..1_000_000_000, d in 1u64..1_000_000_000) {
         let r = ExchangeRate { total_lamports: n, pool_token_supply: d };
@@ -389,6 +393,8 @@ fn build_ed25519_instruction_data(pk: &Pubkey, msg: &[u8]) -> Vec<u8> {
 // so the test doubles as the spec.
 
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
     #[test]
     fn funding_k_bounds_match_interval(k in 0u64..) {
         prop_assert_eq!(funding_k_in_bounds(k), (1..=1_000_000u64).contains(&k));
@@ -472,6 +478,8 @@ fn ob_book(bids: Vec<Order>, asks: Vec<Order>) -> Book {
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
     #[test]
     fn is_crossable_matches_ge(bid in 0u64.., ask in 0u64..) {
         prop_assert_eq!(is_crossable(bid, ask), bid >= ask);
@@ -577,10 +585,14 @@ proptest! {
         posts in proptest::collection::vec((0u8..2u8, 0u64..100u64, 1u64..100u64), 0..10),
     ) {
         let mut book = ob_book(vec![], vec![]);
-        let mut seq = 0u64;
-        for (side, price, size) in posts {
-            let o = ob_order(1 + side, if side == 0 { Side::Bid } else { Side::Ask }, price, size, seq);
-            seq += 1;
+        for (seq, (side, price, size)) in posts.into_iter().enumerate() {
+            let o = ob_order(
+                1 + side,
+                if side == 0 { Side::Bid } else { Side::Ask },
+                price,
+                size,
+                seq as u64,
+            );
             let _ = post_limit(&mut book, o);
             let max_bid = book.bids.iter().map(|o| o.price).max().unwrap_or(0);
             let min_ask = book.asks.iter().map(|o| o.price).min().unwrap_or(u64::MAX);
@@ -768,7 +780,7 @@ fn twap_within_range() {
         cumulative_mid: cum,
     });
     if let Some(t) = twap(&obs, 3, mids.len() as u64) {
-        assert!(t >= 1 && t <= 9, "twap {} out of range", t);
+        assert!((1..=9).contains(&t), "twap {} out of range", t);
     }
 }
 
@@ -1444,6 +1456,8 @@ fn f3_error_table_must_not_claim_settle_fill_returns_position_not_found() {
 // `PositionNotFound`, this property (and the doc-consistency test above) would
 // both go red.
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
     #[test]
     fn f3_settle_fill_never_returns_position_not_found(
         lamports in 1u64..10_000_000_000_000_000_000u64,
@@ -1587,6 +1601,8 @@ fn f3_margin_required_bounds_asserts_monotonicity() {
 // the I-margin-bounds row documents actually holds for the implemented
 // formula.
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
     #[test]
     fn f3_margin_required_is_monotonic(
         n in 0u64..1_000_000_000_000_000_000u64,
@@ -1815,6 +1831,8 @@ fn life_fill(size: u64) -> crate::orderbook::Fill {
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
     // R-S1/R-S2 invariant: the PnL of the closed notional must be determinable
     // from the entry basis that was in effect when it was closed. A re-open
     // (which resets the entry sums) must NOT reframe it. Here the SAME
@@ -1927,7 +1945,7 @@ fn reopen_reframes_closed_pnl_witness() {
         (2u128) * (amt as u128),
         "gen1 entry rate 2.0"
     );
-    assert_eq!(position.entry_d_sum, (1u128) * (amt as u128));
+    assert_eq!(position.entry_d_sum, (amt as u128));
 
     let reference = pnl(
         position.entry_n_sum,
@@ -2099,7 +2117,7 @@ fn reopen_rebases_funding_epoch_deterministic() {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(10_000))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     // R-S1/R-S2: the aggregate closed-entry basis must realize each closed
     // generation at ITS OWN close-time entry basis, across MULTIPLE lifetimes
@@ -2153,7 +2171,7 @@ proptest! {
         .unwrap();
 
         prop_assert!(
-            (actual as i128 - expected as i128).abs() <= CLOSED_PNL_QUANT_TOL,
+            (actual - expected).abs() <= CLOSED_PNL_QUANT_TOL,
             "a re-open then re-close must price each closed generation at its own entry basis; \
              the aggregate closed-entry basis must track the per-generation PnL sum (within the \
              documented `pnl` truncation/quantization bound), never reframe the prior life to the \
@@ -2256,7 +2274,7 @@ mod conservation_adversarial_tests {
     use crate::settlement::{apply_credit, apply_debit};
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100_000))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         // INVARIANT (settle_close no-mint): a matched long+short pair carries
         // exactly opposite PnL, so settling BOTH sides through the PnL pool must

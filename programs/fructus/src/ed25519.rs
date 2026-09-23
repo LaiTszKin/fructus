@@ -103,12 +103,9 @@ pub fn verify_publisher_signature(
     let expected_pubkey = expected_publisher.to_bytes();
     let mut saw_wrong_message = false;
     let mut index: usize = 0;
-    loop {
-        let ix = match load_instruction_at_checked(index, instruction_sysvar) {
-            Ok(ix) => ix,
-            // End of the transaction's instruction list.
-            Err(_) => break,
-        };
+    // `load_instruction_at_checked` errors once `index` runs past the end of the
+    // transaction's instruction list.
+    while let Ok(ix) = load_instruction_at_checked(index, instruction_sysvar) {
         if ix.program_id.as_ref() == ed25519_program::ID.as_ref() {
             if let Some(parsed) = parse_ed25519_instruction(&ix.data) {
                 if parsed.public_key == expected_pubkey {

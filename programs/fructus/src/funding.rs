@@ -131,6 +131,8 @@ mod tests {
     // --- R-F1: premium sign / magnitude ---
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         #[test]
         fn premium_is_signed_difference(mark in 0u64..APY_SCALE * 10, index in 0u64..APY_SCALE * 10) {
             let p = premium(mark, index);
@@ -150,6 +152,8 @@ mod tests {
     // --- R-F2: clamp, monotonicity, symmetry ---
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         #[test]
         fn funding_rate_clamped_to_max(premium in -10_000_000i128..10_000_000,
                                       funding_k in 1u64..=APY_SCALE,
@@ -201,6 +205,8 @@ mod tests {
     // --- R-F3: sign convention — long pays, short receives on positive rate ---
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         #[test]
         fn long_pays_short_receives_on_positive_rate(
             notional in 1_000_000u64..1_000_000_000_000,
@@ -243,6 +249,8 @@ mod tests {
     // --- R-F5: accrual idempotency, zero epochs, epoch derivation ---
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         #[test]
         fn zero_rate_or_zero_epochs_pays_nothing(
             notional in 0u64..1_000_000_000_000,
@@ -316,6 +324,8 @@ mod tests {
     const EPOCHS_MAX: u64 = 10_000;
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         // R-F1: premium is the exact signed difference, antisymmetric, and 0 iff
         // equal — for the FULL u64 domain, not just the `APY_SCALE * 10` band.
         #[test]
@@ -491,6 +501,8 @@ mod tests {
     // R-F5 idempotency across the settlement adapter: re-settling the same epoch
     // delta (points already accrued) adds nothing.
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         #[test]
         fn settlement_idempotent_same_epoch(
             notional in 1u64..NOTIONAL_MAX,

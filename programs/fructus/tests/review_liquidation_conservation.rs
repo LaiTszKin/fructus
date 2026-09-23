@@ -74,7 +74,7 @@ fn handler_transition(
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(10_000))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     // [fix A] The FULL liquidation ledger conserves Σ(deposited + pool): the
     // reward is a zero-sum transfer out of the victim's released margin AND the

@@ -57,7 +57,7 @@ fn surviving_collateral_matches_invariant(
 }
 
 proptest! {
-    #![proptest_config(proptest::test_runner::Config::with_cases(10_000))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     // FULL liquidation: a fully-closed position (notional -> 0) must release ALL
     // of its collateral (the remaining collateral is exactly

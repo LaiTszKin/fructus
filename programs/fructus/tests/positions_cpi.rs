@@ -456,7 +456,7 @@ fn initialized_order_book_data(market: &Pubkey, bump: u8) -> Vec<u8> {
     book.market = *market;
     book.bump = bump;
     let mut data = Vec::with_capacity(8 + OrderBook::LEN);
-    data.extend_from_slice(&<OrderBook as Discriminator>::DISCRIMINATOR);
+    data.extend_from_slice(<OrderBook as Discriminator>::DISCRIMINATOR);
     data.extend_from_slice(bytemuck::bytes_of(&book));
     data
 }
@@ -693,7 +693,7 @@ async fn vault_balance(env: &Env) -> u64 {
 /// `margin_required(notional)` mirror of `positions::margin_required` for the
 /// market's `INITIAL_MARGIN_BPS`: CEILING `(notional * bps + 9_999) / 10_000`.
 fn margin_required(notional: u64) -> u64 {
-    ((notional as u128 * INITIAL_MARGIN_BPS as u128 + 9_999) / 10_000) as u64
+    (notional as u128 * INITIAL_MARGIN_BPS as u128).div_ceil(10_000) as u64
 }
 
 // --- Raw byte views of the zero-copy OrderBook account ---
@@ -2179,8 +2179,6 @@ proptest! {
                 assert!(d_long < 0, "positive premium must make long pay (got {d_long})");
                 assert!(d_short > 0, "positive premium must pay short (got {d_short})");
             }
-            assert!(lafter >= 0, "long funded below zero");
-            assert!(safter >= 0, "short funded below zero");
 
             // ---- (b) liquidation: drop the index, making A's long underwater.
             let drop = entry_total * (100 - drawdown_pct) / 100;
@@ -2221,8 +2219,6 @@ proptest! {
             // ledger ever goes negative; the vault token total is untouched by a
             // ledger-level liquidation transfer.
             assert!(uc_c_after.deposited >= uc_c_before, "liquidator was not credited");
-            assert!(uc_c_after.deposited >= 0, "liquidator ledger negative");
-            assert!(uc_a_after.deposited >= 0, "liquidated ledger negative");
             assert!(
                 uc_a_after.reserved <= uc_a_after.deposited,
                 "liquidated reserved > deposited"

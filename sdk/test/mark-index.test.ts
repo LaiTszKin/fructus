@@ -47,6 +47,7 @@ test("expectedFundingPayment mirrors the settle_funding pipeline", () => {
     indexN: 100_000_000n,
     indexD: 100_000_000n,
     fundingAccumulator: 0n,
+    pnlPool: 0n,
     bump: 255,
   };
   const position = {

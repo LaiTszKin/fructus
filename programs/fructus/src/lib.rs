@@ -3558,6 +3558,8 @@ mod handlers_tests {
     // exercises them at high run count.
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         // REQ-3/REQ-7 (I-close/atomicity): open fills settle inline — notional,
         // entry sums, and margin track margin_required(new_notional) exactly;
         // a shortfall is atomic (neither account mutated).

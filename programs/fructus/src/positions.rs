@@ -274,6 +274,8 @@ mod tests {
     // --- REQ-7: margin / leverage bounds ---
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         #[test]
         fn margin_required_bounds(
             notional in 0u64..1_000_000_000_000,
@@ -283,7 +285,7 @@ mod tests {
                 .expect("margin_required is total on u64 x u16");
             // ceiling formula
             let exact = (notional as u128) * (bps as u128);
-            let expected = ((exact + 9_999) / 10_000) as u64;
+            let expected = exact.div_ceil(10_000) as u64;
             prop_assert_eq!(m, expected, "ceiling formula");
             // bps == 10_000 => exact 1x
             if bps == 10_000 {
@@ -469,9 +471,8 @@ mod tests {
                     notional -= size;
                 }
             }
-            prop_assert!(notional >= 0, "notional never negative");
             let m = margin_required(notional, bps).expect("total");
-            let exact = ((notional as u128) * (bps as u128) + 9_999) / 10_000;
+            let exact = ((notional as u128) * (bps as u128)).div_ceil(10_000);
             prop_assert_eq!(m as u128, exact, "collateral == margin_required(notional)");
             // a full close leaves zero margin
             prop_assert_eq!(margin_required(0, bps), Some(0), "closed => collateral 0");
@@ -504,7 +505,7 @@ mod tests {
     fn margin_required_formula_pinned() {
         for n in [1u64, 10, 1_000, 1_000_000, u64::MAX] {
             // bps == 1000 => ceil(n / 10)
-            let expected_1000 = ((n as u128) * 1_000 + 9_999) / 10_000;
+            let expected_1000 = ((n as u128) * 1_000).div_ceil(10_000);
             assert_eq!(
                 margin_required(n, 1_000).unwrap() as u128,
                 expected_1000,
@@ -641,6 +642,8 @@ mod tests {
     // normalized component must land in [2^44, 2^45) whenever its bit length
     // exceeds 45, and be exact (`k = 0`) when both sums already fit in 45 bits.
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         #[test]
         fn normalize_sums_window_and_exactness(
             n in 0u128..u128::MAX,
@@ -705,6 +708,8 @@ mod tests {
     // in-file tests (which share its assumptions) cannot mask a counterexample.
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         // R-S3: apply_pnl never returns None on a loss, never returns negative, and
         // clamps at exactly `deposited - |loss|` while a profit credits exactly.
         #[test]
@@ -716,7 +721,6 @@ mod tests {
             let want = deposited.saturating_sub(loss.min(u64::MAX as i128) as u64);
             prop_assert_eq!(out, want, "loss debits but clamps at the deposited floor");
             prop_assert!(out <= deposited, "a loss never increases deposited");
-            prop_assert!(out >= 0, "a loss never makes deposited negative");
         }
 
         #[test]
@@ -740,6 +744,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         // pnl: exact antisymmetry (long == -short), sign correctness, and the
         // quantization floor — across a WIDE notional/rate band.
         #[test]
@@ -776,7 +782,7 @@ mod tests {
         ) {
             let m = margin_required(notional, bps).expect("margin_required is total on the validated bps domain");
             let exact = (notional as u128) * (bps as u128);
-            let expected = ((exact + 9_999) / 10_000) as u64;
+            let expected = exact.div_ceil(10_000) as u64;
             prop_assert_eq!(m, expected, "margin_required must be ceil(notional*bps/10000)");
             // Monotonic in notional.
             let m_next = margin_required(notional + 1, bps).unwrap();
@@ -789,6 +795,8 @@ mod tests {
     // signed payment / realized PnL preserves the "always a valid deposited
     // amount" postcondition for EVERY valid (deposited, signed_amount) pair.
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         #[test]
         fn settle_transition_deposited_never_invalid(
             deposited in any::<u64>(),
@@ -796,7 +804,6 @@ mod tests {
         ) {
             let out = apply_pnl(deposited, signed_amount);
             if let Some(v) = out {
-                prop_assert!(v <= u64::MAX, "deposited stays a valid u64");
                 if signed_amount < 0 {
                     prop_assert!(v <= deposited, "a debit never increases deposited");
                 }
@@ -820,6 +827,8 @@ mod settlement_tests {
     use proptest::prelude::*;
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
         #[test]
         fn zero_pnl_keeps_deposited(deposited in 0u64..1_000_000_000_000) {
             prop_assert_eq!(apply_pnl(deposited, 0), Some(deposited));

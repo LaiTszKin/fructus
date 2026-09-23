@@ -50,3 +50,19 @@ spl-associated-token-account = "8.0"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
+
+# Two deliberate style exceptions, allowed so `cargo clippy -D warnings` can be
+# a gate instead of a nag:
+#
+# - `field_reassign_with_default`: test fixtures build the zero-copy
+#   `#[repr(C)]` structs (OrderBook / OutEvent, 10+ fields) field-by-field from
+#   `Default::default()`. Struct-update syntax would hide which slots stay
+#   zeroed, and "zeroed" is exactly what those tests assert about unwritten
+#   slots.
+# - `too_many_arguments`: the positional helpers mirror the on-chain handler and
+#   adapter argument lists (`append_event`, `apply_open_fills`, the review
+#   suite's `handler_transition`); grouping them into structs would break the
+#   1:1 reading against `lib.rs` / the design doc.
+[lints.clippy]
+field_reassign_with_default = "allow"
+too_many_arguments = "allow"
