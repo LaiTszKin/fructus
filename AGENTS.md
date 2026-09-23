@@ -23,7 +23,12 @@
   v1.52**: `anchor build` picks it, while a bare `cargo build-sbf` installs the newer
   default (v1.54) — and rustup keeps only one SBF toolchain, so it *replaces* the good
   one and the bank then traps (`Access violation in unknown section` out of
-  `initialize_market`). CI pins `--tools-version v1.52` (docs/testing.md)
+  `initialize_market`). The fuzzer reads its own copy at `target/deploy-v0/fructus.so`
+  (`Trident.toml`; TridentSVM executes SBPFv0 only) — stage both with
+  `cargo build-sbf --arch v0 --tools-version v1.52 --sbf-out-dir target/deploy-v0`
+  plus a `cp` into `target/deploy`. Devnet takes **SBPFv3** (SIMD-0500) and
+  `scripts/deploy.sh` overwrites `target/deploy` with one, so rebuild the v0
+  artifact before the bank suites. CI pins the same flags (docs/testing.md)
 - `cd publisher && npm test` — publisher suite (8 tests, cross-language vector)
 - `cd sdk && npm test` — trader SDK suite (52 tests; funding/PnL/layout vector)
 - `cd cli && npm test` — trader CLI suite (16 smoke + R-1 regression)
