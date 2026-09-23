@@ -16,6 +16,7 @@ cargo test --workspace                    # full Rust suite (lib invariants + CP
 cargo test --workspace --lib              # lib-only invariants (215 tests)
 cargo test --workspace <test_name>        # single test
 cd publisher && npm test                  # TS suite (8 tests)
+cargo build-sbf --arch v0 --sbf-out-dir target/deploy-v0   # SBPFv0 artifact for the fuzzer (TridentSVM executes v0 only)
 cd trident-tests && cargo run --bin fuzz_0   # fuzz (1000 iters × 100 flows)
 ```
 

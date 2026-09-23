@@ -4,5 +4,9 @@ enabled = true
 
 [[fuzz.programs]]
 address = "8ZLiJ12eBiam4UP2HRp3M75CQAcc8GuUBz44zeHt6mjH"
-program = "../target/deploy/fructus.so"
+# TridentSVM (agave 2.3.x) executes SBPFv0 only, while the deploy path needs an
+# SBPFv3 artifact (SIMD-0500 on agave 4.x validators). Build the fuzz artifact
+# separately so the two paths don't collide:
+#   cargo build-sbf --arch v0 --sbf-out-dir target/deploy-v0
+program = "../target/deploy-v0/fructus.so"
  
