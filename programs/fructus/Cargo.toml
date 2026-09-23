@@ -45,8 +45,13 @@ solana-signer = "=3.0.0"
 solana-transaction = "=3.1.0"
 solana-transaction-error = "=3.4.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-spl-token = "9.0"
-spl-associated-token-account = "8.0"
+# `no-entrypoint` on both: their `entrypoint!` expands to an unmangled
+# `entrypoint` symbol, which collides with the one `#[program]` emits for this
+# crate when a test binary links all three. ld64 (macOS) tolerates the
+# duplicate, rust-lld (Linux, i.e. CI) rejects it: "duplicate symbol:
+# entrypoint". The tests only need their instruction builders and state types.
+spl-token = { version = "9.0", features = ["no-entrypoint"] }
+spl-associated-token-account = { version = "8.0", features = ["no-entrypoint"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
