@@ -61,6 +61,12 @@ fi
 echo "==> [1/4] anchor build (devnet program id: $program_id)"
 anchor build
 
+# SBPF v0/v1/v2 deployment is disabled on current clusters (SIMD-0500), so the
+# toolchain-default (v0) artifact is rejected by the loader with
+# "Detected sbpf_version required by the executable which are not enabled".
+# Rebuild the .so for SBPFv3 — what current localnet/devnet actually accept.
+cargo build-sbf --arch v3 --manifest-path programs/fructus/Cargo.toml --sbf-out-dir "$ROOT/target/deploy"
+
 echo "==> [2/4] anchor deploy to cluster '$DEVNET_CLUSTER'"
 anchor deploy \
   --program-name fructus \
@@ -74,7 +80,9 @@ if [[ ! -d scripts/node_modules ]]; then
   (cd scripts && npm install --silent)
 fi
 out_dir="$(cd scripts && pwd)"
-out_json="$(node -e '
+# Resolve @solana/web3.js from scripts/node_modules (the documented `npm install`
+# location): a `node -e` launched from the repo root cannot resolve it.
+out_json="$(cd "$out_dir" && node -e '
   const { PublicKey } = require("@solana/web3.js");
   const id = new PublicKey(process.argv[1]);
   const [market, mb] = PublicKey.findProgramAddressSync([Buffer.from("perp_market")], id);
@@ -100,4 +108,4 @@ echo "Recording the deployed id back into Anchor.toml (programs.devnet):"
 echo "  sed -i \"s#^fructus = .*#fructus = \\\"$program_id\\\"#\" Anchor.toml"
 echo "If declare_id! differs, update it too, rebuild, and re-run this script."
 echo "Then set these env vars and run the e2e:"
-echo "  PROGRAM_ID=$program_id MARKET_ADDRESS=$(node -e 'process.stdout.write(require(process.argv[1]).market)' "$out_dir/deploy-output.json")"
+echo "  PROGRAM_ID=$program_id MARKET_ADDRESS=$(cd "$out_dir" && node -e 'process.stdout.write(require(process.argv[1]).market)' "$out_dir/deploy-output.json")"
