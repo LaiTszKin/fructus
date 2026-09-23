@@ -171,8 +171,14 @@ async function ensureCollateralMint(): Promise<PublicKey> {
   }
   // create-token: fee payer + mint authority default to the config keypair (authority).
   const out = run("spl-token", ["create-token", "--decimals", String(COLLATERAL_DECIMALS), "--config", CONFIG_PATH, "--output", "json"]);
-  const j = parseJson(out);
-  const addr = (j.address as string) ?? (j.mintAddress as string);
+  const j = parseJson(out) as {
+    address?: string;
+    mintAddress?: string;
+    commandOutput?: { address?: string };
+  };
+  // spl-token-cli >= 5.x wraps results as { commandName, commandOutput: { address } };
+  // older versions print a flat { address } (or { mintAddress }).
+  const addr = j.address ?? j.mintAddress ?? j.commandOutput?.address;
   if (!addr) throw new Error(`could not parse collateral mint from: ${out}`);
   console.log(`[collateral] created mint ${addr}`);
   return new PublicKey(addr);
@@ -182,9 +188,12 @@ async function ensureTraderFunded(mint: PublicKey, trader: Keypair, label: strin
   // create-account with --owner <trader> creates/uses the standard ATA (matches e2e).
   // Idempotent: an ATA that already exists is a no-op, so ignore the error.
   try {
+    // spl-token-cli 5.x: the config `keypair_path` is not used for fee-payer
+    // resolution on this subcommand — pass the signer explicitly.
     run("spl-token", [
       "create-account", mint.toBase58(),
       "--owner", trader.publicKey.toBase58(),
+      "--fee-payer", AUTHORITY_PATH,
       "--config", CONFIG_PATH,
       "--output", "json",
     ]);
@@ -200,7 +209,8 @@ async function ensureTraderFunded(mint: PublicKey, trader: Keypair, label: strin
   if (bal >= DEPOSIT_AMOUNT) return;
   const factor = 10n ** BigInt(COLLATERAL_DECIMALS);
   const tokens = (DEPOSIT_AMOUNT / factor + BigInt(MINT_HEADROOM_TOKENS)).toString();
-  run("spl-token", ["mint", mint.toBase58(), tokens, ata.toBase58(), "--config", CONFIG_PATH, "--output", "json"]);
+  // spl-token-cli 5.x: same explicit-signer note as create-account above.
+  run("spl-token", ["mint", mint.toBase58(), tokens, ata.toBase58(), "--mint-authority", AUTHORITY_PATH, "--fee-payer", AUTHORITY_PATH, "--config", CONFIG_PATH, "--output", "json"]);
   console.log(`[collateral] minted ${tokens} tokens to ${label} ATA`);
 }
 
