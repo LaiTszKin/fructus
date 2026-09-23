@@ -44,7 +44,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Pinned to the toolchain docs/setup.md was validated against (the package
       # MSRV is lower); bump it in one place per job when the toolchain moves.
       - uses: dtolnay/rust-toolchain@1.97.1
@@ -57,7 +57,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: clippy
@@ -98,11 +98,16 @@ jobs:
           - name: review suites
             filter: 'binary(review_liquidation_conservation) + binary(review_liquidation_invariants)'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.1
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: rust-1.97.1
+      # cargo-nextest is not on the runner image; the prebuilt binary makes this a
+      # few seconds. rust-cache restores ~/.cargo/bin, so later runs skip it.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - run: cargo nextest run -E '${{ matrix.filter }}'
 
   # --------------------------------------------------------- SBF artifact ----
@@ -111,7 +116,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.1
       - name: Install the Agave CLI (cargo-build-sbf)
         run: |
@@ -120,7 +125,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: rust-1.97.1
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           # Platform-tools + the SBF rustc `cargo-build-sbf` drives through rustup.
           # Keyed on the pinned tools version: a miss only costs the download.
@@ -145,14 +150,15 @@ jobs:
         run: |
           cargo build-sbf --manifest-path programs/fructus/Cargo.toml \
             --tools-version v1.52 --arch v0 --sbf-out-dir target/deploy-v0
+          mkdir -p target/deploy
           cp target/deploy-v0/fructus.so target/deploy/fructus.so
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: fructus-so
           path: target/deploy/fructus.so
           if-no-files-found: error
           retention-days: 7
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: fructus-so-v0
           path: target/deploy-v0/fructus.so
@@ -180,17 +186,22 @@ jobs:
           - name: collateral vault
             filter: 'binary(collateral_cpi)'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.1
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: rust-1.97.1
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: fructus-so
           path: target/deploy
       - name: Refresh the .so mtime for the freshness guard
         run: touch target/deploy/fructus.so
+      # cargo-nextest is not on the runner image; the prebuilt binary makes this a
+      # few seconds. rust-cache restores ~/.cargo/bin, so later runs skip it.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - run: cargo nextest run -E '${{ matrix.filter }}'
 
   # ------------------------------------------------------------- TS suites ----
@@ -203,12 +214,18 @@ jobs:
       matrix:
         package: [publisher, sdk, cli, scripts]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: npm
           cache-dependency-path: ${{ matrix.package }}/package-lock.json
+      # `cli` imports the SDK's sources (`fructus-sdk/src/index.js`), and those
+      # files resolve `@solana/web3.js` from the SDK's own node_modules.
+      - name: Install the SDK
+        if: matrix.package == 'cli'
+        working-directory: sdk
+        run: npm ci
       - name: Install
         working-directory: ${{ matrix.package }}
         run: npm ci
@@ -240,8 +257,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: npm
@@ -253,10 +270,17 @@ jobs:
         run: |
           curl -sSfL "https://release.anza.xyz/v${SOLANA_VERSION}/install" | sh
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: fructus-so
           path: target/deploy
+      # `integration` imports both the SDK's and the CLI's sources.
+      - name: Install the SDK
+        working-directory: sdk
+        run: npm ci
+      - name: Install the CLI
+        working-directory: cli
+        run: npm ci
       - name: Install
         working-directory: integration
         run: npm ci
@@ -290,7 +314,7 @@ jobs:
             experimental: true
     continue-on-error: ${{ matrix.experimental }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.1
       - uses: Swatinem/rust-cache@v2
         with:
@@ -298,7 +322,7 @@ jobs:
           shared-key: rust-1.97.1-trident
           workspaces: trident-tests
       # Trident.toml points at target/deploy-v0 (TridentSVM executes SBPFv0 only).
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: fructus-so-v0
           path: target/deploy-v0
@@ -307,7 +331,7 @@ jobs:
         run: cargo run --bin ${{ matrix.bin }}
       - name: Upload Trident metrics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: trident-metrics-${{ matrix.target }}
           path: |
