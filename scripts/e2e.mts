@@ -624,7 +624,7 @@ async function networkWalk(): Promise<void> {
       [
         depositCollateralIx(programId, [
           { pubkey: user.publicKey, isSigner: true, isWritable: true },
-          { pubkey: pdas.market, isSigner: false, isWritable: false },
+          { pubkey: pdas.market, isSigner: false, isWritable: true },
           { pubkey: uc, isSigner: false, isWritable: true },
           { pubkey: pdas.vault, isSigner: false, isWritable: true },
           { pubkey: ata, isSigner: false, isWritable: true },
@@ -841,7 +841,7 @@ async function networkWalk(): Promise<void> {
       connection,
       [
         settleCloseIx(programId, [
-          { pubkey: pdas.market, isSigner: false, isWritable: false },
+          { pubkey: pdas.market, isSigner: false, isWritable: true },
           { pubkey: pos, isSigner: false, isWritable: true },
           { pubkey: userCollateralPda(programId, pdas.market, label === "long" ? longUser.publicKey : shortUser.publicKey), isSigner: false, isWritable: true },
           { pubkey: indexSource, isSigner: false, isWritable: false },
