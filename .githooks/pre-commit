@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Pre-commit hook: run `cargo fmt --all` and re-stage the Rust files that are part
+# of this commit, so a commit can never land unformatted and CI's `cargo fmt
+# --check` has nothing left to catch.
+#
+# Enable it once per clone (hooks are not cloned automatically):
+#
+#     git config core.hooksPath .githooks
+#
+# Skip it for a single commit with:  git commit --no-verify
+set -euo pipefail
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-commit: cargo not on PATH — skipping cargo fmt" >&2
+    exit 0
+fi
+
+# Only staged (added/copied/modified/renamed) Rust files matter here.
+staged=()
+while IFS= read -r -d '' file; do
+    staged+=("$file")
+done < <(git diff --cached --name-only -z --diff-filter=ACMR -- '*.rs')
+
+if [ "${#staged[@]}" -eq 0 ]; then
+    exit 0
+fi
+
+# A syntax error makes rustfmt fail, which aborts the commit — intended.
+cargo fmt --all
+
+# `cargo fmt --all` may also reformat files that are not part of this commit;
+# only the staged paths are re-added, so unrelated working-tree edits stay
+# unstaged and out of the commit.
+git add -- "${staged[@]}"
+
+echo "pre-commit: cargo fmt applied; re-staged ${#staged[@]} Rust file(s)"

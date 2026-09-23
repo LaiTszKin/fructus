@@ -1,0 +1,18 @@
+# Local test budget for `proptest` (see docs/testing.md).
+#
+# Case counts live next to the test that declares them — every block sets
+# `#![proptest_config(...)]` (local default 64; the bank CPI block runs 20
+# because each case drives a bank for ~2 s). This table only bounds the
+# *shrinking* of a counterexample, which is the same job for every block:
+# proptest's own default is `4 x cases` iterations with no time cap, so a wide
+# generator could spend a long time minimising a failure.
+#
+# An environment variable you export always wins over `[env]`, so a one-off
+# deeper run is a one-liner (0 disables a limit):
+#
+#   PROPTEST_CASES=100000 cargo test --workspace          # full property sweep
+#   PROPTEST_MAX_SHRINK_TIME=0 cargo test --lib settlement::   # minimise fully
+#
+[env]
+PROPTEST_MAX_SHRINK_ITERS = "1024"
+PROPTEST_MAX_SHRINK_TIME = "5000"

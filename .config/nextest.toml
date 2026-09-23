@@ -1,0 +1,31 @@
+# The repository's default test runner is cargo-nextest (see AGENTS.md and
+# docs/testing.md). `cargo test` stays the fallback for the one behaviour nextest
+# does not carry — doctests — and this workspace has none (`Doc-tests fructus`
+# runs 0 tests).
+#
+# The four settings below are pinned rather than left to nextest's defaults,
+# because each default would change what a run MEANS:
+#
+# - fail-fast = false: nextest's default stops at the first failing test, while
+#   `cargo test` keeps going — one red run must still show every red.
+# - retries = 0: a retry would hide exactly the flakiness the property suites
+#   exist to surface. No test is ever retried.
+# - slow-timeout (mark only — the duration form sets no `terminate-after`):
+#   keep slow MARKING and termination OFF, so like `cargo test` no test is
+#   killed on a clock. The bank CPI suites legitimately run for tens of seconds.
+# - leak-timeout = "5s": nextest's default calls a test leaky when the stdio
+#   pipes are not observed closed within 100 ms of the process exiting, which
+#   flags a child that closes them a moment later. 5 s still marks a handle the
+#   test really left open (a task that never finished) while a child that closes
+#   its pipes on its own is not marked, and a green test pays nothing — the
+#   check returns as soon as both pipes are observed closed.
+#
+# Parallelism is left at the default (one process per test). Measured here: the
+# whole workspace is 252 tests, and the heaviest suite (`positions_cpi`, two bank
+# property tests plus 12 bank scenarios) peaks at ~0.3 GB of concurrent RSS, so
+# nothing needs a `threads-required` cap.
+[profile.default]
+fail-fast = false
+retries = 0
+slow-timeout = { period = "120s" }
+leak-timeout = "5s"
