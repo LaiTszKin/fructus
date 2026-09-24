@@ -230,12 +230,12 @@ jobs:
         working-directory: ${{ matrix.package }}
         run: npm ci
       - name: Type-check
-        # `publisher` is skipped: `src/update.ts` calls `Keypair.sign`, which the
-        # installed @solana/web3.js (1.98) no longer exposes — not in its types and
-        # not at run time (`TypeError: publisher.sign is not a function`). Fixing it
-        # (`Ed25519Program.createInstructionWithPrivateKey`) is a keeper source
-        # change, tracked outside this workflow; drop the `if` once it lands.
-        if: matrix.package != 'publisher'
+        # `publisher` used to be skipped here: `src/update.ts` called `Keypair.sign`,
+        # which @solana/web3.js >= 1.98 no longer exposes — not in its types and not at
+        # run time (`TypeError: publisher.sign is not a function`). `buildUpdateTx` now
+        # signs through `Ed25519Program.createInstructionWithPrivateKey` and is pinned
+        # by `publisher/test/update.test.ts` (valid-signature check), so the whole
+        # matrix type-checks and builds again.
         working-directory: ${{ matrix.package }}
         run: |
           npm run typecheck --if-present

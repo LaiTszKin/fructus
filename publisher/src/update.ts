@@ -36,12 +36,15 @@ export function buildUpdateApyIx({ oracle, programId, apy, version }: UpdatePara
 export function buildUpdateTx(params: UpdateParams): Transaction {
   const { publisher, oracle, apy, version } = params;
   const message = updateMessage(oracle, apy, version);
-  const signature = publisher.sign(message); // 64-byte ed25519 signature
 
-  const ed25519Ix = Ed25519Program.createInstructionWithPublicKey({
-    publicKey: publisher.publicKey.toBytes(),
+  // web3.js >= 1.98 no longer exposes `Keypair.sign` — not in its types and not at
+  // run time (`TypeError: publisher.sign is not a function`), which is why the
+  // keeper was broken while its type-stripping tsx suite stayed green. The ed25519
+  // program helper signs with the raw secret key and emits the verify instruction
+  // in one call. Regression test: `test/update.test.ts`.
+  const ed25519Ix = Ed25519Program.createInstructionWithPrivateKey({
+    privateKey: publisher.secretKey,
     message,
-    signature,
   });
 
   const tx = new Transaction().add(ed25519Ix, buildUpdateApyIx(params));
