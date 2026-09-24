@@ -38,6 +38,15 @@ import {
 } from "@solana/web3.js";
 import { createHash } from "node:crypto";
 
+// The e2e v1 smoke leg (issue #20) consumes the SDK's v1 send path directly, the
+// same way the CLI does (cli/src/commands/common.ts).
+import {
+  V1UnavailableError,
+  buildDepositCollateral,
+  isV1GateActive,
+  sendV1Instructions,
+} from "fructus-sdk/src/index.js";
+
 // ---------------------------------------------------------------------------
 // Protocol constants (mirror programs/fructus/src/constants.rs)
 // ---------------------------------------------------------------------------
@@ -637,6 +646,11 @@ async function networkWalk(): Promise<void> {
     );
   }
 
+  // --- 4b. v1 smoke leg (issue #20) ----------------------------------------
+  // Added section: ONE minimal deposit_collateral through the SDK's v1 path,
+  // right after the v0 deposit phase. The v0 walk's code and rows are untouched.
+  await v1SmokeLeg(connection, programId, pdas.market, longUser, usdcMint);
+
   // --- 5. open a full LONG and a full SHORT --------------------------------
   // shortUser posts a resting ask; the long takers fill against it (long user
   // opens LONG as taker). The long user then posts a resting bid; the short
@@ -855,6 +869,88 @@ async function networkWalk(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// v1 smoke leg (issue #20) — ADDED section; the v0 walk above is untouched.
+// ---------------------------------------------------------------------------
+
+/**
+ * Amount for the v1 smoke deposit: 1_000_000 micro-USDC = 1 USDC (6dp). A small
+ * fixed value on purpose — this leg smoke-tests the SDK's v1 send path, it is not
+ * part of the walk's economic setup (which uses DEPOSIT_AMOUNT).
+ */
+const V1_SMOKE_DEPOSIT_AMOUNT = 1_000_000n;
+
+/** The v1 leg's banner row (shared by the offline notice and the network leg). */
+function logV1LegIntro(): void {
+  console.log(
+    `\n[v1] smoke leg: one deposit_collateral of ${V1_SMOKE_DEPOSIT_AMOUNT} micro (1 USDC) via the SDK v1 path`,
+  );
+}
+
+/**
+ * The v1 leg proper: gate check, then ONE minimal `deposit_collateral` for the
+ * long user — instruction built by the SDK (`buildDepositCollateral`) and submitted
+ * through the SDK's v1 path (`sendV1Instructions`), which does its own fail-closed
+ * gate check, one simulation for the explicit limits, then a base64 send and (with
+ * `confirm: true`) a confirmation. The confirmation is logged with its signature:
+ * `[v1] confirmed: <signature>`.
+ *
+ * An inactive v1 gate is a loud SKIP, never a failure — the rest of the walk's exit
+ * status is unaffected either way (the gate is active on the clusters we target, so
+ * this normally runs).
+ */
+export async function v1SmokeLeg(
+  connection: Connection,
+  programId: PublicKey,
+  market: PublicKey,
+  longUser: Keypair,
+  collateralMint: PublicKey,
+): Promise<void> {
+  logV1LegIntro();
+  if (!(await isV1GateActive(connection))) {
+    console.log("[v1] skipped: the transaction-v1 feature gate is inactive on this cluster");
+    return;
+  }
+  const userAta = associatedTokenAccount(longUser.publicKey, collateralMint);
+  console.log(`[v1] depositing ${V1_SMOKE_DEPOSIT_AMOUNT} for the long user via v1...`);
+  try {
+    const signature = await sendV1Instructions(
+      connection,
+      [
+        buildDepositCollateral({
+          user: longUser.publicKey,
+          market,
+          userAta,
+          collateralMint,
+          amount: V1_SMOKE_DEPOSIT_AMOUNT,
+          programId,
+        }),
+      ],
+      [longUser],
+      { feePayer: longUser.publicKey, confirm: true },
+    );
+    console.log(`[v1] confirmed: ${signature}`);
+  } catch (err) {
+    // `sendV1Instructions` re-checks the gate itself (fail closed), so a gate that
+    // went away between the check above and the send lands here too.
+    if (err instanceof V1UnavailableError) {
+      console.log(`[v1] skipped: ${err.message}`);
+      return;
+    }
+    throw err;
+  }
+}
+
+/**
+ * Offline counterpart of the v1 smoke leg: the dry-run touches no network, so the
+ * leg is printed and marked skipped. Kept out of `offlineDryRun` so the v0 dry-run
+ * body — and every existing output row — stays byte-identical (REQ-20-2).
+ */
+function v1LegOfflineNotice(): void {
+  logV1LegIntro();
+  console.log("[v1] skipped (offline): set RUN_E2E=1 on a v1-gated cluster to submit it");
+}
+
+// ---------------------------------------------------------------------------
 // Offline dry-run (default): no network; derive PDAs + assert the convention.
 // ---------------------------------------------------------------------------
 
@@ -894,6 +990,8 @@ function main(): void {
     });
   } else {
     offlineDryRun(programId);
+    // Added v1-leg rows only (issue #20); the dry-run above is untouched.
+    v1LegOfflineNotice();
   }
 }
 

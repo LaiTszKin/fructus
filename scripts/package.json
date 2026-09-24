@@ -14,7 +14,8 @@
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.99.0"
+    "@solana/web3.js": "^1.99.0",
+    "fructus-sdk": "file:../sdk"
   },
   "devDependencies": {
     "@types/node": "^24.13.6",
