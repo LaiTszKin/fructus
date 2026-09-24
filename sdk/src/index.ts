@@ -19,3 +19,6 @@ export * from "./account/index.js";
 // PDA derivation + instruction builders / submit helpers (R-SDK1).
 export * from "./pda.js";
 export * from "./instructions.js";
+
+// Transaction v1 opt-in send path (issue #19).
+export * from "./v1.js";

@@ -9,6 +9,7 @@
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
+    "@solana/kit": "8.3.0",
     "@solana/web3.js": "^1.95.0"
   },
   "devDependencies": {
