@@ -5,7 +5,7 @@ import type { TraderConfig } from "../env.js";
 import { PLACEHOLDER_PUBKEY } from "../env.js";
 import { die } from "../errors.js";
 import type { DerivedStep, DryRunReport, ValueStep } from "../report.js";
-import { submitInstruction, submitTransaction } from "fructus-sdk/src/index.js";
+import { sendV1Instructions, submitInstruction, submitTransaction } from "fructus-sdk/src/index.js";
 
 export interface ReportParts {
   derived: DerivedStep[];
@@ -40,11 +40,14 @@ export function placeholders(cfg: TraderConfig, out: ReportParts): void {
 
 /**
  * Sign + submit a report's instructions via the SDK's submit helpers and return
- * the transaction signatures. Requires a real keypair + RPC URL.
+ * the transaction signatures. Requires a real keypair + RPC URL. With
+ * `txVersion === "v1"` the built instructions go through the SDK's v1 send path
+ * (`sendV1Instructions`); the default `legacy` path is unchanged.
  */
 export async function submitReport(
   cfg: TraderConfig,
   report: DryRunReport,
+  txVersion: "legacy" | "v1" = "legacy",
 ): Promise<string[]> {
   if (report.instructions.length === 0) {
     return [];
@@ -60,6 +63,22 @@ export async function submitReport(
   }
   const connection = new Connection(cfg.rpcUrl, "confirmed");
   const signers = [cfg.keypair];
+
+  if (txVersion === "v1") {
+    const ixs = report.instructions.map(
+      (i) =>
+        new TransactionInstruction({
+          programId: i.programId,
+          keys: i.keys,
+          data: i.data,
+        }),
+    );
+    const sig = await sendV1Instructions(connection, ixs, signers, {
+      feePayer: cfg.owner,
+      confirm: true,
+    });
+    return [sig];
+  }
 
   if (report.instructions.length === 1) {
     const i = report.instructions[0];

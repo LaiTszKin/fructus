@@ -5,6 +5,7 @@
 //! + submits on-chain. No secrets are committed.
 
 import { flagBool } from "./args.js";
+import { flagStr } from "./args.js";
 import { tokenize } from "./args.js";
 import { commands, commandNames } from "./commands/registry.js";
 import { submitReport } from "./commands/common.js";
@@ -13,6 +14,27 @@ import { CliError, die } from "./errors.js";
 import { defaultIo, renderReport, type Io } from "./report.js";
 
 export const VERSION = "0.1.0";
+
+/** The transaction version a submission goes through (`--tx-version`). */
+type TxVersion = "legacy" | "v1";
+
+/** Legal `--tx-version` values, in documentation order. */
+const TX_VERSIONS: readonly TxVersion[] = ["legacy", "v1"];
+
+/**
+ * Read the global `--tx-version` option (default `legacy`). A value outside the
+ * legal set is rejected with a `CliError` naming the flag and both legal values,
+ * before any config resolution or instruction building happens (R-19-2).
+ */
+function txVersionFromFlags(flags: Record<string, string | boolean>): TxVersion {
+  const raw = flagStr(flags, "tx-version", "legacy");
+  if (raw !== "legacy" && raw !== "v1") {
+    throw new CliError(
+      `invalid --tx-version value "${raw}"; legal values: ${TX_VERSIONS.join(", ")}`,
+    );
+  }
+  return raw;
+}
 
 function globalHelp(): string {
   const lines: string[] = [
@@ -38,6 +60,7 @@ function globalHelp(): string {
     "  --keypair-file <p>   trader keypair file",
     "  --network/-n         connect to the RPC for live queries",
     "  --submit/-s          sign + submit on-chain",
+    "  --tx-version <legacy|v1>  transaction version for submissions (default: legacy)",
     "  --help/-h            show help",
     "  --version/-v         print version",
     "",
@@ -83,18 +106,20 @@ export async function runCli(
   }
 
   try {
+    const txVersion = txVersionFromFlags(parsed.flags);
     const cfg = resolveConfig(parsed, cwd);
     const report = await cmd.build(cfg, {
       ...parsed,
       positionals: parsed.positionals.slice(1),
     });
+    report.txVersion = txVersion;
     io.out(renderReport(report));
 
     if (cfg.submit) {
       if (report.instructions.length === 0) {
         io.err(`warning: ${cmdName} has no on-chain instruction to submit`);
       } else {
-        const sigs = await submitReport(cfg, report);
+        const sigs = await submitReport(cfg, report, txVersion);
         io.out(`submitted: ${sigs.join(", ")}`);
       }
     }

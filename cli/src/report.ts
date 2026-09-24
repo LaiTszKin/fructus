@@ -24,6 +24,8 @@ export interface ValueStep {
 export interface DryRunReport {
   command: string;
   mode: "offline" | "network";
+  /** Transaction version used for submissions (`--tx-version`); default `legacy`. */
+  txVersion?: "legacy" | "v1";
   programId: PublicKey;
   market: PublicKey;
   owner: PublicKey;
@@ -52,6 +54,7 @@ export function renderReport(r: DryRunReport): string {
   const lines: string[] = [];
   lines.push(`=== fructus-cli ${r.command} ===`);
   lines.push(`mode: ${r.mode}${r.mode === "offline" ? " (dry-run; use --submit to post on-chain)" : ""}`);
+  lines.push(`tx-version: ${r.txVersion ?? "legacy"}`);
   lines.push(`owner : ${r.owner.toBase58()}`);
   lines.push(`program: ${r.programId.toBase58()}`);
   lines.push(`market : ${r.market.toBase58()}`);
