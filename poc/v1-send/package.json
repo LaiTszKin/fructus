@@ -1,0 +1,19 @@
+{
+  "name": "fructus-poc-v1-send",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Fructus Stage-2 #18 PoC: a minimal Transaction V1 (SIMD-0385) send on devnet, built with @solana/kit and @solana/web3.js. Not part of any workspace or CI run.",
+  "scripts": {
+    "poc": "tsx main.ts"
+  },
+  "dependencies": {
+    "@solana/kit": "8.3.0",
+    "@solana/web3.js": "^1.99.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.6",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
