@@ -10,7 +10,8 @@
     "skipLibCheck": true,
     "resolveJsonModule": true,
     "sourceMap": true,
-    "declaration": false
+    "declaration": false,
+    "types": ["node"]
   },
   "include": ["e2e.mts", "selfcontained.mts"]
 }
