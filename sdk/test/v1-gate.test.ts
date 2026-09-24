@@ -26,10 +26,10 @@ test("V1-GATE-INACTIVE-FAILS-CLOSED: an inactive gate reads false and any v1 sen
     sendV1Instructions(off, [], []),
     (err: unknown) =>
       err instanceof V1UnavailableError &&
-      (err as Error).message.includes("txv1aq4pp281K9um3pgkfX8UqtFT6wcVW3hNezGLL"),
+      (err as Error).message.includes("txv1aq4pp281K9um3tnPgkfX8UqtFT6wcVW3hNezGLL"),
   );
 });
 
 test("V1-GATE-ID: the gate id constant is the documented feature id", () => {
-  assert.equal(TXV1_GATE_ID, "txv1aq4pp281K9um3pgkfX8UqtFT6wcVW3hNezGLL");
+  assert.equal(TXV1_GATE_ID, "txv1aq4pp281K9um3tnPgkfX8UqtFT6wcVW3hNezGLL");
 });

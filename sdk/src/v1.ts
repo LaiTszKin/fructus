@@ -29,7 +29,7 @@ export type V1Message = Extract<TransactionMessage, { version: 1 }> &
   TransactionMessageWithLifetime;
 
 /** The v1 feature gate (SIMD-0385). Feature accounts live at the feature id's address. */
-export const TXV1_GATE_ID = "txv1aq4pp281K9um3pgkfX8UqtFT6wcVW3hNezGLL";
+export const TXV1_GATE_ID = "txv1aq4pp281K9um3tnPgkfX8UqtFT6wcVW3hNezGLL";
 
 /** v1 resource limits are page-granular: the loaded-accounts data size rounds up to 32 KiB. */
 export const V1_PAGE_BYTES = 32768;
