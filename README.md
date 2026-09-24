@@ -116,7 +116,7 @@ that provide liquidity and raise the cost of a hostile capital attack.
 
 - **Language:** Rust (on-chain) + TypeScript (off-chain keeper, SDK, CLI, scripts)
 - **Chain:** Solana
-- **Framework:** Anchor 1.1
+- **Framework:** Anchor 1.2
 - **Key dependencies:** `anchor-lang`, `anchor-spl`, `bytemuck`, `solana-sdk-ids`, `@solana/web3.js`
 - **Testing/verification:** `proptest`, `solana-program-test` (CPI), Trident, `tsx --test`
 - **Fuzzing:** Trident

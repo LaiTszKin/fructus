@@ -7,8 +7,8 @@
 | Node.js | ≥ 18 | Off-chain publisher | Dev on v26 |
 | TypeScript | ^5.5 | Off-chain publisher | ESM, `moduleResolution: NodeNext` |
 | **Solana / Anchor** | | | |
-| anchor-lang | 1.1.2 | Program framework | workspace dep |
-| anchor-spl | 1.1.2 | SPL helpers | workspace dep |
+| anchor-lang | 1.2.0 | Program framework | workspace dep |
+| anchor-spl | 1.2.0 | SPL helpers | workspace dep |
 | bytemuck | 1.17 | zero-copy account layouts | `derive` + `min_const_generics` |
 | solana-sdk-ids | 3.1.0 | Well-known program IDs | `ed25519_program`, sysvars |
 | solana-instructions-sysvar | 3.0.0 | Instruction introspection | for ed25519 verify |

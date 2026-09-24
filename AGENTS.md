@@ -53,7 +53,7 @@
 ## Tech Stack
 
 - **Language**: Rust (MSRV 1.89) + TypeScript (ESM, Node ≥ 18)
-- **Framework**: anchor-lang 1.1.2 / anchor-spl 1.1.2
+- **Framework**: anchor-lang 1.2.0 / anchor-spl 1.2.0
 - **Solana crates**: `solana-sdk-ids` 3.1, `solana-instructions-sysvar` 3.0, `sha2` 0.11,
   `bytemuck` 1.17 (zero-copy accounts)
 - **npm deps (publisher/sdk/cli/scripts)**: `@solana/web3.js` ^1.95, `tsx`

@@ -10,8 +10,8 @@ license = "MIT"
 repository = "https://github.com/LaiTszKin/fructus"
 
 [workspace.dependencies]
-anchor-lang = "1.1.2"
-anchor-spl = "1.1.2"
+anchor-lang = "1.2.0"
+anchor-spl = "1.2.0"
 
 # Local builds (dev + test) carry no debug info: DWARF is the bulk of what this
 # dependency graph writes into `target/` and it dominates the link step of the

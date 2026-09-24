@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - Rust toolchain ≥ 1.89 (`rustup`)
-- Anchor CLI 1.1.2 (via `avm`)
+- Anchor CLI 1.2.0 (via `avm`)
 - `cargo-build-sbf` 4.x (BPF toolchain — required for `anchor build` / Trident)
 - `cargo-nextest` 0.9 (`cargo install cargo-nextest --locked`) — the default test runner
 - Node.js ≥ 18 + npm (for the publisher)
