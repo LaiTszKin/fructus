@@ -5,7 +5,8 @@
   "type": "module",
   "description": "Fructus Stage-2 #18 PoC: a minimal Transaction V1 (SIMD-0385) send on devnet, built with @solana/kit and @solana/web3.js. Not part of any workspace or CI run.",
   "scripts": {
-    "poc": "tsx main.ts"
+    "poc": "tsx main.ts",
+    "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@solana/kit": "8.3.0",

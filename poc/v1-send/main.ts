@@ -30,6 +30,7 @@
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
     AccountRole,
@@ -158,6 +159,56 @@ function isFundingFailure(error: unknown): boolean {
 // ---------------------------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------------------------
+
+/**
+ * The pitfall rows, with this run's measured values.
+ *
+ * BigInt-safe: kit's vit message config carries `u64` (bigint) entries, and a plain
+ * `JSON.stringify` throws `TypeError: Do not know how to serialize a BigInt` — the
+ * first live devnet run used to crash exactly there, after a successful send
+ * (regression test: `test/pitfalls.test.ts`). Every call site that renders measured
+ * kit values goes through `bigintReplacer`.
+ */
+export interface PitfallEvidence {
+    /** kit's compiled provisory message (config mask/value pairs). */
+    provisory: { configValues: readonly unknown[]; numStaticAccounts: number };
+    /** the compiled, configured message's values — absent on the build-only path. */
+    measuredConfigValues?: readonly unknown[];
+    /** base64 wire size in bytes. */
+    wireBytes: number;
+}
+
+export function renderPitfalls(e: PitfallEvidence): Array<[string, string]> {
+    return [
+        [
+            'unset v1 limits are ZERO, never defaults — kit writes only what the config mask carries:',
+            `provisory configValues ${JSON.stringify(e.provisory.configValues, bigintReplacer)}` +
+                (e.measuredConfigValues === undefined
+                    ? ''
+                    : `, measured ${JSON.stringify(e.measuredConfigValues, bigintReplacer)}`),
+        ],
+        [
+            'the priority fee is a TOTAL in lamports (V1TransactionConfig.priorityFeeLamports), not a price',
+            'per compute unit — this message pays 0n; a ComputeBudget price instruction is a no-op (probe A)',
+        ],
+        [
+            `base64 is mandatory above ${LEGACY_PACKET_DATA_SIZE} bytes — measured wire size`,
+            `${e.wireBytes} bytes, submitted as base64 regardless; kit's sendTransaction only ever encodes base64`,
+        ],
+        [
+            'ComputeBudget instructions are no-ops under v1 — never include them: probe A asks for',
+            `${MAX_COMPUTE_UNIT_LIMIT} units that way and is refused anyway`,
+        ],
+        [
+            'v1 has no ALT support — the compiled v1 message carries',
+            `staticAccounts only, no addressTableLookups field (keys: ${Object.keys(e.provisory).sort().join(', ')})`,
+        ],
+        [
+            'duplicate addresses are rejected by the protocol — kit merges repeated references into one',
+            `static account (${e.provisory.numStaticAccounts} for 3 role references: the fee payer, the sender and the recipient are the same key); a hand-spliced duplicate (probe B) is refused`,
+        ],
+    ];
+}
 
 async function main(): Promise<void> {
     console.log('Fructus v1 send PoC — Transaction V1 (SIMD-0385) on devnet');
@@ -378,33 +429,11 @@ async function main(): Promise<void> {
 
     // ── pitfalls, as validated above ─────────────────────────────────────────────────────────
     console.log('\n──── pitfalls, with the evidence this run produced ────');
-    const pitfalls = [
-        [
-            'unset v1 limits are ZERO, never defaults — kit writes only what the config mask carries:',
-            `provisory configValues ${JSON.stringify(provisoryCompiled.configValues, bigintReplacer)}` +
-                (configured ? `, measured ${JSON.stringify(compileTransactionMessage(configured).configValues, bigintReplacer)}` : ''),
-        ],
-        [
-            'the priority fee is a TOTAL in lamports (V1TransactionConfig.priorityFeeLamports), not a price',
-            'per compute unit — this message pays 0n; a ComputeBudget price instruction is a no-op (probe A)',
-        ],
-        [
-            `base64 is mandatory above ${LEGACY_PACKET_DATA_SIZE} bytes — measured wire size`,
-            `${wireBytes} bytes, submitted as base64 regardless; kit's sendTransaction only ever encodes base64`,
-        ],
-        [
-            'ComputeBudget instructions are no-ops under v1 — never include them: probe A asks for',
-            `${MAX_COMPUTE_UNIT_LIMIT} units that way and is refused anyway`,
-        ],
-        [
-            'v1 has no ALT support — the compiled v1 message carries',
-            `staticAccounts only, no addressTableLookups field (keys: ${Object.keys(provisoryCompiled).sort().join(', ')})`,
-        ],
-        [
-            'duplicate addresses are rejected by the protocol — kit merges repeated references into one',
-            `static account (${provisoryCompiled.numStaticAccounts} for 3 role references: the fee payer, the sender and the recipient are the same key); a hand-spliced duplicate (probe B) is refused`,
-        ],
-    ];
+    const pitfalls = renderPitfalls({
+        provisory: provisoryCompiled,
+        measuredConfigValues: configured ? compileTransactionMessage(configured).configValues : undefined,
+        wireBytes,
+    });
     for (const [a, b] of pitfalls) console.log(`  • ${a}\n      ${b}`);
 
     // ── outcome ──────────────────────────────────────────────────────────────────────────────
@@ -430,10 +459,15 @@ async function main(): Promise<void> {
     );
 }
 
-main().catch(error => {
+const isEntry =
+    process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isEntry) {
+    main().catch(error => {
     const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
     console.error(`\nFAIL — ${message}`);
     for (const [depth, detail] of causeChain(error).entries()) console.error(`  cause[${depth}] — ${detail}`);
     if (error instanceof Error && error.stack) console.error(error.stack.split('\n').slice(0, 6).join('\n'));
     process.exit(1);
 });
+}
