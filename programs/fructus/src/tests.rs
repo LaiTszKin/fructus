@@ -343,7 +343,11 @@ fn borrowed(data: &[u8]) -> BorrowedInstruction<'_> {
 /// Build the mock instruction sysvar from `ixs` and run
 /// [`crate::ed25519::verify_publisher_signature`] against it.
 fn run_verify(ixs: &[BorrowedInstruction], publisher: &Pubkey, message: &[u8; 32]) -> Result<()> {
-    let mut sysvar_data = construct_instructions_data(ixs);
+    // solana-instructions-sysvar 4.0.0 returns a Result here (3.0.x returned the
+    // Vec directly); the serialization of an in-memory instruction list cannot
+    // fail, so the expectation is the honest form of the old infallible call.
+    let mut sysvar_data =
+        construct_instructions_data(ixs).expect("serialize the mock instruction sysvar");
     let key = sysvar::instructions::id();
     let owner = sysvar::id();
     let mut lamports = 0u64;

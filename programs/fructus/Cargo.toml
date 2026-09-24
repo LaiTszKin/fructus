@@ -26,7 +26,7 @@ anchor-lang = { workspace = true }
 anchor-spl = { workspace = true }
 bytemuck = { version = "1.17", features = ["derive", "min_const_generics"] }
 solana-sdk-ids = "3.1.0"
-solana-instructions-sysvar = "3.0.0"
+solana-instructions-sysvar = "4.0.0"
 sha2 = "0.11"
 
 [dev-dependencies]
