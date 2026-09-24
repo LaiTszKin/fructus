@@ -8,7 +8,7 @@
 //! Rust bank. See `test/integration-pbt.test.ts`.
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, openSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -164,7 +164,7 @@ function parseJson(out: string): Record<string, unknown> {
   return JSON.parse(m[0]) as Record<string, unknown>;
 }
 
-async function waitForRpc(connection: Connection, timeoutMs = 45_000): Promise<void> {
+async function waitForRpc(connection: Connection, timeoutMs = 45_000, logPath?: string): Promise<void> {
   const start = Date.now();
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -173,7 +173,16 @@ async function waitForRpc(connection: Connection, timeoutMs = 45_000): Promise<v
       return;
     } catch {
       if (Date.now() - start > timeoutMs) {
-        throw new Error(`validator RPC not ready after ${timeoutMs}ms`);
+        const tail =
+          logPath && existsSync(logPath)
+            ? readFileSync(logPath, "utf-8").trim().split("\n").slice(-6).join("\n")
+            : "";
+        throw new Error(
+          `validator RPC ${connection.rpcEndpoint} not ready after ${timeoutMs}ms` +
+            (tail ? ` — validator log tail:\n${tail}` : "") +
+            `\n(a validator dies before binding when another one already holds its gossip/` +
+            `dynamic port block — check for a stray solana-test-validator)`,
+        );
       }
       await new Promise((r) => setTimeout(r, 400));
     }
@@ -236,12 +245,30 @@ export async function startValidator(opts: StartOptions = {}): Promise<Validator
 
   const configPath = writeSolanaConfig(dir, rpcUrl, authorityPath);
 
+  // The RPC port is caller-controlled, but solana-test-validator would otherwise take
+  // its defaults for everything else — gossip 8000, dynamic range 8000-8020, faucet
+  // 9900 — and those are the first thing any other validator on the machine holds: a
+  // stray one from another repo, a leftover from an earlier run, or a parallel run.
+  // A collision kills this process before it ever binds, which surfaces as nothing but
+  // a silent `waitForRpc` timeout. Keep every port this harness opens in a block
+  // derived from its own RPC port, and keep the validator's log for the failure path.
+  const rpcPort = Number(rpcUrl.match(/:(\d+)/)?.[1] ?? "8899");
+  const gossipPort = rpcPort + 1_000;
+  const faucetPort = rpcPort + 2_000;
+  const dynamicPortRange = `${rpcPort + 3_000}-${rpcPort + 3_100}`;
+
   const args = [
     "--ledger",
     ledger,
     "--reset",
     "--rpc-port",
-    rpcUrl.match(/:(\d+)/)?.[1] ?? "8899",
+    String(rpcPort),
+    "--gossip-port",
+    String(gossipPort),
+    "--faucet-port",
+    String(faucetPort),
+    "--dynamic-port-range",
+    dynamicPortRange,
     "--bpf-program",
     programId.toBase58(),
     SO_PATH,
@@ -250,8 +277,10 @@ export async function startValidator(opts: StartOptions = {}): Promise<Validator
     dump.path,
   ];
 
-  const proc = spawn("solana-test-validator", args, { stdio: "ignore", detached: true });
-  await waitForRpc(new Connection(rpcUrl, "confirmed"));
+  const logPath = join(dir, "validator.log");
+  const logFd = openSync(logPath, "a");
+  const proc = spawn("solana-test-validator", args, { stdio: ["ignore", logFd, logFd], detached: true });
+  await waitForRpc(new Connection(rpcUrl, "confirmed"), 45_000, logPath);
   await airdrop(new Connection(rpcUrl, "confirmed"), authority.publicKey, 120);
 
   return {
