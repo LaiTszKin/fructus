@@ -381,8 +381,8 @@ async function main(): Promise<void> {
     const pitfalls = [
         [
             'unset v1 limits are ZERO, never defaults — kit writes only what the config mask carries:',
-            `provisory configValues ${JSON.stringify(provisoryCompiled.configValues)}` +
-                (configured ? `, measured ${JSON.stringify(compileTransactionMessage(configured).configValues)}` : ''),
+            `provisory configValues ${JSON.stringify(provisoryCompiled.configValues, bigintReplacer)}` +
+                (configured ? `, measured ${JSON.stringify(compileTransactionMessage(configured).configValues, bigintReplacer)}` : ''),
         ],
         [
             'the priority fee is a TOTAL in lamports (V1TransactionConfig.priorityFeeLamports), not a price',
