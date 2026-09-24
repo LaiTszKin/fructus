@@ -220,10 +220,14 @@ jobs:
           node-version: "24"
           cache: npm
           cache-dependency-path: ${{ matrix.package }}/package-lock.json
-      # `cli` imports the SDK's sources (`fructus-sdk/src/index.js`), and those
-      # files resolve `@solana/web3.js` from the SDK's own node_modules.
+      # `cli` and `scripts` import the SDK's sources (`fructus-sdk/src/index.js`), and
+      # resolution walks up from the *importing file*: `sdk/src/*.ts` resolves
+      # `@solana/web3.js` and `@solana/kit` from `sdk/node_modules` — never from the
+      # dependent package's. Without this step the dependent package type-checks the
+      # SDK sources with TS2307 on every `sdk/src/*.ts` file (reproduced locally by
+      # moving `sdk/node_modules` aside).
       - name: Install the SDK
-        if: matrix.package == 'cli'
+        if: matrix.package == 'cli' || matrix.package == 'scripts'
         working-directory: sdk
         run: npm ci
       - name: Install
