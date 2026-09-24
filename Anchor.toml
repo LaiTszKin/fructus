@@ -7,19 +7,17 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-fructus = "8ZLiJ12eBiam4UP2HRp3M75CQAcc8GuUBz44zeHt6mjH"
+fructus = "3EsUd5XQ6KChedwL2ho8pv3zrrGGFvMpJEV1PnzN8MD1"
 
 # Devnet deployment (R-D1a).
 #
-# The id below is a VALID base58 pubkey PLACEHOLDER so `anchor build` keeps
-# working — it is NOT the real devnet program. POPULATE after a real devnet
-# deploy, and make it equal the `declare_id!` in programs/fructus/src/lib.rs
-# (Anchor derives every PerpMarket / OrderBook / Position PDA from the program
-# id, so deploying to a different address than `declare_id!` breaks all PDA
-# derivation). `scripts/deploy.sh` rejects this placeholder and tells you to
-# set PROGRAM_ID.
+# The id below is the DEPLOYED devnet program id and equals `declare_id!` in
+# programs/fructus/src/lib.rs and the SDK's `PROGRAM_ID` (Anchor derives every
+# PerpMarket / OrderBook / Position PDA from the program id, so a mismatch
+# breaks all PDA derivation). `scripts/deploy.sh` still refuses the old
+# `J2xccRtuG43drESLYznHhLhQkLTdfepcKYbiQ9BsJVaf` placeholder id.
 [programs.devnet]
-fructus = "J2xccRtuG43drESLYznHhLhQkLTdfepcKYbiQ9BsJVaf"
+fructus = "3EsUd5XQ6KChedwL2ho8pv3zrrGGFvMpJEV1PnzN8MD1"
 
 [provider]
 # Localnet is the ACTIVE DEFAULT profile and is left unchanged.

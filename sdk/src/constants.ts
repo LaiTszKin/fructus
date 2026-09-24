@@ -67,7 +67,7 @@ export const USER_COLLATERAL_SEED = Buffer.from("user_collateral", "utf8");
 export const POSITION_SEED = Buffer.from("position", "utf8");
 
 /** On-chain program id (`declare_id!` in `programs/fructus/src/lib.rs`). */
-export const PROGRAM_ID = new PublicKey("8ZLiJ12eBiam4UP2HRp3M75CQAcc8GuUBz44zeHt6mjH");
+export const PROGRAM_ID = new PublicKey("3EsUd5XQ6KChedwL2ho8pv3zrrGGFvMpJEV1PnzN8MD1");
 
 /** Canonical SPL Stake Pool program id (`SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy`). */
 export const STAKE_POOL_PROGRAM_ID = new PublicKey(

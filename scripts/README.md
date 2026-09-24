@@ -9,24 +9,37 @@ run flag (`RUN_E2E=1` / `npm run e2e:network`); the default `npm run e2e` derive
 the PDAs and asserts the funding sign convention on a pure TypeScript mirror of
 the funding engine — no RPC, no transaction, no deployment.
 
-> ## TODO — fill in after a real devnet deploy
+> ## Devnet deployment (recorded 2026-09-24)
 >
-> The on-chain program id and the derived devnet `PerpMarket` address are
-> recorded **after** a real `anchor deploy` (they are not known from here and
-> cannot be pre-computed until lib.rs `declare_id!` matches the deployed id).
+> The program is live on devnet, and `declare_id!` (`programs/fructus/src/lib.rs`),
+> `Anchor.toml` (`[programs.localnet]` + `[programs.devnet]`), the SDK's `PROGRAM_ID`,
+> `e2e.mts`'s default and `trident-tests/Trident.toml` all carry the same id:
 >
-> 1. **Anchor.toml → `[programs.devnet] → fructus`** — set to the deployed devnet
->    program id (currently the `J2xccRtuG43drESLYznHhLhQkLTdfepcKYbiQ9BsJVaf`
->    placeholder, a valid-base58 id chosen so `anchor build` still parses).
-> 2. **`programs/fructus/src/lib.rs` → `declare_id!`** — must equal that same id,
->    then `anchor build` + `anchor deploy` again. (The PDAs derive from the
->    program id, so a mismatch breaks all PDA derivation.)
-> 3. **`PROGRAM_ID` / `MARKET` env** — after `bash scripts/deploy.sh`, copy the
->    printed ids into the env vars below.
+> | item | address |
+> | --- | --- |
+> | program | `3EsUd5XQ6KChedwL2ho8pv3zrrGGFvMpJEV1PnzN8MD1` |
+> | PerpMarket PDA | `BgS7s7S72i1ParoTbD9vXpVHLcDdgg1qMSv4UQt5xyuB` |
+> | OrderBook PDA | `5QhmQfVfeJgFbLn6W1ijZpCRwGF7PspX5eWucDNVBiE4` |
+> | vault PDA | `9RJiwrQGBVxMV2c3uabcgxkCciZtXTPbVcJp4kUdibmx` |
 >
-> Until those are set, `npm run e2e` uses the default program id from
-> `[programs.localnet]` for its offline PDA derivation (which is correct only for
-> localnet; for a devnet check, set `PROGRAM_ID`).
+> Full record (local, gitignored — `scripts/.gitignore`): `scripts/deploy-output.json`
+> carries the ids, the artifact arch and every transaction signature of the first
+> devnet walk. The program id moved for this deploy:
+> the previous canonical id (`8ZLiJ12eBiam4UP2HRp3M75CQAcc8GuUBz44zeHt6mjH`) had no
+> keypair, so the deploy had to use a key we hold
+> (`target/deploy/fructus-keypair.json`, gitignored).
+>
+> Two notes from that deploy:
+> - `anchor deploy` wrote the program, then failed `Failed to initialize IDL` while
+>   creating the on-chain metadata account. Nothing in this repo reads an on-chain
+>   IDL (the SDK/CLI build instructions from the mirrored layouts), so the walk
+>   works — do not treat that error as a failed deploy.
+> - The deploy stages an **SBPFv3** artifact (SIMD-0500). Rebuild the SBPFv0
+>   artifact (`cargo build-sbf --arch v0 --tools-version v1.52 --sbf-out-dir
+>   target/deploy-v0` + `cp`) before the bank suites or Trident, per AGENTS.md.
+>
+> Until `[programs.devnet]` was filled, `npm run e2e` used the `[programs.localnet]`
+> id for its offline PDA derivation; now both are the deployed id.
 
 ---
 
@@ -133,7 +146,7 @@ npm run e2e            # offline dry-run: PDA derivation + R-F3 sign-convention 
 Expected offline output (excerpt):
 
 ```
-[dry-run] PROGRAM_ID: 8ZLiJ12eBiam4UP2HRp3M75CQAcc8GuUBz44zeHt6mjH
+[dry-run] PROGRAM_ID: 3EsUd5XQ6KChedwL2ho8pv3zrrGGFvMpJEV1PnzN8MD1
 [dry-run] perp_market PDA : EgMTaHdHmz6Z6BTe1DgX5sC63kqk5dXuVFhkWELumEPX (bump 252)
 [dry-run] order_book PDA  : <order_book PDA> (bump <n>)
 [dry-run] vault PDA       : <vault PDA> (bump <n>)

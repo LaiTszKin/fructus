@@ -1,6 +1,6 @@
 # API Reference (On-chain Instructions)
 
-Program id: `8ZLiJ12eBiam4UP2HRp3M75CQAcc8GuUBz44zeHt6mjH`
+Program id: `3EsUd5XQ6KChedwL2ho8pv3zrrGGFvMpJEV1PnzN8MD1`
 
 All instructions are Anchor handlers. Accounts are validated by Anchor
 constraints + explicit checks in the handler.

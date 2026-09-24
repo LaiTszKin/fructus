@@ -45,7 +45,7 @@ Copy `publisher/.env.example` → `.env` and fill:
 | --- | --- |
 | `RPC_URL` | Solana RPC endpoint |
 | `PUBLISHER_KEYPAIR` | JSON byte-array secret key of the publisher |
-| `PROGRAM_ID` | `8ZLiJ12eBiam4UP2HRp3M75CQAcc8GuUBz44zeHt6mjH` |
+| `PROGRAM_ID` | `3EsUd5XQ6KChedwL2ho8pv3zrrGGFvMpJEV1PnzN8MD1` |
 | `ORACLE_ADDRESS` | the `yield_oracle` PDA |
 | `JITO_API` | `https://kobe.mainnet.jito.network` |
 | `POLL_INTERVAL_MS` | poll interval (default 3600000) |

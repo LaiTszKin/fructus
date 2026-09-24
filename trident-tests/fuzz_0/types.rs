@@ -26,7 +26,7 @@ pub mod fructus {
 
     /// Returns the program ID for fructus
     pub fn program_id() -> Pubkey {
-        pubkey!("8ZLiJ12eBiam4UP2HRp3M75CQAcc8GuUBz44zeHt6mjH")
+        pubkey!("3EsUd5XQ6KChedwL2ho8pv3zrrGGFvMpJEV1PnzN8MD1")
     }
 
     // ------------------------------------------------------------------------

@@ -3,7 +3,7 @@ enabled = true
 
 
 [[fuzz.programs]]
-address = "8ZLiJ12eBiam4UP2HRp3M75CQAcc8GuUBz44zeHt6mjH"
+address = "3EsUd5XQ6KChedwL2ho8pv3zrrGGFvMpJEV1PnzN8MD1"
 # TridentSVM (agave 2.3.x) executes SBPFv0 only, while the deploy path needs an
 # SBPFv3 artifact (SIMD-0500 on agave 4.x validators). Build the fuzz artifact
 # separately so the two paths don't collide:

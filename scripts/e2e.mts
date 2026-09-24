@@ -70,7 +70,7 @@ const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey(
 
 // Localnet program id (from Anchor.toml [programs.localnet]). Real devnet id is
 // set via PROGRAM_ID env after a real deploy (see scripts/README.md).
-const DEFAULT_PROGRAM_ID = "8ZLiJ12eBiam4UP2HRp3M75CQAcc8GuUBz44zeHt6mjH";
+const DEFAULT_PROGRAM_ID = "3EsUd5XQ6KChedwL2ho8pv3zrrGGFvMpJEV1PnzN8MD1";
 
 // ---------------------------------------------------------------------------
 // Env helpers (no secrets committed; keypair + RPC from env only)

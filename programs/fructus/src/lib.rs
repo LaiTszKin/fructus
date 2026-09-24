@@ -882,7 +882,7 @@ fn verify_collateral_pda(
     Ok(())
 }
 
-declare_id!("8ZLiJ12eBiam4UP2HRp3M75CQAcc8GuUBz44zeHt6mjH");
+declare_id!("3EsUd5XQ6KChedwL2ho8pv3zrrGGFvMpJEV1PnzN8MD1");
 
 #[program]
 pub mod fructus {
