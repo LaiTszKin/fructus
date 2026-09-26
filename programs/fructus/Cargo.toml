@@ -5,7 +5,7 @@ description = "Fructus — a Solana protocol for trading yield futures."
 edition.workspace = true
 rust-version.workspace = true
 license = "MIT"
-repository = "https://github.com/LaiTszKin/fructus"
+repository = "https://github.com/Uniterra-Solutions/fructus"
 
 [lib]
 crate-type = ["cdylib", "lib"]

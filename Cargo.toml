@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.89.0"
 license = "MIT"
-repository = "https://github.com/LaiTszKin/fructus"
+repository = "https://github.com/Uniterra-Solutions/fructus"
 
 [workspace.dependencies]
 anchor-lang = "1.2.0"

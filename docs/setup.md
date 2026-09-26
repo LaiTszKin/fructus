@@ -12,7 +12,7 @@
 ## Install
 
 ```bash
-git clone https://github.com/LaiTszKin/fructus.git
+git clone https://github.com/Uniterra-Solutions/fructus.git
 cd fructus
 
 # Rust workspace (program)

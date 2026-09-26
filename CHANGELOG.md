@@ -190,5 +190,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   targeting jitoSOL yield perpetual futures as the MVP, followed by jitoSOL
   dated futures and expansion to other yield-bearing assets.
 
-[Unreleased]: https://github.com/LaiTszKin/fructus/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/LaiTszKin/fructus/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Uniterra-Solutions/fructus/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Uniterra-Solutions/fructus/releases/tag/v0.1.0
